@@ -1,0 +1,91 @@
+//------------------------------------------------
+// 010 Editor Template for .fskin game skin format
+//   (girl_Boot.fskin etc. - SKIN v1.0)
+//
+// Structure (reverse engineered):
+//   Header  | Vertex records (var-size, skin data
+//   + bbox  | embedded per-vertex with bone-local
+//           | positions) | Index section | Material
+//------------------------------------------------
+
+LittleEndian();
+
+char     magic[4];              // "SKIN"
+uint     version;               // 0x00000100 = v1.0
+uint     vertexCount;
+uint     vertexOffset;          // always 0x138
+uint     indexSectionCount;     // 1
+uint     indexSectionOffset;    // end of vertex data
+uint     materialCount;         // 1
+uint     materialOffset;
+
+float   bboxMax[3];             // header bbox max (x,y,z)
+float   bboxMin[3];             // header bbox min (x,y,z)
+
+uchar   reserved[0x100];        // 256 zero bytes, 0x38..0x137
+
+// ---- Vertex section ----
+typedef struct {
+    float  pos[3];              // model-space position
+    float  normal[3];           // unit normal
+    float  uv[2];               // texture coords
+    uint   influenceCount;
+    typedef struct {
+        uint   boneIndex;       // global skeleton bone id
+        float  weight;          // sums to 1.0 per vertex
+        float  boneLocalPos[3]; // position in bone space
+    } BONE_INFLUENCE;
+    BONE_INFLUENCE bones[influenceCount] <optimize=false>;
+} VERTEX <read=VertexRead>;
+
+string VertexRead(VERTEX &v) {
+    string s;
+    SPrintf(s, "pos(%.1f,%.1f,%.1f) %d bone(s)", v.pos[0], v.pos[1], v.pos[2], v.influenceCount);
+    return s;
+}
+
+FSeek(vertexOffset);
+VERTEX vertices[vertexCount] <optimize=false>;
+
+// ---- Index section ----
+FSeek(indexSectionOffset);
+typedef struct {
+    uint   zero1;               // 0
+    ushort zero2;               // 0
+    ushort vertexCount2;        // vertex count repeated
+    ushort pad[3];
+    uint   hash1;               // unknown / checksum
+    uint   hash2;               // unknown / checksum
+    uint   one1;                // 1
+    uint   one2;                // 1
+    uint   triangleCount;
+    ushort indices[triangleCount * 3];  // vertex indices, u16
+} INDEX_SECTION <read=IdxRead>;
+
+string IdxRead(INDEX_SECTION &s) {
+    string str;
+    SPrintf(str, "%d triangles", s.triangleCount);
+    return str;
+}
+
+INDEX_SECTION indexSection;
+
+// ---- Material section ----
+FSeek(materialOffset);
+typedef struct {
+    float  leadZero;            // 0.0
+    float  diffuse[4];          // RGBA
+    float  ambient[4];          // RGBA
+    float  emissive[4];         // RGBA
+    float  specular[4];         // RGBA
+    float  specPower;           // e.g. 12.8
+    uchar  pre[3];              // 00 00 FF before texture path
+    char   texturePath[36];     // zero-terminated, e.g. system\avatargirl\NvZhuJue_Boot.tga
+    uchar  reserved[FileSize() - FTell()]; // zero padding to EOF (extra texture slots?)
+} MATERIAL <read=MatRead>;
+
+string MatRead(MATERIAL &m) {
+    return m.texturePath;
+}
+
+MATERIAL material;

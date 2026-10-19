@@ -1,0 +1,10 @@
+# 本机构建配置：Git Bash 环境下 /usr/bin/link 会遮蔽 MSVC link.exe，
+# 这里显式指定链接器与 LIB 搜索路径，使任何 shell 下都能直接 cargo build。
+# 其他机器上如无此问题可删除本文件。
+
+[target.x86_64-pc-windows-msvc]
+#linker = "D:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
+#linker = "D:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
+[env]
+#LIB = "D:\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64;D:\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64"
+#LIB = "D:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64"

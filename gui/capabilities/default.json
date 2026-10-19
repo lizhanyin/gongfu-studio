@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Gongfu Studio 默认能力",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}

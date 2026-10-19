@@ -1,0 +1,19 @@
+# Node / Vite（gui/ui）
+gui/ui/node_modules/
+gui/ui/dist/
+
+# Rust / Cargo
+target/
+gui/target/
+
+# Tauri 生成文件
+gui/gen/schemas/
+
+# 日志与临时文件
+*.log
+*.tmp
+.cache/
+
+# 系统文件
+.DS_Store
+Thumbs.db

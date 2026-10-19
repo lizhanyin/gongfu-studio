@@ -1,0 +1,12 @@
+[package]
+name = "cpk"
+description = "软星 CPK 资源包格式（RST\\x1A）读写库，移植自 Cpack2009 CPKCore 2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lzokay = { workspace = true }
+md-5 = { workspace = true }
+encoding_rs = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "cpktool"
+description = "功夫世界 CPK 资源包命令行工具（打包/解包/校验）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+glob = { workspace = true }
+cpk = { path = "../cpk" }
