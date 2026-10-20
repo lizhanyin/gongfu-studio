@@ -152,6 +152,15 @@ export class Viewer {
   private clothMats = new Map<number, THREE.Matrix4>();
   /** 布料链载体骨索引（链根的公共父骨，裙摆 = 骨盆），无布料骨时 -1 */
   private clothCarrier = -1;
+  /**
+   * 布料弹簧模拟开关（默认关）。F3D.dll 反汇编确证引擎无运行时布料：
+   * 游戏对 Bone* 链直接回放 FSKEL 烘焙动画（InvalidateRenderData 帧插值
+   * +父级合成，无物理步；骨骼 API 仅 GetBoneSpace 等只读）。默认走与
+   * 游戏一致的精确 LBS（链骨矩阵直接来自 FSKEL 姿态，条带随舞蹈等动作
+   * 里的烘焙链动画摆动）；开启后 detectCloth/updateClothMats 的次级运动
+   * 模拟接管链骨渲染（"比游戏更好"的增强，走路时裙摆滞后摆动）。
+   */
+  private clothSimEnabled = false;
   /** 载体数据绑定拟合的逆（骨盆绑定系 ↔ 世界） */
   private clothTpInv: THREE.Matrix4 | null = null;
   /** 每根布料骨的次级运动模拟状态 */
@@ -608,7 +617,8 @@ export class Viewer {
   }
 
   /**
-   * 裙摆布料骨检测与次级运动模拟初始化。
+   * 裙摆布料骨检测与次级运动模拟初始化（仅 clothSimEnabled=true 时生效，
+   * 默认关闭——引擎无运行时布料，默认走游戏忠实的 FSKEL 链动画回放）。
    *
    * Bone* 布料链（裙摆前 2 后 2 + 侧链，链根挂骨盆）的 FSKEL 姿态是布料
    * 模拟的种子状态：与 FSKIN 绑定数据恒不一致（坏链 M·boneLocalPos 残差
@@ -626,7 +636,26 @@ export class Viewer {
    * 放大成接近 180° 的翻转把面板甩飞）。静止时裙子精确贴绑定姿态，
    * 运动/急停时裙摆滞后摆动，与游戏行为定性一致。部件增删后需重跑。
    */
+  /** 布料弹簧模拟开关：false=游戏忠实（默认，链骨直接回放 FSKEL 动画），见 clothSimEnabled 注释 */
+  setClothSim(on: boolean) {
+    if (this.clothSimEnabled === on) return;
+    this.clothSimEnabled = on;
+    if (on) {
+      this.detectCloth();
+    } else {
+      this.clothBones.clear();
+      this.clothMats.clear();
+      this.clothSims = [];
+      this.clothColliders = [];
+      this.clothCarrier = -1;
+      this.clothTpInv = null;
+      this.clothLastAbs = NaN;
+    }
+    for (const p of this.parts.values()) this.skinPart(p);
+  }
+
   private detectCloth() {
+    if (!this.clothSimEnabled) return; // 游戏忠实模式：链骨走精确 LBS
     this.clothBones.clear();
     this.clothMats.clear();
     this.clothSims = [];
@@ -997,9 +1026,9 @@ export class Viewer {
    *   nrm = 静态 —— 引擎蒙皮循环只写位置三分量，法线是加载时从
    *        顶点记录 +12 拷贝的静态数据，随世界矩阵变换（引擎自身
    *        就不做法线蒙皮，光照用绑定姿势法线）。
-   * 例外：布料骨（detectCloth 标记的裙摆 Bone* 链）改用次级运动模拟的
-   * 合成矩阵作用在 authored pos 上（游戏为运行时布料模拟，文件姿态
-   * 只是种子，见 detectCloth 注释）。
+   * 例外：布料骨（detectCloth 标记的裙摆 Bone* 链）仅在 clothSimEnabled
+   * 开启时改用次级运动模拟的合成矩阵；默认（游戏忠实）链骨与本表第一
+   * 行一致——直接用 FSKEL 姿态矩阵，条带跟随动作里烘焙的链动画。
    * 绑定矩阵近似（共识拟合）只在无骨架的静态模式兜底离群部件；
    * boneLocalPos 是引擎逐顶点写入的精确数据，直接加权即为游戏渲染结果。
    */
