@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { FskinModel, FskelMeta } from "./types";
+import type { FskinModel, FskelMeta, Influence } from "./types";
 
 export interface TexData {
   width: number;
@@ -54,6 +54,68 @@ function boneColor(bone: number): THREE.Color {
   return new THREE.Color().setHSL(hue, 0.75, 0.55);
 }
 
+/** 3×3 行列式（行主序） */
+function mat3Det(m: number[]): number {
+  return (
+    m[0] * (m[4] * m[8] - m[5] * m[7]) -
+    m[1] * (m[3] * m[8] - m[5] * m[6]) +
+    m[2] * (m[3] * m[7] - m[4] * m[6])
+  );
+}
+
+function mat3Inv(m: number[]): number[] | null {
+  const det = mat3Det(m);
+  if (Math.abs(det) < 1e-12) return null;
+  const d = 1 / det;
+  return [
+    (m[4] * m[8] - m[5] * m[7]) * d,
+    (m[2] * m[7] - m[1] * m[8]) * d,
+    (m[1] * m[5] - m[2] * m[4]) * d,
+    (m[5] * m[6] - m[3] * m[8]) * d,
+    (m[0] * m[8] - m[2] * m[6]) * d,
+    (m[2] * m[3] - m[0] * m[5]) * d,
+    (m[3] * m[7] - m[4] * m[6]) * d,
+    (m[1] * m[6] - m[0] * m[7]) * d,
+    (m[0] * m[4] - m[1] * m[3]) * d,
+  ];
+}
+
+/** 极分解 Newton 迭代 M ← (M + M⁻ᵀ)/2，收敛到 H 的最近正交旋转因子；退化返回 null */
+function polarRotation(h: number[]): number[] | null {
+  let m = h.slice();
+  for (let it = 0; it < 32; it++) {
+    const mi = mat3Inv(m);
+    if (!mi) return null;
+    const next = new Array<number>(9);
+    let delta = 0;
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        const v = (m[r * 3 + c] + mi[c * 3 + r]) / 2;
+        next[r * 3 + c] = v;
+        delta = Math.max(delta, Math.abs(v - m[r * 3 + c]));
+      }
+    }
+    m = next;
+    if (delta < 1e-10) break;
+  }
+  return mat3Det(m) > 0.5 ? m : null; // 未收敛或落入反射
+}
+
+/** 取权重最高的至多 4 个影响并归一化；超出骨架范围的骨骼剔除 */
+function topInfluences(infs: Influence[], boneCount: number) {
+  const valid = infs.filter((i) => i.boneIndex < boneCount);
+  const src = valid.length ? valid : [{ boneIndex: 0, weight: 1 }];
+  const sorted = [...src].sort((a, b) => b.weight - a.weight).slice(0, 4);
+  const sum = sorted.reduce((s, i) => s + Math.max(i.weight, 0), 0) || 1;
+  const idx = sorted.map((i) => i.boneIndex);
+  const w = sorted.map((i) => Math.max(i.weight, 0) / sum);
+  while (idx.length < 4) {
+    idx.push(0);
+    w.push(0);
+  }
+  return { idx, w };
+}
+
 export class Viewer {
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
@@ -75,6 +137,8 @@ export class Viewer {
   /** 全部帧的扁平姿态：帧 × 骨 × 7 */
   private fskelPoses: Float32Array | null = null;
   private fskelBoneCount = 0;
+  /** 部件蒙皮绑定的骨架（动作模式下网格跟随骨骼变形） */
+  private skelSkeleton: THREE.Skeleton | null = null;
   private qa = new THREE.Quaternion();
   private qb = new THREE.Quaternion();
 
@@ -85,14 +149,14 @@ export class Viewer {
     container.appendChild(this.renderer.domElement);
 
     this.camera = new THREE.PerspectiveCamera(50, 1, 0.5, 5000);
-    this.camera.position.set(120, 140, 260);
+    this.camera.position.set(185, 200, 340);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.target.set(0, 85, 0);
 
-    this.scene.background = new THREE.Color(0x0b0b0f);
+    this.scene.background = new THREE.Color(0x000000);
     const hemi = new THREE.HemisphereLight(0xdde6ff, 0x30281e, 1.15);
     this.scene.add(hemi);
     const dir = new THREE.DirectionalLight(0xffffff, 1.6);
@@ -262,6 +326,22 @@ export class Viewer {
     geom.setAttribute("color", new THREE.BufferAttribute(Float32Array.from(boneCol), 3));
     geom.setAttribute("color2", new THREE.BufferAttribute(Float32Array.from(uvCol), 3));
     geom.setIndex(tri);
+    // 蒙皮属性（未绑骨架时挂上亦无副作用）；跨缝克隆顶点沿用源顶点权重
+    const total = model.vertices.length + clones.length;
+    const sIdx = new Uint16Array(total * 4);
+    const sW = new Float32Array(total * 4);
+    const boneCap = this.fskelBoneCount > 0 ? this.fskelBoneCount : Infinity;
+    const fillSkin = (ai: number, infs: Influence[]) => {
+      const { idx, w } = topInfluences(infs, boneCap);
+      for (let k = 0; k < 4; k++) {
+        sIdx[ai * 4 + k] = idx[k];
+        sW[ai * 4 + k] = w[k];
+      }
+    };
+    model.vertices.forEach((v, i) => fillSkin(i, v.influences));
+    clones.forEach((c, k) => fillSkin(model.vertices.length + k, model.vertices[c.src].influences));
+    geom.setAttribute("skinIndex", new THREE.Uint16BufferAttribute(sIdx, 4));
+    geom.setAttribute("skinWeight", new THREE.Float32BufferAttribute(sW, 4));
 
     const mat = new THREE.MeshStandardMaterial({
       side: THREE.DoubleSide,
@@ -281,7 +361,10 @@ export class Viewer {
     const mesh = new THREE.Mesh(geom, mat);
     mesh.userData.path = path;
     this.scene.add(mesh);
-    this.parts.set(path, { mesh, geom, mat, model, clones });
+    const part: PartObj = { mesh, geom, mat, model, clones };
+    this.parts.set(path, part);
+    // 动作模式已绑骨架时直接以蒙皮网格入场景
+    if (this.skelSkeleton) this.bindPart(part);
     this.applyMode(this.mode);
   }
 
@@ -410,10 +493,13 @@ export class Viewer {
       this.scene.add(this.skelRoot);
     }
 
-    this.skelHelper = new THREE.SkeletonHelper(this.skelBones);
-    const mat = this.skelHelper.material as THREE.LineBasicMaterial;
-    mat.linewidth = 2;
-    this.scene.add(this.skelHelper);
+    // SkeletonHelper 只接受单一根 Object3D（内部遍历 children），不能传骨骼数组
+    this.skelHelper = this.skelRoot ? new THREE.SkeletonHelper(this.skelRoot) : null;
+    if (this.skelHelper) {
+      const mat = this.skelHelper.material as THREE.LineBasicMaterial;
+      mat.linewidth = 2;
+      this.scene.add(this.skelHelper);
+    }
 
     // 关节小球（按骨骼索引着色）
     this.jointMesh = new THREE.InstancedMesh(
@@ -428,7 +514,109 @@ export class Viewer {
     this.jointMesh.instanceColor!.needsUpdate = true;
     this.scene.add(this.jointMesh);
 
+    // GPU 蒙皮：从部件顶点反推每骨绑定姿势，网格换成跟随骨骼变形的 SkinnedMesh
+    this.skelSkeleton = new THREE.Skeleton(this.skelBones, this.computeBoneInverses(n));
+    for (const p of this.parts.values()) this.bindPart(p);
+
     this.applyFskelFrame(0, 0, 0);
+  }
+
+  /**
+   * 每骨绑定世界矩阵之逆（boneInverses）。数据源是 fskin 顶点影响里的
+   * boneLocalPos：单影响顶点满足 M_bind × boneLocalPos = pos（已验证为精确
+   * 刚体映射），据此做 Kabsch 拟合；混合权重顶点的 (局部点, pos) 只是近似
+   * 对应，仅在单影响点不足 3 个时补充。无任何点对的骨骼对蒙皮无影响。
+   */
+  private computeBoneInverses(boneCount: number): THREE.Matrix4[] {
+    const exact: [number[], number[]][][] = Array.from({ length: boneCount }, () => []);
+    const approx: [number[], number[]][][] = Array.from({ length: boneCount }, () => []);
+    for (const p of this.parts.values()) {
+      for (const v of p.model.vertices) {
+        for (const inf of v.influences) {
+          if (inf.boneIndex >= boneCount) continue;
+          const pair: [number[], number[]] = [inf.boneLocalPos, v.pos];
+          if (v.influences.length === 1 || inf.weight >= 0.99) exact[inf.boneIndex].push(pair);
+          else approx[inf.boneIndex].push(pair);
+        }
+      }
+    }
+    return Array.from({ length: boneCount }, (_, i) =>
+      this.fitBindMatrix(exact[i].length >= 3 ? exact[i] : exact[i].concat(approx[i])).invert()
+    );
+  }
+
+  /** 点对 (骨骼局部, 世界) 的刚体拟合：H = Σ(b-cb)(a-ca)ᵀ 极分解求 R，t = cb - R·ca */
+  private fitBindMatrix(pairs: [number[], number[]][]): THREE.Matrix4 {
+    const n = pairs.length;
+    if (n === 0) return new THREE.Matrix4();
+    const ca = [0, 0, 0];
+    const cb = [0, 0, 0];
+    for (const [a, b] of pairs) {
+      for (let k = 0; k < 3; k++) {
+        ca[k] += a[k] / n;
+        cb[k] += b[k] / n;
+      }
+    }
+    let R: number[] | null = null;
+    if (n >= 3) {
+      const h = new Array<number>(9).fill(0);
+      for (const [a, b] of pairs) {
+        for (let r = 0; r < 3; r++) {
+          for (let c = 0; c < 3; c++) h[r * 3 + c] += (b[r] - cb[r]) * (a[c] - ca[c]);
+        }
+      }
+      R = polarRotation(h);
+    } else if (n === 2) {
+      // 两点：方向对齐（绕轴扭转未定，好过没有）
+      const da = new THREE.Vector3(
+        pairs[1][0][0] - pairs[0][0][0],
+        pairs[1][0][1] - pairs[0][0][1],
+        pairs[1][0][2] - pairs[0][0][2]
+      ).normalize();
+      const db = new THREE.Vector3(
+        pairs[1][1][0] - pairs[0][1][0],
+        pairs[1][1][1] - pairs[0][1][1],
+        pairs[1][1][2] - pairs[0][1][2]
+      ).normalize();
+      const q = new THREE.Quaternion().setFromUnitVectors(da, db);
+      const e = new THREE.Matrix4().makeRotationFromQuaternion(q).elements;
+      R = [e[0], e[4], e[8], e[1], e[5], e[9], e[2], e[6], e[10]];
+    }
+    if (!R) R = [1, 0, 0, 0, 1, 0, 0, 0, 1]; // 退化：仅平移
+    const t = [0, 1, 2].map(
+      (r) => cb[r] - (R![r * 3] * ca[0] + R![r * 3 + 1] * ca[1] + R![r * 3 + 2] * ca[2])
+    );
+    return new THREE.Matrix4().set(
+      R[0], R[1], R[2], t[0],
+      R[3], R[4], R[5], t[1],
+      R[6], R[7], R[8], t[2],
+      0, 0, 0, 1
+    );
+  }
+
+  /** 把部件换成绑定当前骨架的 SkinnedMesh（几何、材质、可见性全沿用） */
+  private bindPart(p: PartObj) {
+    if (!this.skelSkeleton || p.mesh instanceof THREE.SkinnedMesh) return;
+    const s = new THREE.SkinnedMesh(p.geom, p.mat);
+    s.userData.path = p.mesh.userData.path;
+    s.visible = p.mesh.visible;
+    s.frustumCulled = false; // 蒙皮变形后静态包围球不再可靠
+    this.scene.remove(p.mesh);
+    this.scene.add(s);
+    // 顶点与骨骼同处世界空间，bindMatrix 用单位阵
+    s.bind(this.skelSkeleton, new THREE.Matrix4());
+    p.mesh = s;
+  }
+
+  /** 解除蒙皮：换回静态绑定姿势网格 */
+  private unbindPart(p: PartObj) {
+    if (!(p.mesh instanceof THREE.SkinnedMesh)) return;
+    const m = new THREE.Mesh(p.geom, p.mat);
+    m.userData.path = p.mesh.userData.path;
+    m.visible = p.mesh.visible;
+    this.scene.remove(p.mesh);
+    this.scene.add(m);
+    p.mesh = m;
   }
 
   /** 应用第 i0 帧姿态；给出 i1/alpha 时做平移 lerp + 旋转 slerp 平滑插值 */
@@ -471,6 +659,9 @@ export class Viewer {
   }
 
   clearFskel() {
+    for (const p of this.parts.values()) this.unbindPart(p);
+    this.skelSkeleton?.dispose();
+    this.skelSkeleton = null;
     if (this.skelHelper) {
       this.scene.remove(this.skelHelper);
       this.skelHelper.dispose();
@@ -504,13 +695,7 @@ export class Viewer {
     for (const b of this.skelBones) {
       box.expandByPoint(b.getWorldPosition(new THREE.Vector3()));
     }
-    if (box.isEmpty()) return;
-    const center = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
-    const dist = Math.max(size.x, size.y, size.z) * 1.4 + 30;
-    this.controls.target.copy(center);
-    this.camera.position.set(center.x + dist * 0.4, center.y + dist * 0.35, center.z + dist);
-    this.camera.updateProjectionMatrix();
+    this.frameBox(box);
   }
 
   frameAll() {
@@ -521,15 +706,24 @@ export class Viewer {
       has = true;
     }
     if (!has) return;
+    this.frameBox(box);
+  }
+
+  /** 相机对准包围盒：按视口宽高比计算恰好容纳模型的距离，再放宽一倍多留边，避免初始过近 */
+  private frameBox(box: THREE.Box3) {
+    if (box.isEmpty()) return;
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
-    const dist = Math.max(size.x, size.y, size.z) * 1.4 + 30;
-    this.controls.target.copy(center);
-    this.camera.position.set(
-      center.x + dist * 0.55,
-      center.y + dist * 0.35,
-      center.z + dist
+    const fovY = (this.camera.fov * Math.PI) / 180;
+    const fovX = 2 * Math.atan(Math.tan(fovY / 2) * this.camera.aspect);
+    const need = Math.max(
+      size.y / 2 / Math.tan(fovY / 2),
+      size.x / 2 / Math.tan(fovX / 2)
     );
+    const dist = Math.max(need * 2.2, 60);
+    const dir = new THREE.Vector3(0.55, 0.35, 1).normalize();
+    this.controls.target.copy(center);
+    this.camera.position.copy(center).addScaledVector(dir, dist);
     this.camera.updateProjectionMatrix();
   }
 

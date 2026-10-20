@@ -11,7 +11,7 @@ import { shortName } from "../utils";
  * 返回 reactive store（嵌套 ref 自动解包），供 App 与各子组件直接使用。
  */
 export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
-  const rootDir = ref("G:\\pojie\\ai\\AvatarGirl");
+  const rootDir = ref(".\\res\\system\\AvatarGirl");
   const modelSet = ref<ModelSet | null>(null);
   const scanning = ref(false);
   const renderMode = ref<"shaded" | "bones" | "uv">("shaded");
@@ -142,9 +142,11 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   }
 
   function selectPart(path: string | null) {
-    selectedPart.value = path;
-    viewer.value?.highlight(path);
-    if (path && !loaded.has(path)) ensureLoaded(path);
+    // 再次点击已选中的部件 → 取消选中，整个模型恢复完整高亮
+    const next = path !== null && selectedPart.value === path ? null : path;
+    selectedPart.value = next;
+    viewer.value?.highlight(next);
+    if (next && !loaded.has(next)) ensureLoaded(next);
   }
 
   // ---------- 编辑 ----------

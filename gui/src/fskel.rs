@@ -829,7 +829,8 @@ pub fn export_glb(f: &FskelFile, out_path: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    const ACT_DIR: &str = "G:/pojie/ai/AvatarGirl/act";
+    // 项目根目录 res/system 为 pack 解压后的实际目录
+    const ACT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/system/AvatarGirl/act");
 
     #[test]
     fn parse_all_act_files() {

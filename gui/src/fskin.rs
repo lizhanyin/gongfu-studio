@@ -558,7 +558,8 @@ fn walk_images(dir: &Path, out: &mut Vec<PathBuf>) {
 mod tests {
     use super::*;
 
-    const ROOT: &str = r"G:\pojie\ai\AvatarGirl";
+    // 项目根目录 res/system 为 pack 解压后的实际目录
+    const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/system/AvatarGirl");
 
     #[test]
     fn roundtrip_all_fskins() {
@@ -599,5 +600,57 @@ mod tests {
             let w: f32 = v.influences.iter().map(|i| i.weight).sum();
             assert!((w - 1.0).abs() < 0.01, "权重和异常 {w}");
         }
+    }
+
+    /// boneLocalPos 与顶点世界坐标应为同一刚体映射下的像（间距保持不变）。
+    /// 这是 LBS 蒙皮（世界矩阵 × boneLocalPos）成立的前提。
+    #[test]
+    fn bone_local_pos_is_rigid() {
+        fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        }
+        let mut files = Vec::new();
+        walk(Path::new(ROOT), &mut files);
+        if files.is_empty() {
+            eprintln!("跳过: 测试目录不存在");
+            return;
+        }
+        let mut worst = 0f32; // 相对偏差 |dl-dw|/max(dl,1)
+        for f in &files {
+            let bytes = fs::read(f).unwrap();
+            let m = parse_fskin(&f.to_string_lossy(), &bytes).unwrap();
+            // 每根骨骼收集 (局部点, 世界点)。多影响顶点的 pos 是加权混合结果，
+            // 与单骨骼不构成刚体对应，只取单影响（权重=1）顶点验证。
+            let mut by_bone: BTreeMap<u32, Vec<([f32; 3], [f32; 3])>> = BTreeMap::new();
+            for v in &m.vertices {
+                if v.influences.len() != 1 {
+                    continue;
+                }
+                let inf = &v.influences[0];
+                by_bone
+                    .entry(inf.bone_index)
+                    .or_default()
+                    .push((inf.bone_local_pos, v.pos));
+            }
+            for (bone, pts) in &by_bone {
+                let n = pts.len();
+                assert!(n >= 1, "骨骼 {bone} 无点对");
+                // 全对采样过大时抽点（步长取整，保证首尾点参与）
+                let step = (n / 64).max(1);
+                let idx: Vec<usize> = (0..n).step_by(step).chain(std::iter::once(n - 1)).collect();
+                for &i in &idx {
+                    for &j in &idx {
+                        if i >= j {
+                            continue;
+                        }
+                        let dl = dist3(pts[i].0, pts[j].0);
+                        let dw = dist3(pts[i].1, pts[j].1);
+                        worst = worst.max((dl - dw).abs() / dl.max(1.0));
+                    }
+                }
+            }
+        }
+        eprintln!("boneLocalPos 刚性最大相对偏差 {worst:.6}");
+        assert!(worst < 0.002, "骨骼局部坐标不是刚体映射，最大相对偏差 {worst}");
     }
 }

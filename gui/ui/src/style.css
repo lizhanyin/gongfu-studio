@@ -27,6 +27,8 @@ button:disabled,
 .n-input-number .n-button { cursor: pointer; }
 
 html, body, #app { height: 100%; overflow: hidden; }
+/* n-config-provider 在 #app 与 .app 之间渲染一层 div，需显式撑满以维持 height:100% 链 */
+#app > .n-config-provider { height: 100%; }
 body {
   font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
   background: #101014;
@@ -46,7 +48,7 @@ body {
   width: 290px; flex-shrink: 0; border-right: 1px solid #2a2a32;
   overflow-y: auto; padding: 8px; background: #131318;
 }
-.viewport { flex: 1; position: relative; min-width: 0; background: #0b0b0f; }
+.viewport { flex: 1; position: relative; min-width: 0; background: #000; }
 .viewport canvas { display: block; cursor: grab; }
 .viewport canvas:active { cursor: grabbing; }
 .viewport-overlay {
