@@ -201,7 +201,7 @@ pub fn parse_fskin(path: &str, bytes: &[u8]) -> Result<FskinModel, String> {
     // ---- 材质区 ----
     r.pos = material_off;
     let lead = r.f32()?;
-    let mut read4 = |r: &mut Reader| -> Result<[f32; 4], String> {
+    let read4 = |r: &mut Reader| -> Result<[f32; 4], String> {
         let mut a = [0f32; 4];
         for v in a.iter_mut() {
             *v = r.f32()?;

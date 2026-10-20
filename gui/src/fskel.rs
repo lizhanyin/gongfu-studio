@@ -115,6 +115,13 @@ fn read_header(b: &[u8]) -> Result<(u16, u16, u32, usize), String> {
     Ok((version, checksum, frame_count, header_size))
 }
 
+/// 资源列举用的轻量头部信息：(帧数, 骨骼数)，非 SKEL 文件返回 None
+pub(crate) fn light_meta(b: &[u8]) -> Option<(u32, u32)> {
+    let (_v, _c, frame_count, header_size) = read_header(b).ok()?;
+    let bone_count = u32_at(b, header_size)?;
+    Some((frame_count, bone_count))
+}
+
 /// 字符串表：[u32 长度(含 NUL)][字节] 连续存放，返回 (名字列表, 结束偏移)
 fn read_names(b: &[u8], mut pos: usize, limit: usize) -> (Vec<String>, usize) {
     let mut names = Vec::new();

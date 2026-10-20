@@ -172,9 +172,11 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   }
 
   // ---------- 扫描 ----------
-  async function scan() {
+  /** 扫描目录并装配部件；onlyPath 给定时只装配该文件所属组（单文件预览） */
+  async function scan(dir?: string, onlyPath?: string) {
     scanning.value = true;
     try {
+      if (dir) rootDir.value = dir;
       const set = await api.scanModelSet(rootDir.value);
       modelSet.value = set;
       // 清空场景
@@ -189,21 +191,51 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
       for (const g of set.groups) {
         const def = g.parts.find((p) => p.inRoot) ?? g.parts[0];
         groupSel.set(g.signature, def.path);
-        groupVis.set(g.signature, !!g.parts.find((p) => p.inRoot));
+        if (onlyPath) {
+          // 只让目标文件所属组可见，其余组保留默认选中便于后续在变体面板打开
+          groupVis.set(g.signature, g.parts.some((p) => p.path === onlyPath));
+          if (g.parts.some((p) => p.path === onlyPath)) groupSel.set(g.signature, onlyPath);
+        } else {
+          groupVis.set(g.signature, !!g.parts.find((p) => p.inRoot));
+        }
       }
       // 依次加载可见部件（根目录 5 件 = 完整角色）
       for (const g of set.groups) {
         if (groupVis.get(g.signature)) await addToViewer(groupSel.get(g.signature)!);
       }
       viewer.value?.frameAll();
-      message.success(
-        `扫描完成: ${set.groups.length} 组 · 已装配 ${set.groups.filter((g) => groupVis.get(g.signature)).length} 个部件`
-      );
+      if (onlyPath) {
+        selectedPart.value = onlyPath;
+        viewer.value?.highlight(onlyPath);
+        message.success(`已加载部件: ${shortName(onlyPath)}`);
+      } else {
+        message.success(
+          `扫描完成: ${set.groups.length} 组 · 已装配 ${set.groups.filter((g) => groupVis.get(g.signature)).length} 个部件`
+        );
+      }
     } catch (e) {
       message.error(`扫描失败: ${e}`);
     } finally {
       scanning.value = false;
     }
+  }
+
+  /** 卸下全部部件并清空模型集（切换到 FAK 等互斥模式时调用） */
+  function clearScene() {
+    for (const p of [...loaded.keys()]) viewer.value?.removePart(p);
+    loaded.clear();
+    dirty.clear();
+    groupSel.clear();
+    groupVis.clear();
+    selectedPart.value = null;
+    modelSet.value = null;
+    viewer.value?.highlight(null);
+  }
+
+  /** 单文件预览：扫描父目录（贴图/变体信息照常可用）但只装配该部件 */
+  async function soloPreview(path: string) {
+    const dir = path.replace(/[\\/][^\\/]*$/, "");
+    await scan(dir, path);
   }
 
   async function pickDir() {
@@ -227,6 +259,8 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     return out;
   });
   const visibleCount = computed(() => visiblePaths.value.length);
+  /** 是否有皮肤部件可供操作（情境化显示皮肤工具栏/检查器） */
+  const hasParts = computed(() => loaded.size > 0);
   const statVerts = computed(() => {
     let n = 0;
     for (const p of visiblePaths.value) n += loaded.get(p)?.vertices.length ?? 0;
@@ -318,6 +352,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     selectedModel,
     visiblePaths,
     visibleCount,
+    hasParts,
     statVerts,
     statTris,
     texPreviewUrl,
@@ -331,9 +366,12 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     toggleGroup,
     changeVariant,
     selectPart,
+    addToViewer,
+    soloPreview,
     setColor,
     touchVertex,
     scan,
+    clearScene,
     pickDir,
     saveSelected,
     saveAs,

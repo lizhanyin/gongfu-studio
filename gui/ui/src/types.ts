@@ -78,6 +78,24 @@ export interface ModelSet {
   textures: TexInfo[];
 }
 
+// ---------------- 资源浏览 ----------------
+
+/** 资源目录的一个子项（树节点 / 网格卡片共用） */
+export interface ResEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  /** 小写扩展名，目录为 "dir" */
+  kind: string;
+  byteLen: number;
+  /** 目录是否为"整体模型"（根级含 .fskin 或 act/ 内含 .FSKEL） */
+  isModel: boolean;
+  vertexCount?: number;
+  triangleCount?: number;
+  frameCount?: number;
+  boneCount?: number;
+}
+
 export interface TexImageDto {
   width: number;
   height: number;
@@ -85,15 +103,6 @@ export interface TexImageDto {
 }
 
 // ---------------- FSKEL 动作 ----------------
-
-export interface FskelBrief {
-  path: string;
-  fileName: string;
-  frameCount: number;
-  boneCount: number;
-  byteLen: number;
-  actionName: string;
-}
 
 export interface FskelAction {
   name: string;
@@ -112,4 +121,55 @@ export interface FskelMeta {
   boneNames: string[];
   parents: number[];
   actions: FskelAction[];
+}
+
+// ---------------- FAK 顶点动画 ----------------
+
+export interface FakSubmesh {
+  index: number;
+  pad: number[];
+  bboxMax: number[];
+  bboxMin: number[];
+  /** 扁平 u16 索引，每 3 个为一个三角形，引用共享顶点池 */
+  triangles: number[];
+  tail: number[];
+}
+
+export interface FakFrame {
+  name: string;
+  /** 该帧持续时长（秒） */
+  frameDt: number;
+  /** 扁平顶点数据：每顶点 8 个 f32 = [pos3][normal3][uv2] */
+  data: number[];
+}
+
+export interface FakMaterial {
+  index: number;
+  diffuse: number[];
+  ambient: number[];
+  emissive: number[];
+  specular: number[];
+  specPower: number;
+  pre: number[];
+  texturePath: string;
+  tail: number[];
+}
+
+export interface FakAction {
+  name: string;
+  firstFrame: number;
+  frameCount: number;
+}
+
+export interface FakModel {
+  path: string;
+  version: number;
+  vertexCount: number;
+  bboxMax: number[];
+  bboxMin: number[];
+  reserved256: number[];
+  submeshes: FakSubmesh[];
+  frames: FakFrame[];
+  materials: FakMaterial[];
+  actions: FakAction[];
 }

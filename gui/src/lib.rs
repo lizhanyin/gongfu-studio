@@ -1,7 +1,9 @@
 mod dds;
+mod fak;
 mod fskin;
 mod fskel;
 mod obj;
+mod res;
 
 use base64::Engine;
 use serde::Serialize;
@@ -97,6 +99,28 @@ fn export_fskel_glb(path: String, out_path: String) -> Result<String, String> {
     fskel::export_glb(&f, &out_path)
 }
 
+// ---------------- 资源浏览 ----------------
+
+/// .fak 顶点动画模型（含全部帧顶点数据）
+#[tauri::command]
+fn load_fak(path: String) -> Result<fak::FakModel, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取失败: {e}"))?;
+    fak::parse_fak(&path, &bytes)
+}
+
+/// 保存 .fak（未修改的模型字节级还原，见 fak roundtrip 测试）
+#[tauri::command]
+fn save_fak(path: String, model: fak::FakModel) -> Result<(), String> {
+    let bytes = fak::serialize_fak(&model)?;
+    std::fs::write(&path, bytes).map_err(|e| format!("写入失败: {e}"))
+}
+
+/// 列举资源目录直接子项（供资源树懒加载 / 资源网格）
+#[tauri::command]
+fn list_res_dir(dir: String) -> Result<Vec<res::ResEntry>, String> {
+    res::list_dir(&dir)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -113,7 +137,10 @@ pub fn run() {
             load_fskel_meta,
             load_fskel_frames,
             export_fskel_bvh,
-            export_fskel_glb
+            export_fskel_glb,
+            load_fak,
+            save_fak,
+            list_res_dir
         ])
         .run(tauri::generate_context!())
         .expect("运行 Tauri 失败");

@@ -1,0 +1,109 @@
+import { reactive, ref } from "vue";
+import { open } from "@tauri-apps/plugin-dialog";
+import { api } from "../api";
+import type { ResEntry } from "../types";
+import { message } from "../message";
+import { shortName } from "../utils";
+
+/** n-tree 节点（树只放目录，文件由资源网格展示）；带索引签名以兼容 naive-ui TreeOption */
+export interface TreeNode {
+  [k: string]: unknown;
+  key: string; // 完整路径
+  label: string;
+  isDir: true;
+  isModel: boolean;
+  isLeaf: false;
+  children?: TreeNode[];
+}
+
+function toNode(e: ResEntry): TreeNode {
+  return {
+    key: e.path,
+    label: e.name,
+    isDir: true,
+    isModel: e.isModel,
+    isLeaf: false,
+  };
+}
+
+/**
+ * 资源树（以 res 为根，懒加载目录）+ 当前目录的资源网格数据。
+ * 树/网格只负责浏览；预览与整体模型装配由 App 层路由到 skin/act store。
+ */
+export function useResourceTree() {
+  const rootDir = ref(".\\res");
+  const treeData = ref<TreeNode[]>([]);
+  const treeLoading = ref(false);
+  /** 网格当前展示的目录（null = 未初始化） */
+  const currentDir = ref<string | null>(null);
+  const gridEntries = ref<ResEntry[]>([]);
+  const gridLoading = ref(false);
+
+  async function init() {
+    treeLoading.value = true;
+    try {
+      treeData.value = [
+        {
+          key: rootDir.value,
+          label: shortName(rootDir.value) || rootDir.value,
+          isDir: true,
+          isModel: false,
+          isLeaf: false,
+        },
+      ];
+      await selectDir(rootDir.value);
+    } catch (e) {
+      message.error(`资源根目录加载失败: ${e}`);
+    } finally {
+      treeLoading.value = false;
+    }
+  }
+
+  async function changeRoot(dir: string) {
+    rootDir.value = dir;
+    currentDir.value = null;
+    gridEntries.value = [];
+    await init();
+  }
+
+  async function pickRoot() {
+    const d = await open({ directory: true, defaultPath: rootDir.value });
+    if (d) await changeRoot(d);
+  }
+
+  /** 选中目录：网格切换为该目录内容 */
+  async function selectDir(path: string) {
+    gridLoading.value = true;
+    try {
+      gridEntries.value = await api.listResDir(path);
+      currentDir.value = path;
+    } catch (e) {
+      message.error(`目录读取失败: ${e}`);
+    } finally {
+      gridLoading.value = false;
+    }
+  }
+
+  /** 树节点懒加载子目录（供 n-tree on-load） */
+  async function loadChildren(path: string): Promise<TreeNode[]> {
+    const list = await api.listResDir(path);
+    return list.filter((e) => e.isDir).map(toNode);
+  }
+
+  return reactive({
+    rootDir,
+    treeData,
+    treeLoading,
+    currentDir,
+    gridEntries,
+    gridLoading,
+    init,
+    changeRoot,
+    pickRoot,
+    refreshRoot: init,
+    selectDir,
+    loadChildren,
+  });
+}
+
+export type ResourceTreeStore = ReturnType<typeof useResourceTree>;

@@ -1,17 +1,16 @@
-import { computed, onMounted, onUnmounted, reactive, ref, type Ref, type ShallowRef } from "vue";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { computed, onMounted, onUnmounted, reactive, ref, type ShallowRef } from "vue";
+import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
-import type { FskelBrief, FskelMeta } from "../types";
+import type { FskelMeta } from "../types";
 import type { Viewer } from "../viewer";
 import { message } from "../message";
 
 /**
- * FSKEL 动作模式：动作文件扫描 / 加载、播放控制（rAF 循环）、BVH / GLB 导出。
+ * FSKEL 动作：加载/播放（rAF 循环）、BVH / GLB 导出。
+ * 动作文件浏览由资源树/网格承担，这里只管"已加载的动作"。
  * 返回 reactive store（嵌套 ref 自动解包），供 App 与各子组件直接使用。
  */
-export function useActMode(viewer: ShallowRef<Viewer | null>, rootDir: Ref<string>) {
-  const actFiles = ref<FskelBrief[]>([]);
-  const actScanning = ref(false);
+export function useActMode(viewer: ShallowRef<Viewer | null>) {
   const actMeta = ref<FskelMeta | null>(null);
   const actPoses = ref<Float32Array | null>(null);
   const actLoading = ref(false);
@@ -31,40 +30,8 @@ export function useActMode(viewer: ShallowRef<Viewer | null>, rootDir: Ref<strin
     return [a.firstFrame, a.firstFrame + a.frameCount];
   });
   const actionFrames = computed(() => actionRange.value[1] - actionRange.value[0]);
-
-  async function scanAct() {
-    actScanning.value = true;
-    try {
-      const dir = rootDir.value.replace(/[\\/]+$/, "") + "\\act";
-      actFiles.value = await api.scanActDir(dir);
-      message.success(`动作目录扫描完成: ${actFiles.value.length} 个文件`);
-    } catch (e) {
-      message.error(`扫描动作目录失败: ${e}`);
-    } finally {
-      actScanning.value = false;
-    }
-  }
-
-  async function pickActFile() {
-    const p = await open({
-      defaultPath: rootDir.value,
-      filters: [{ name: "FSKEL 动作", extensions: ["fskel"] }],
-    });
-    if (p) {
-      if (!actFiles.value.some((f) => f.path === p)) {
-        // 单独打开的文件插到列表最前
-        actFiles.value.unshift({
-          path: p,
-          fileName: (p.split(/[\\/]/).pop() ?? p).replace(/\.fskel$/i, ""),
-          frameCount: 0,
-          boneCount: 0,
-          byteLen: 0,
-          actionName: "",
-        });
-      }
-      openActFile(p);
-    }
-  }
+  /** FSKEL 恒定 30 FPS（PlayBar 显示用） */
+  const fps = computed(() => 30);
 
   async function openActFile(path: string) {
     actLoading.value = true;
@@ -75,12 +42,6 @@ export function useActMode(viewer: ShallowRef<Viewer | null>, rootDir: Ref<strin
       actMeta.value = meta;
       actPoses.value = Float32Array.from(arr);
       viewer.value?.setFskel(meta, actPoses.value);
-      // 同步左侧列表条目信息
-      const brief = actFiles.value.find((f) => f.path === path);
-      if (brief && !brief.frameCount) {
-        brief.frameCount = meta.frameCount;
-        brief.boneCount = meta.boneCount;
-      }
       currentAction.value = 0;
       playTime.value = 0;
       playing.value = true;
@@ -90,6 +51,14 @@ export function useActMode(viewer: ShallowRef<Viewer | null>, rootDir: Ref<strin
     } finally {
       actLoading.value = false;
     }
+  }
+
+  /** 关闭当前动作：卸下骨架，皮肤恢复绑定姿势 */
+  function closeAct() {
+    playing.value = false;
+    actMeta.value = null;
+    actPoses.value = null;
+    viewer.value?.clearFskel();
   }
 
   function selectAction(i: number) {
@@ -177,8 +146,6 @@ export function useActMode(viewer: ShallowRef<Viewer | null>, rootDir: Ref<strin
   onUnmounted(() => cancelAnimationFrame(playRaf));
 
   return reactive({
-    actFiles,
-    actScanning,
     actMeta,
     actPoses,
     actLoading,
@@ -190,9 +157,9 @@ export function useActMode(viewer: ShallowRef<Viewer | null>, rootDir: Ref<strin
     currentActionInfo,
     actionRange,
     actionFrames,
-    scanAct,
-    pickActFile,
+    fps,
     openActFile,
+    closeAct,
     selectAction,
     scrub,
     setSkinOverlay,

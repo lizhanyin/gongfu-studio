@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  FakModel,
   FskinModel,
-  FskelBrief,
   FskelMeta,
   ModelSet,
+  ResEntry,
   TexImageDto,
 } from "./types";
 
@@ -19,7 +20,6 @@ export const api = {
     invoke<[number[], number[]]>("compute_bbox", { model }),
   toggleDevtools: () => invoke<void>("toggle_devtools"),
   // FSKEL 动作
-  scanActDir: (dir: string) => invoke<FskelBrief[]>("scan_act_dir", { dir }),
   loadFskelMeta: (path: string) => invoke<FskelMeta>("load_fskel_meta", { path }),
   /** [from, to) 帧的扁平姿态：帧 × 骨 × (tx,ty,tz,qx,qy,qz,qw) */
   loadFskelFrames: (path: string, from: number, to: number) =>
@@ -28,4 +28,10 @@ export const api = {
     invoke<string>("export_fskel_bvh", { path, actionIndex, outPath }),
   exportFskelGlb: (path: string, outPath: string) =>
     invoke<string>("export_fskel_glb", { path, outPath }),
+  // 资源浏览
+  listResDir: (dir: string) => invoke<ResEntry[]>("list_res_dir", { dir }),
+  // FAK 顶点动画模型（含全部帧顶点数据）
+  loadFak: (path: string) => invoke<FakModel>("load_fak", { path }),
+  saveFak: (path: string, model: FakModel) =>
+    invoke<void>("save_fak", { path, model }),
 };

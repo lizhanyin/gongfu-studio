@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { FskinModel, FskelMeta, Influence } from "./types";
+import type { FakModel, FskinModel, FskelMeta, Influence } from "./types";
 
 export interface TexData {
   width: number;
@@ -141,6 +141,15 @@ export class Viewer {
   private skelSkeleton: THREE.Skeleton | null = null;
   private qa = new THREE.Quaternion();
   private qb = new THREE.Quaternion();
+
+  // ---- FAK 顶点动画 ----
+  private fakModel: FakModel | null = null;
+  private fakMeshes: THREE.Mesh[] = [];
+  private fakGeoms: THREE.BufferGeometry[] = [];
+  private fakMats: THREE.MeshStandardMaterial[] = [];
+  /** 所有子网格共享的顶点属性（位置/法线逐帧更新，UV 恒定） */
+  private fakPos: THREE.BufferAttribute | null = null;
+  private fakNrm: THREE.BufferAttribute | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -408,6 +417,7 @@ export class Viewer {
 
   setWireframe(on: boolean) {
     for (const p of this.parts.values()) p.mat.wireframe = on;
+    for (const m of this.fakMats) m.wireframe = on;
   }
 
   /** 高亮选中部件：其余半透明 */
@@ -682,6 +692,119 @@ export class Viewer {
     this.fskelBoneCount = 0;
   }
 
+  // ---------------- FAK 顶点动画 ----------------
+
+  /**
+   * 构建顶点动画模型：每个子网格一个 Mesh，几何引用同一份共享顶点池属性
+   * （position/normal 逐帧更新，UV 经全帧验证恒定作静态属性）。
+   * mats[i] 为子网格 i 的贴图（按材质记录序号一一对应）。
+   */
+  setFak(model: FakModel, mats: { tex: TexData | null; file: string | null }[]) {
+    this.clearFak();
+    this.fakModel = model;
+    const n = model.vertexCount;
+    const frame0 = model.frames[0]?.data ?? [];
+
+    const pos = new Float32Array(n * 3);
+    const nrm = new Float32Array(n * 3);
+    const uv = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      uv[i * 2] = frame0[i * 8 + 6];
+      uv[i * 2 + 1] = frame0[i * 8 + 7];
+    }
+    this.fakPos = new THREE.BufferAttribute(pos, 3);
+    this.fakNrm = new THREE.BufferAttribute(nrm, 3);
+    this.fakPos.setUsage(THREE.DynamicDrawUsage);
+    this.fakNrm.setUsage(THREE.DynamicDrawUsage);
+
+    model.submeshes.forEach((s, i) => {
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute("position", this.fakPos!);
+      geom.setAttribute("normal", this.fakNrm!);
+      geom.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+      geom.setIndex(s.triangles);
+      const fm = model.materials[Math.min(i, model.materials.length - 1)];
+      const mat = new THREE.MeshStandardMaterial({
+        side: THREE.DoubleSide,
+        roughness: 0.75,
+        metalness: 0.0,
+      });
+      if (fm) {
+        mat.color.setRGB(fm.diffuse[0], fm.diffuse[1], fm.diffuse[2]);
+        mat.emissive.setRGB(fm.emissive[0], fm.emissive[1], fm.emissive[2]);
+        mat.roughness = Math.max(0.05, Math.min(1, 1 - fm.specPower / 60));
+      }
+      const m = mats[i];
+      if (m?.tex && m.file) mat.map = this.getTexture(m.file, m.tex);
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.frustumCulled = false; // 顶点动画变形后静态包围球不再可靠
+      this.scene.add(mesh);
+      this.fakMeshes.push(mesh);
+      this.fakGeoms.push(geom);
+      this.fakMats.push(mat);
+    });
+    this.applyFakFrame(0, 0, 0);
+  }
+
+  /** 应用第 i0 帧；给出 i1/alpha 时做位置/法线 lerp 平滑插值（法线重归一化） */
+  applyFakFrame(i0: number, i1: number, alpha: number) {
+    const m = this.fakModel;
+    const pos = this.fakPos;
+    const nrm = this.fakNrm;
+    if (!m || !pos || !nrm) return;
+    const n = m.vertexCount;
+    const d0 = m.frames[i0]?.data;
+    if (!d0) return;
+    const d1 = alpha > 0 && i1 !== i0 ? m.frames[i1]?.data : null;
+    const pa = pos.array as Float32Array;
+    const na = nrm.array as Float32Array;
+    for (let i = 0; i < n; i++) {
+      const b = i * 8;
+      const o = i * 3;
+      if (d1) {
+        const a = alpha;
+        pa[o] = d0[b] + (d1[b] - d0[b]) * a;
+        pa[o + 1] = d0[b + 1] + (d1[b + 1] - d0[b + 1]) * a;
+        pa[o + 2] = d0[b + 2] + (d1[b + 2] - d0[b + 2]) * a;
+        na[o] = d0[b + 3] + (d1[b + 3] - d0[b + 3]) * a;
+        na[o + 1] = d0[b + 4] + (d1[b + 4] - d0[b + 4]) * a;
+        na[o + 2] = d0[b + 5] + (d1[b + 5] - d0[b + 5]) * a;
+      } else {
+        pa[o] = d0[b];
+        pa[o + 1] = d0[b + 1];
+        pa[o + 2] = d0[b + 2];
+        na[o] = d0[b + 3];
+        na[o + 1] = d0[b + 4];
+        na[o + 2] = d0[b + 5];
+      }
+      // 文件内法线未归一化（长度 2.1~3.0），写入时归一化保证光照正确
+      const len = Math.hypot(na[o], na[o + 1], na[o + 2]);
+      if (len > 1e-6) {
+        na[o] /= len;
+        na[o + 1] /= len;
+        na[o + 2] /= len;
+      }
+    }
+    pos.needsUpdate = true;
+    nrm.needsUpdate = true;
+  }
+
+  clearFak() {
+    for (const mesh of this.fakMeshes) this.scene.remove(mesh);
+    for (const g of this.fakGeoms) g.dispose();
+    for (const m of this.fakMats) m.dispose();
+    this.fakMeshes = [];
+    this.fakGeoms = [];
+    this.fakMats = [];
+    this.fakPos = null;
+    this.fakNrm = null;
+    this.fakModel = null;
+  }
+
+  hasFak() {
+    return this.fakMeshes.length > 0;
+  }
+
   /** 皮肤网格整体显隐（动作模式下叠加/隐藏绑定姿势网格） */
   setPartsVisible(v: boolean) {
     for (const p of this.parts.values()) p.mesh.visible = v;
@@ -703,6 +826,16 @@ export class Viewer {
     let has = false;
     for (const p of this.parts.values()) {
       box.expandByObject(p.mesh);
+      has = true;
+    }
+    if (this.fakMeshes.length) {
+      // FAK 为逐帧变形网格，用当前顶点位置直接求包围盒
+      const pa = this.fakPos?.array as Float32Array | undefined;
+      if (pa) {
+        for (let i = 0; i < pa.length; i += 3) {
+          box.expandByPoint(new THREE.Vector3(pa[i], pa[i + 1], pa[i + 2]));
+        }
+      }
       has = true;
     }
     if (!has) return;
