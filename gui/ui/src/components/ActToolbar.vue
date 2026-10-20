@@ -1,6 +1,7 @@
 <template>
   <div class="toolbar">
     <n-checkbox size="small" :checked="act.showSkinOverlay" @update:checked="act.setSkinOverlay">叠加皮肤网格</n-checkbox>
+    <n-checkbox size="small" :checked="act.showSkeleton" @update:checked="act.setSkeletonVisible">显示骨架</n-checkbox>
     <n-button size="small" @click="act.frameSkeleton()">定位</n-button>
     <n-button size="small" @click="act.closeAct">关闭动作</n-button>
     <div class="spacer"></div>

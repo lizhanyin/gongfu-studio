@@ -784,7 +784,7 @@ pub fn export_glb(f: &FskelFile, out_path: &str) -> Result<String, String> {
         .collect();
 
     let json = format!(
-        "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"Gongfu Studio (Gongfu-studio)\"}},\
+        "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"Gongfu Studio (Gongfu-Studio)\"}},\
 \"scene\":0,\"scenes\":[{{\"nodes\":[{}]}}],\
 \"nodes\":[{}],\
 \"animations\":[{}],\

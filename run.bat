@@ -5,11 +5,30 @@ rem NOTE: keep this file ASCII-only; cmd.exe parses bat in ANSI codepage (GBK).
 setlocal
 cd /d "%~dp0"
 
+rem actual cargo output name (lowercase s, normalized from package Gongfu-Studio)
+set EXE_NAME=Gongfu-Studio.exe
+
 echo [1/4] kill leftover process...
-taskkill /IM Gongfu-studio.exe /F >nul 2>&1
+taskkill /IM %EXE_NAME% /F >nul 2>&1
+rem wait up to ~5s for exit; a running exe cannot be deleted or relinked,
+rem which would fail later with a confusing linker error
+set /a KILLTRIES=0
+:waitkill
+tasklist /FI "IMAGENAME eq %EXE_NAME%" 2>nul | find /i "%EXE_NAME%" >nul 2>&1
+if errorlevel 1 goto killed
+set /a KILLTRIES+=1
+if %KILLTRIES% geq 5 goto killfail
+timeout /t 1 /nobreak >nul
+goto waitkill
+:killfail
+echo.
+echo *** ERROR: cannot terminate %EXE_NAME%, close it manually and retry ***
+pause
+exit /b 1
+:killed
 
 echo [2/4] remove old outputs...
-if exist "target\release\Gongfu-studio.exe" del /q "target\release\Gongfu-studio.exe"
+if exist "target\release\%EXE_NAME%" del /q "target\release\%EXE_NAME%"
 if exist "gui\ui\dist" rmdir /s /q "gui\ui\dist"
 
 if "%~1"=="--full" (
@@ -32,7 +51,7 @@ call cargo build --release
 if errorlevel 1 goto :err
 
 echo [4/4] start Gongfu Studio...
-start "" "target\release\Gongfu-studio.exe"
+start "" "target\release\%EXE_NAME%"
 echo done.
 exit /b 0
 

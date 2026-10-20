@@ -1,4 +1,4 @@
-# Gongfu-studio
+# Gongfu-Studio
 
 功夫世界（软星 vEngine 引擎）游戏资源的逆向工程与 Mod 工具集。
 

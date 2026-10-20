@@ -25,6 +25,9 @@ interface PartObj {
   model: FskinModel;
   /** 跨缝拆分产生的副本顶点，编辑顶点时需同步 */
   clones: CloneVert[];
+  /** 饰品透明叠层（共享几何，TFaceDetail 贴花） */
+  overlayMesh: THREE.Mesh | null;
+  overlayMat: THREE.MeshStandardMaterial | null;
 }
 
 function b64ToBytes(b64: string): Uint8Array {
@@ -134,10 +137,12 @@ export class Viewer {
   private skelRoot: THREE.Bone | null = null;
   private skelHelper: THREE.SkeletonHelper | null = null;
   private jointMesh: THREE.InstancedMesh | null = null;
+  /** 骨架可视化（线条 + 关节小球）显隐，跨动作加载保持 */
+  private skeletonVisible = true;
   /** 全部帧的扁平姿态：帧 × 骨 × 7 */
   private fskelPoses: Float32Array | null = null;
   private fskelBoneCount = 0;
-  /** 部件蒙皮绑定的骨架（动作模式下网格跟随骨骼变形） */
+  /** 蒙皮共享骨架（绑定矩阵为各骨骼的共识拟合，部件增删后就地刷新） */
   private skelSkeleton: THREE.Skeleton | null = null;
   private qa = new THREE.Quaternion();
   private qb = new THREE.Quaternion();
@@ -370,20 +375,26 @@ export class Viewer {
     const mesh = new THREE.Mesh(geom, mat);
     mesh.userData.path = path;
     this.scene.add(mesh);
-    const part: PartObj = { mesh, geom, mat, model, clones };
+    const part: PartObj = { mesh, geom, mat, model, clones, overlayMesh: null, overlayMat: null };
     this.parts.set(path, part);
-    // 动作模式已绑骨架时直接以蒙皮网格入场景
-    if (this.skelSkeleton) this.bindPart(part);
+    // 动作模式已绑骨架时直接以蒙皮网格入场景，并刷新各骨共识绑定矩阵
+    if (this.skelSkeleton) {
+      this.bindPart(part);
+      this.refreshBindInverses();
+    }
     this.applyMode(this.mode);
   }
 
   removePart(path: string) {
     const p = this.parts.get(path);
     if (!p) return;
+    this.removeOverlay(p);
     this.scene.remove(p.mesh);
     p.geom.dispose();
     p.mat.dispose();
     this.parts.delete(path);
+    // 部件集合变化可能改变共识（如锚定部件被移除），蒙皮激活时刷新
+    if (this.skelSkeleton) this.refreshBindInverses();
   }
 
   has(path: string) {
@@ -420,13 +431,17 @@ export class Viewer {
     for (const m of this.fakMats) m.wireframe = on;
   }
 
-  /** 高亮选中部件：其余半透明 */
+  /** 高亮选中部件：其余半透明（饰品叠层随之） */
   highlight(path: string | null) {
     for (const [k, p] of this.parts) {
       const sel = path === null || k === path;
       p.mat.transparent = !sel;
       p.mat.opacity = sel ? 1.0 : 0.28;
       p.mat.depthWrite = true;
+      if (p.overlayMat) {
+        p.overlayMat.opacity = sel ? 1.0 : 0.28;
+        p.overlayMat.needsUpdate = true;
+      }
     }
   }
 
@@ -508,6 +523,7 @@ export class Viewer {
     if (this.skelHelper) {
       const mat = this.skelHelper.material as THREE.LineBasicMaterial;
       mat.linewidth = 2;
+      this.skelHelper.visible = this.skeletonVisible;
       this.scene.add(this.skelHelper);
     }
 
@@ -522,25 +538,42 @@ export class Viewer {
       this.jointMesh.setColorAt(i, color.copy(boneColor(i)));
     }
     this.jointMesh.instanceColor!.needsUpdate = true;
+    this.jointMesh.visible = this.skeletonVisible;
     this.scene.add(this.jointMesh);
 
-    // GPU 蒙皮：从部件顶点反推每骨绑定姿势，网格换成跟随骨骼变形的 SkinnedMesh
-    this.skelSkeleton = new THREE.Skeleton(this.skelBones, this.computeBoneInverses(n));
+    // GPU 蒙皮。绑定矩阵按"共识"拟合：同一骨骼上取相互一致的多数部件的
+    // (boneLocalPos→pos) 刚体变换（如头部与其余发型），离群部件（Girl_hair05
+    // 与头部共用 0x6 骨但变换不同）被剔除——其 authored pos 端正贴在头上，
+    // 差异部分按刚性附件变换随骨骼运动，渲染始终贴合头部。
+    this.skelSkeleton?.dispose();
+    this.skelSkeleton = new THREE.Skeleton(
+      this.skelBones,
+      Array.from({ length: n }, () => new THREE.Matrix4())
+    );
+    this.refreshBindInverses();
     for (const p of this.parts.values()) this.bindPart(p);
 
     this.applyFskelFrame(0, 0, 0);
   }
 
   /**
-   * 每骨绑定世界矩阵之逆（boneInverses）。数据源是 fskin 顶点影响里的
-   * boneLocalPos：单影响顶点满足 M_bind × boneLocalPos = pos（已验证为精确
-   * 刚体映射），据此做 Kabsch 拟合；混合权重顶点的 (局部点, pos) 只是近似
-   * 对应，仅在单影响点不足 3 个时补充。无任何点对的骨骼对蒙皮无影响。
+   * 重算共享骨架的每骨绑定矩阵之逆（部件增删后调用，就地更新）。
+   * 每骨：各部件先用自身单影响点对拟合变换，两两比较划分一致簇
+   * （阈值 0.1，精确刚体数据的簇内差 ~1e-3），取点数最多的簇合并拟合；
+   * 无 ≥3 点的部件不参与投票但点对照旧并入。混合权重顶点的 (局部点, pos)
+   * 只是近似对应，仅在单影响点不足 3 个时补充。无点对的骨骼权重为 0，
+   * 逆矩阵保持单位阵。
    */
-  private computeBoneInverses(boneCount: number): THREE.Matrix4[] {
-    const exact: [number[], number[]][][] = Array.from({ length: boneCount }, () => []);
-    const approx: [number[], number[]][][] = Array.from({ length: boneCount }, () => []);
+  private refreshBindInverses() {
+    const skel = this.skelSkeleton;
+    if (!skel) return;
+    const boneCount = this.fskelBoneCount;
+    // bone -> 各部件的 exact 点对集合 与 approx 点对集合
+    const perBone: { exact: [number[], number[]][][]; approx: [number[], number[]][][] }[] =
+      Array.from({ length: boneCount }, () => ({ exact: [], approx: [] }));
     for (const p of this.parts.values()) {
+      const exact: [number[], number[]][][] = Array.from({ length: boneCount }, () => []);
+      const approx: [number[], number[]][][] = Array.from({ length: boneCount }, () => []);
       for (const v of p.model.vertices) {
         for (const inf of v.influences) {
           if (inf.boneIndex >= boneCount) continue;
@@ -549,10 +582,54 @@ export class Viewer {
           else approx[inf.boneIndex].push(pair);
         }
       }
+      for (let b = 0; b < boneCount; b++) {
+        if (exact[b].length) perBone[b].exact.push(exact[b]);
+        if (approx[b].length) perBone[b].approx.push(approx[b]);
+      }
     }
-    return Array.from({ length: boneCount }, (_, i) =>
-      this.fitBindMatrix(exact[i].length >= 3 ? exact[i] : exact[i].concat(approx[i])).invert()
-    );
+    for (let b = 0; b < boneCount; b++) {
+      const { exact, approx } = perBone[b];
+      const pool: [number[], number[]][] = [];
+      if (exact.length >= 2) {
+        // 各部件自身拟合 → 一致性分簇，取总点数最多的簇
+        const fits = exact.map((pts) => this.fitBindMatrix(pts));
+        const ok = (i: number, j: number) => this.bindTransformDiff(fits[i], fits[j]) < 0.1;
+        const compOf: number[][] = [];
+        const seen = new Set<number>();
+        for (let i = 0; i < exact.length; i++) {
+          if (seen.has(i)) continue;
+          const comp = [i];
+          seen.add(i);
+          for (let j = i + 1; j < exact.length; j++) {
+            if (!seen.has(j) && comp.some((c) => ok(c, j))) {
+              comp.push(j);
+              seen.add(j);
+            }
+          }
+          compOf.push(comp);
+        }
+        const best = compOf.reduce((a, c) =>
+          c.reduce((s, i) => s + exact[i].length, 0) > a.reduce((s, i) => s + exact[i].length, 0) ? c : a
+        );
+        for (const i of best) pool.push(...exact[i]);
+      } else if (exact.length === 1) {
+        pool.push(...exact[0]);
+      }
+      const t = this.fitBindMatrix(pool.length >= 3 ? pool : pool.concat(...approx));
+      skel.boneInverses[b].copy(t.invert());
+    }
+  }
+
+  /** 两个绑定刚体变换的差异量（R 逐元素最大差 与 t 距离 取最大） */
+  private bindTransformDiff(a: THREE.Matrix4, b: THREE.Matrix4): number {
+    let dr = 0;
+    for (let i = 0; i < 16; i++) {
+      dr = Math.max(dr, Math.abs(a.elements[i] - b.elements[i]));
+    }
+    const ta = [a.elements[12], a.elements[13], a.elements[14]];
+    const tb = [b.elements[12], b.elements[13], b.elements[14]];
+    const dt = Math.hypot(ta[0] - tb[0], ta[1] - tb[1], ta[2] - tb[2]);
+    return Math.max(dr, dt);
   }
 
   /** 点对 (骨骼局部, 世界) 的刚体拟合：H = Σ(b-cb)(a-ca)ᵀ 极分解求 R，t = cb - R·ca */
@@ -604,29 +681,94 @@ export class Viewer {
     );
   }
 
-  /** 把部件换成绑定当前骨架的 SkinnedMesh（几何、材质、可见性全沿用） */
+  /** 把部件换成绑定共享骨架的 SkinnedMesh（几何、材质、可见性全沿用） */
   private bindPart(p: PartObj) {
     if (!this.skelSkeleton || p.mesh instanceof THREE.SkinnedMesh) return;
-    const s = new THREE.SkinnedMesh(p.geom, p.mat);
-    s.userData.path = p.mesh.userData.path;
-    s.visible = p.mesh.visible;
+    p.mesh = this.toSkinned(p.mesh, p.geom, p.mat);
+    if (p.overlayMesh) {
+      p.overlayMesh = this.toSkinned(
+        p.overlayMesh,
+        p.geom,
+        p.overlayMat ?? p.overlayMesh.material as THREE.MeshStandardMaterial
+      );
+    }
+  }
+
+  /** 静态/蒙皮网格转换为绑定共享骨架的 SkinnedMesh */
+  private toSkinned(src: THREE.Mesh, geom: THREE.BufferGeometry, mat: THREE.Material): THREE.SkinnedMesh {
+    const s = new THREE.SkinnedMesh(geom, mat);
+    s.userData.path = src.userData.path;
+    s.visible = src.visible;
+    s.renderOrder = src.renderOrder;
     s.frustumCulled = false; // 蒙皮变形后静态包围球不再可靠
-    this.scene.remove(p.mesh);
+    this.scene.remove(src);
     this.scene.add(s);
     // 顶点与骨骼同处世界空间，bindMatrix 用单位阵
-    s.bind(this.skelSkeleton, new THREE.Matrix4());
-    p.mesh = s;
+    s.bind(this.skelSkeleton!, new THREE.Matrix4());
+    return s;
   }
 
   /** 解除蒙皮：换回静态绑定姿势网格 */
   private unbindPart(p: PartObj) {
     if (!(p.mesh instanceof THREE.SkinnedMesh)) return;
-    const m = new THREE.Mesh(p.geom, p.mat);
-    m.userData.path = p.mesh.userData.path;
-    m.visible = p.mesh.visible;
-    this.scene.remove(p.mesh);
+    p.mesh = this.toStatic(p.mesh, p.geom, p.mat);
+    if (p.overlayMesh instanceof THREE.SkinnedMesh) {
+      p.overlayMesh = this.toStatic(p.overlayMesh, p.geom, p.overlayMat!);
+    }
+  }
+
+  private toStatic(src: THREE.Mesh, geom: THREE.BufferGeometry, mat: THREE.Material): THREE.Mesh {
+    const m = new THREE.Mesh(geom, mat);
+    m.userData.path = src.userData.path;
+    m.visible = src.visible;
+    m.renderOrder = src.renderOrder;
+    this.scene.remove(src);
     this.scene.add(m);
-    p.mesh = m;
+    return m;
+  }
+
+  /** 饰品透明叠层：tex = null 时移除。共享部件几何，跟随蒙皮/可见性/高亮。 */
+  setPartOverlay(path: string, tex: TexData | null, texFile: string | null) {
+    const p = this.parts.get(path);
+    if (!p) return;
+    if (!tex || !texFile) {
+      this.removeOverlay(p);
+      return;
+    }
+    if (!p.overlayMat) {
+      p.overlayMat = new THREE.MeshStandardMaterial({
+        side: THREE.DoubleSide,
+        roughness: 0.75,
+        metalness: 0,
+        transparent: true,
+        depthWrite: false,
+      });
+    }
+    p.overlayMat.map = this.getTexture(texFile, tex);
+    p.overlayMat.needsUpdate = true;
+    if (!p.overlayMesh) {
+      const mesh = new THREE.Mesh(p.geom, p.overlayMat);
+      mesh.userData.path = path;
+      mesh.renderOrder = 1; // 在基础网格之后绘制
+      mesh.frustumCulled = false;
+      mesh.visible = p.mesh.visible;
+      this.scene.add(mesh);
+      p.overlayMesh = mesh;
+      if (p.mesh instanceof THREE.SkinnedMesh && this.skelSkeleton) {
+        p.overlayMesh = this.toSkinned(mesh, p.geom, p.overlayMat);
+      }
+    }
+  }
+
+  private removeOverlay(p: PartObj) {
+    if (p.overlayMesh) {
+      this.scene.remove(p.overlayMesh);
+      p.overlayMesh = null;
+    }
+    if (p.overlayMat) {
+      p.overlayMat.dispose();
+      p.overlayMat = null;
+    }
   }
 
   /** 应用第 i0 帧姿态；给出 i1/alpha 时做平移 lerp + 旋转 slerp 平滑插值 */
@@ -805,9 +947,19 @@ export class Viewer {
     return this.fakMeshes.length > 0;
   }
 
-  /** 皮肤网格整体显隐（动作模式下叠加/隐藏绑定姿势网格） */
+  /** 皮肤网格整体显隐（动作模式下叠加/隐藏绑定姿势网格），饰品叠层跟随 */
   setPartsVisible(v: boolean) {
-    for (const p of this.parts.values()) p.mesh.visible = v;
+    for (const p of this.parts.values()) {
+      p.mesh.visible = v;
+      if (p.overlayMesh) p.overlayMesh.visible = v;
+    }
+  }
+
+  /** 骨架可视化显隐（SkeletonHelper 线条 + 关节小球），蒙皮网格不受影响 */
+  setSkeletonVisible(v: boolean) {
+    this.skeletonVisible = v;
+    if (this.skelHelper) this.skelHelper.visible = v;
+    if (this.jointMesh) this.jointMesh.visible = v;
   }
 
   /** 相机对准当前骨架 */

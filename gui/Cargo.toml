@@ -1,5 +1,5 @@
 [package]
-name = "Gongfu-studio"
+name = "Gongfu-Studio"
 version = "0.1.0"
 description = "模型预览与编辑器"
 edition = "2021"

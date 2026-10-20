@@ -19,6 +19,7 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
   const playTime = ref(0);
   const speed = ref(1);
   const showSkinOverlay = ref(true);
+  const showSkeleton = ref(true);
   let playRaf = 0;
   let lastTs = 0;
 
@@ -99,6 +100,12 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
     viewer.value?.setPartsVisible(v);
   }
 
+  /** 骨架可视化开关（隐藏骨架线条与关节小球，蒙皮网格不受影响） */
+  function setSkeletonVisible(v: boolean) {
+    showSkeleton.value = v;
+    viewer.value?.setSkeletonVisible(v);
+  }
+
   function frameSkeleton() {
     viewer.value?.frameSkeleton();
   }
@@ -154,6 +161,7 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
     playTime,
     speed,
     showSkinOverlay,
+    showSkeleton,
     currentActionInfo,
     actionRange,
     actionFrames,
@@ -163,6 +171,7 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
     selectAction,
     scrub,
     setSkinOverlay,
+    setSkeletonVisible,
     frameSkeleton,
     exportBvh,
     exportGlb,

@@ -1,10 +1,19 @@
 import { computed, reactive, ref, watch, type ShallowRef } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
-import type { FskinModel, ModelSet, PartGroup, PartInfo } from "../types";
+import type { FskinModel, ModelSet, PartGroup, PartInfo, TexSlot, TexVariant } from "../types";
 import { texDataFromDto, type TexData, type Viewer } from "../viewer";
 import { message } from "../message";
 import { shortName } from "../utils";
+
+/** 衣服槽（YiFu 换装目录）：整套切换时联动 */
+const CLOTHING_SLOTS = ["upper", "lower", "boot"];
+
+/** 部件款式号：根目录成员 = 0（默认），girl_Upper_2 → 2 */
+function styleNum(p: PartInfo): number {
+  if (p.inRoot) return 0;
+  return Number((p.fileName.match(/_(\d+)\.fskin$/i) ?? [])[1] ?? 0);
+}
 
 /**
  * 皮肤模式：目录扫描、部件组装、材质 / 顶点编辑、纹理与保存导出。
@@ -16,6 +25,8 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   const scanning = ref(false);
   const renderMode = ref<"shaded" | "bones" | "uv">("shaded");
   const wireframe = ref(false);
+  /** 选中部件时是否压暗其余部件（默认关） */
+  const pickHighlight = ref(false);
   const selectedPart = ref<string | null>(null);
 
   const loaded = reactive(new Map<string, FskinModel>());
@@ -102,6 +113,86 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     v.applyMaterial(m.path);
   }
 
+  // ---------- 纹理切换槽（脸部纹理 / 饰品）与部件配色 ----------
+
+  /** 每个纹理槽当前选中的贴图路径（overlay 槽 null = 关闭） */
+  const texSlotSel = reactive(new Map<string, string | null>());
+
+  /** 磁盘贴图路径 → 游戏风格材质路径（保存后与原始数据同构） */
+  function gameTexPath(file: string): string {
+    const root = rootDir.value.replace(/[\\/]+$/, "");
+    const rel = file.toLowerCase().startsWith(root.toLowerCase())
+      ? file.slice(root.length).replace(/^[\\/]+/, "")
+      : file;
+    const base = root.split(/[\\/]+/).filter(Boolean).slice(-2).join("\\");
+    return `${base}\\${rel.replace(/\.dds$/i, ".tga")}`;
+  }
+
+  /** 应用纹理槽选项：替换类换材质贴图，叠层类挂透明饰品网格 */
+  async function applyTexVariant(slot: TexSlot, path: string | null) {
+    const v = viewer.value;
+    if (!v) return;
+    texSlotSel.set(slot.key, path);
+    if (!path) {
+      if (slot.overlay) v.setPartOverlay(slot.part, null, null);
+      return;
+    }
+    const tex = await ensureTexture(path);
+    if (!tex) return;
+    if (slot.overlay) {
+      v.setPartOverlay(slot.part, tex, path);
+      return;
+    }
+    v.refreshTexture(slot.part, tex, path);
+    const m = loaded.get(slot.part);
+    if (m) {
+      m.material.texturePath = gameTexPath(path);
+      afterEdit();
+      v.applyMaterial(slot.part);
+    }
+  }
+
+  /** 选中部件的配色族（如 ff01_00/01/02 同前缀贴图互为配色） */
+  const partTexVariants = computed<TexVariant[]>(() => {
+    const m = selectedModel.value;
+    const set = modelSet.value;
+    if (!m || !set) return [];
+    const file = resolveTexture(m.material.texturePath);
+    if (!file) return [];
+    const stem = (file.split(/[\\/]/).pop() ?? "").replace(/\.[^.]*$/, "").toLowerCase();
+    const i = stem.lastIndexOf("_");
+    if (i <= 0) return [];
+    const fam = stem.slice(0, i);
+    return set.textures
+      .filter((t) => t.stem.startsWith(fam + "_"))
+      .map((t) => ({ label: t.stem.slice(fam.length + 1), path: t.path }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  });
+
+  /** 当前部件贴图在配色族中的后缀（ff01_02 → "02"），无族返回 null */
+  const partTexCurrent = computed<string | null>(() => {
+    const m = selectedModel.value;
+    if (!m || !partTexVariants.value.length) return null;
+    const file = resolveTexture(m.material.texturePath);
+    if (!file) return null;
+    const stem = (file.split(/[\\/]/).pop() ?? "").replace(/\.[^.]*$/, "").toLowerCase();
+    const i = stem.lastIndexOf("_");
+    return i > 0 ? stem.slice(i + 1) : null;
+  });
+
+  /** 应用部件配色（发型颜色等）：替换材质贴图 */
+  async function applyPartTexture(path: string) {
+    const m = selectedModel.value;
+    const v = viewer.value;
+    if (!m || !v) return;
+    const tex = await ensureTexture(path);
+    if (!tex) return;
+    v.refreshTexture(m.path, tex, path);
+    m.material.texturePath = gameTexPath(path);
+    afterEdit();
+    v.applyMaterial(m.path);
+  }
+
   // ---------- 部件加载 ----------
   async function ensureLoaded(path: string): Promise<FskinModel | null> {
     if (loaded.has(path)) return loaded.get(path)!;
@@ -141,11 +232,119 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     if (selectedPart.value === old) selectPart(newPath);
   }
 
+  // ---------- 替换槽（头发等跨几何组互斥） ----------
+
+  /** 槽的全部可选部件：跨组收集，同几何+同贴图去重（根目录成员优先） */
+  function slotOptions(slot: string): PartInfo[] {
+    const set = modelSet.value;
+    if (!set) return [];
+    const seen = new Map<string, PartInfo>();
+    for (const g of set.groups.filter((g) => g.slot === slot)) {
+      for (const p of [...g.parts].sort((a, b) => Number(b.inRoot) - Number(a.inRoot))) {
+        const key = `${g.signature}|${p.textureFile ?? p.texturePath}`;
+        if (!seen.has(key)) seen.set(key, p);
+      }
+    }
+    return [...seen.values()];
+  }
+
+  /** 槽当前显示的部件路径（无可见组时取第一组的当前选择） */
+  function slotCurrent(slot: string): string | null {
+    const set = modelSet.value;
+    if (!set) return null;
+    const groups = set.groups.filter((g) => g.slot === slot);
+    for (const g of groups) {
+      if (groupVis.get(g.signature)) return groupSel.get(g.signature) ?? null;
+    }
+    return groups.length ? (groupSel.get(groups[0].signature) ?? null) : null;
+  }
+
+  const slotVisible = (slot: string) => {
+    const set = modelSet.value;
+    if (!set) return false;
+    return set.groups.some((g) => g.slot === slot && groupVis.get(g.signature));
+  };
+
+  /** 选择槽选项：目标组显示该部件，同槽其余组隐藏（互斥替换） */
+  async function selectSlotVariant(slot: string, path: string) {
+    const set = modelSet.value;
+    if (!set) return;
+    const target = set.groups
+      .filter((g) => g.slot === slot)
+      .find((g) => g.parts.some((p) => p.path === path));
+    if (!target) return;
+    for (const g of set.groups.filter((g) => g.slot === slot)) {
+      if (g.signature === target.signature) continue;
+      if (groupVis.get(g.signature)) {
+        const cur = groupSel.get(g.signature);
+        if (cur) viewer.value?.removePart(cur);
+        groupVis.set(g.signature, false);
+      }
+    }
+    const old = groupSel.get(target.signature);
+    if (old && old !== path) viewer.value?.removePart(old);
+    groupSel.set(target.signature, path);
+    groupVis.set(target.signature, true);
+    await addToViewer(path);
+    if (selectedPart.value && selectedPart.value === old) selectPart(path);
+  }
+
+  /** 槽整体开关 */
+  async function toggleSlot(slot: string, on: boolean) {
+    const set = modelSet.value;
+    if (!set) return;
+    const groups = set.groups.filter((g) => g.slot === slot);
+    if (on) {
+      const cur = slotCurrent(slot);
+      if (cur) await selectSlotVariant(slot, cur);
+    } else {
+      for (const g of groups) {
+        if (groupVis.get(g.signature)) {
+          const cur = groupSel.get(g.signature);
+          if (cur) viewer.value?.removePart(cur);
+          groupVis.set(g.signature, false);
+        }
+      }
+    }
+  }
+
+  // ---------- 整套换装（上衣/下装/鞋子同号款式一键切换） ----------
+
+  /** 三槽共有的款式号（可整套切换） */
+  const outfitStyles = computed<number[]>(() => {
+    const common = new Set(
+      CLOTHING_SLOTS.flatMap((s) => slotOptions(s)).map(styleNum).filter((n) => n > 0)
+    );
+    for (const s of CLOTHING_SLOTS) {
+      const nums = new Set(slotOptions(s).map(styleNum));
+      for (const n of [...common]) if (!nums.has(n)) common.delete(n);
+    }
+    return [...common].sort((a, b) => a - b);
+  });
+
+  /** 当前整套款式号：0 = 全默认，n = 三槽同款，-1 = 混合搭配 */
+  const outfitCurrent = computed<number>(() => {
+    const nums = CLOTHING_SLOTS.map((s) => {
+      const cur = slotCurrent(s);
+      const p = cur ? slotOptions(s).find((o) => o.path === cur) : null;
+      return p ? styleNum(p) : -1;
+    });
+    return nums.every((n) => n >= 0 && n === nums[0]) ? nums[0] : -1;
+  });
+
+  /** 整套切换：null = 全部恢复默认，n = 各槽选款式 n */
+  async function selectOutfit(n: number | null) {
+    for (const s of CLOTHING_SLOTS) {
+      const target = slotOptions(s).find((p) => styleNum(p) === (n ?? 0));
+      if (target) await selectSlotVariant(s, target.path);
+    }
+  }
+
   function selectPart(path: string | null) {
     // 再次点击已选中的部件 → 取消选中，整个模型恢复完整高亮
     const next = path !== null && selectedPart.value === path ? null : path;
     selectedPart.value = next;
-    viewer.value?.highlight(next);
+    viewer.value?.highlight(pickHighlight.value ? next : null);
     if (next && !loaded.has(next)) ensureLoaded(next);
   }
 
@@ -187,6 +386,9 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
       groupVis.clear();
       selectedPart.value = null;
       viewer.value?.highlight(null);
+      // 纹理槽回默认：替换类选首项（原始），叠层类关闭
+      texSlotSel.clear();
+      for (const s of set.texSlots) texSlotSel.set(s.key, s.overlay ? null : (s.variants[0]?.path ?? null));
 
       for (const g of set.groups) {
         const def = g.parts.find((p) => p.inRoot) ?? g.parts[0];
@@ -206,7 +408,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
       viewer.value?.frameAll();
       if (onlyPath) {
         selectedPart.value = onlyPath;
-        viewer.value?.highlight(onlyPath);
+        viewer.value?.highlight(pickHighlight.value ? onlyPath : null);
         message.success(`已加载部件: ${shortName(onlyPath)}`);
       } else {
         message.success(
@@ -336,6 +538,8 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
 
   watch(renderMode, (m) => viewer.value?.setMode(m));
   watch(wireframe, (w) => viewer.value?.setWireframe(w));
+  // 开关切换时立即应用到当前选中状态
+  watch(pickHighlight, (v) => viewer.value?.highlight(v ? selectedPart.value : null));
 
   return reactive({
     rootDir,
@@ -343,6 +547,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     scanning,
     renderMode,
     wireframe,
+    pickHighlight,
     selectedPart,
     loaded,
     texCache,
@@ -365,9 +570,22 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     applyTexture,
     toggleGroup,
     changeVariant,
+    slotOptions,
+    slotCurrent,
+    slotVisible,
+    selectSlotVariant,
+    toggleSlot,
+    outfitStyles,
+    outfitCurrent,
+    selectOutfit,
     selectPart,
     addToViewer,
     soloPreview,
+    texSlotSel,
+    applyTexVariant,
+    partTexVariants,
+    partTexCurrent,
+    applyPartTexture,
     setColor,
     touchVertex,
     scan,

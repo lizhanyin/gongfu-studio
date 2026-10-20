@@ -6,6 +6,7 @@
       <n-button :type="skin.renderMode === 'uv' ? 'primary' : 'default'" @click="skin.renderMode = 'uv'">UV</n-button>
     </n-button-group>
     <n-checkbox size="small" v-model:checked="skin.wireframe">线框</n-checkbox>
+    <n-checkbox size="small" v-model:checked="skin.pickHighlight">选中高亮</n-checkbox>
     <n-button size="small" @click="skin.frameAll()">定位</n-button>
     <div class="spacer"></div>
     <n-button size="small" @click="skin.exportObj" :disabled="!skin.visiblePaths.length">导出 OBJ</n-button>

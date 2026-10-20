@@ -66,12 +66,37 @@
                 </n-button>
               </div>
               <div v-show="!inspectorCollapsed" class="inspector-body">
-                <PartGroupList v-if="skin.modelSet?.groups.length" :skin="skin" />
-                <ActFileInfo v-if="act.actMeta" :act="act" />
-                <FakFileInfo v-if="fak.fakModel" :fak="fak" />
-                <PartInspector v-if="skin.selectedPart" :skin="skin" />
+                <n-collapse
+                  class="inspector-collapse"
+                  display-directive="show"
+                  :default-expanded-names="['variants', 'tex', 'act', 'fak', 'part']"
+                >
+                  <n-collapse-item
+                    v-if="skin.modelSet?.groups.length"
+                    title="换装变体"
+                    name="variants"
+                  >
+                    <PartGroupList :skin="skin" />
+                  </n-collapse-item>
+                  <n-collapse-item
+                    v-if="skin.modelSet?.texSlots.length || skin.partTexVariants.length"
+                    title="纹理切换"
+                    name="tex"
+                  >
+                    <TexSlotPanel :skin="skin" />
+                  </n-collapse-item>
+                  <n-collapse-item v-if="act.actMeta || skin.hasParts" title="动作" name="act">
+                    <ActFileInfo :act="act" :act-dir="skin.rootDir + '\\act'" />
+                  </n-collapse-item>
+                  <n-collapse-item v-if="fak.fakModel" title="FAK 信息" name="fak">
+                    <FakFileInfo :fak="fak" />
+                  </n-collapse-item>
+                  <n-collapse-item v-if="skin.selectedPart" title="部件检查" name="part">
+                    <PartInspector :skin="skin" />
+                  </n-collapse-item>
+                </n-collapse>
                 <div
-                  v-if="!skin.modelSet?.groups.length && !act.actMeta && !skin.selectedPart && !fak.fakModel"
+                  v-if="!skin.hasParts && !act.actMeta && !fak.fakModel"
                   class="inspector-empty"
                 >
                   从资源网格选择文件预览
@@ -121,6 +146,7 @@ import ActToolbar from "./components/ActToolbar.vue";
 import ResourceTree from "./components/ResourceTree.vue";
 import ResourceGrid from "./components/ResourceGrid.vue";
 import PartGroupList from "./components/PartGroupList.vue";
+import TexSlotPanel from "./components/TexSlotPanel.vue";
 import PlayBar from "./components/PlayBar.vue";
 import ActFileInfo from "./components/ActFileInfo.vue";
 import FakFileInfo from "./components/FakFileInfo.vue";

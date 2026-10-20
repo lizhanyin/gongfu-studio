@@ -171,4 +171,3 @@ fn decode_dxt(data: &[u8], w: u32, h: u32, alpha_mode: Alpha) -> Result<Vec<u8>,
     }
     Ok(out)
 }
-

@@ -65,6 +65,8 @@ export interface PartGroup {
   label: string;
   signature: string;
   parts: PartInfo[];
+  /** 替换槽（"hair"/"upper"/"lower"/"boot"）：同槽各组互斥显示；空串 = 独立部件组 */
+  slot: string;
 }
 
 export interface TexInfo {
@@ -72,10 +74,29 @@ export interface TexInfo {
   path: string;
 }
 
+export interface TexVariant {
+  label: string;
+  path: string;
+}
+
+/** 纹理切换槽：把一组贴图应用到指定部件（替换材质贴图或透明叠层） */
+export interface TexSlot {
+  /** "face" | "face_detail" */
+  key: string;
+  label: string;
+  /** 应用到的部件 fskin 路径 */
+  part: string;
+  /** true = 透明叠层（饰品），false = 替换材质贴图（脸部纹理） */
+  overlay: boolean;
+  variants: TexVariant[];
+}
+
 export interface ModelSet {
   rootDir: string;
   groups: PartGroup[];
   textures: TexInfo[];
+  /** 纹理切换槽（脸部纹理 / 饰品等） */
+  texSlots: TexSlot[];
 }
 
 // ---------------- 资源浏览 ----------------
