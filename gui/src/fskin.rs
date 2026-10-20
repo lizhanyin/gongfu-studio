@@ -854,175 +854,21 @@ mod tests {
         }
         eprintln!("M6·boneLocalPos vs head pos: 最大 {:.3}（{} 点）", hd, pairs_head.len());
     }
-
-    /// 诊断：hair05 游戏真实 LBS（M·boneLocalPos）vs viewer 共识渲染的摆放差异
+    /// 回归：蒙皮共识投票按"部件骨骼覆盖数"加权（viewer.ts refreshBindInverses
+    /// 的数据面镜像）。Girl_hair05 在 0x6 骨上有 256 个单影响点，按点数投票会
+    /// 压过头部（124 点），把共享 0x6 的部件（头部/基础发型）装到 hair05 的
+    /// 离群绑定上——两套绑定相差约 5° 旋转 + 4 单位平移，发髻与颅顶脱开数
+    /// 单位（用户报告的"5 号头发绑定位置异常"）。按骨骼覆盖数加权后头部
+    /// （5 骨）赢得 0x6 共识，hair05 按头部绑定渲染，与头部保持刚性贴合。
     #[test]
-    fn hair05_two_paths() {
+    fn hair05_consensus_vote_regression() {
         use crate::fskel;
-        let load = |rel: &str| parse_fskin(&format!("{ROOT}/{rel}"), &fs::read(format!("{ROOT}/{rel}")).unwrap()).unwrap();
-        let head = load("girl_head.fskin");
-        let h5 = load("MHair/Girl_hair05.fskin");
-        let h4 = load("MHair/Girl_hair04.fskin");
-
-        // 各部件用到的骨骼
-        let bones_of = |m: &FskinModel| {
-            let mut b: Vec<u32> = m.vertices.iter().flat_map(|v| v.influences.iter().map(|i| i.bone_index)).collect();
-            b.sort_unstable(); b.dedup(); b
-        };
-        eprintln!("head bones: {:?}", bones_of(&head));
-        eprintln!("hair05 bones: {:?}", bones_of(&h5));
-        eprintln!("hair04 bones: {:?}", bones_of(&h4));
-
-        // sta.FSKEL 世界矩阵（帧 f）
-        let skel = fskel::get_or_load(&format!("{ROOT}/act/sta.FSKEL")).unwrap();
-        let qm = |q: [f32; 4]| -> [[f32; 4]; 4] {
-            let n = (q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]).sqrt();
-            let (x, y, z, w) = (q[0]/n, q[1]/n, q[2]/n, q[3]/n);
-            let r = [
-                [1.0-2.0*(y*y+z*z), 2.0*(x*y-z*w), 2.0*(x*z+y*w)],
-                [2.0*(x*y+z*w), 1.0-2.0*(x*x+z*z), 2.0*(y*z-x*w)],
-                [2.0*(x*z-y*w), 2.0*(y*z+x*w), 1.0-2.0*(x*x+y*y)],
-            ];
-            let mut m = [[0f32; 4]; 4];
-            for i in 0..3 { for j in 0..3 { m[i][j] = r[i][j]; } m[i][3] = 0.0; }
-            m
-        };
-        let world_at = |frame: usize| -> Vec<[[f32; 4]; 4]> {
-            let flat = skel.frames_flat(frame as u32, frame as u32 + 1);
-            let mut world = vec![[[0f32; 4]; 4]; skel.parents.len()];
-            for b in 0..skel.parents.len() {
-                let o = b * 7;
-                let mut m = qm([flat[o+3], flat[o+4], flat[o+5], flat[o+6]]);
-                m[0][3] = flat[o]; m[1][3] = flat[o+1]; m[2][3] = flat[o+2]; m[3][3] = 1.0;
-                let p = skel.parents[b];
-                if p >= 0 {
-                    let pm = world[p as usize];
-                    let mut w = [[0f32; 4]; 4];
-                    for i in 0..4 { for j in 0..4 { w[i][j] = (0..4).map(|k| pm[i][k]*m[k][j]).sum(); } }
-                    world[b] = w;
-                } else { world[b] = m; }
-            }
-            world
-        };
-        let apply = |m: &[[f32; 4]; 4], p: [f32; 3]| -> [f32; 3] {
-            [m[0][0]*p[0]+m[0][1]*p[1]+m[0][2]*p[2]+m[0][3],
-             m[1][0]*p[0]+m[1][1]*p[1]+m[1][2]*p[2]+m[1][3],
-             m[2][0]*p[0]+m[2][1]*p[1]+m[2][2]*p[2]+m[2][3]]
-        };
-        let centroid = |pts: &[[f32; 3]]| -> [f32; 3] {
-            let n = pts.len() as f32;
-            let mut c = [0f32; 3];
-            for p in pts { for k in 0..3 { c[k] += p[k] / n; } }
-            c
-        };
-        let bbox = |pts: &[[f32; 3]]| -> ([f32; 3], [f32; 3]) {
-            let mut mn = [f32::MAX; 3]; let mut mx = [f32::MIN; 3];
-            for p in pts { for k in 0..3 { mn[k] = mn[k].min(p[k]); mx[k] = mx[k].max(p[k]); } }
-            (mn, mx)
-        };
-
-        for frame in [0usize, skel.frame_count() as usize / 2] {
-            let world = world_at(frame);
-            eprintln!("=== sta 帧 {frame} ===");
-            // 游戏真实 LBS：Σ w·M_b·local_b
-            let game_pos = |m: &FskinModel| -> Vec<[f32; 3]> {
-                m.vertices.iter().map(|v| {
-                    let mut o = [0f32; 3];
-                    for inf in &v.influences {
-                        let x = apply(&world[inf.bone_index as usize], inf.bone_local_pos);
-                        for k in 0..3 { o[k] += inf.weight * x[k]; }
-                    }
-                    o
-                }).collect()
-            };
-            let gh = game_pos(&head); let g5 = game_pos(&h5); let g4 = game_pos(&h4);
-            let ch = centroid(&gh); let c5 = centroid(&g5); let c4 = centroid(&g4);
-            let (mn5, mx5) = bbox(&g5);
-            eprintln!("游戏LBS head 质心 {:?}", ch);
-            eprintln!("游戏LBS hair05 质心 {:?} bbox {:?}..{:?}", c5, mn5, mx5);
-            eprintln!("游戏LBS hair04 质心 {:?}（对照）", c4);
-            eprintln!("游戏LBS 相对摆放 hair05-head {:?}  hair04-head {:?}", [c5[0]-ch[0],c5[1]-ch[1],c5[2]-ch[2]], [c4[0]-ch[0],c4[1]-ch[1],c4[2]-ch[2]]);
-            let ah: Vec<[f32;3]> = head.vertices.iter().map(|v| v.pos).collect();
-            let a5: Vec<[f32;3]> = h5.vertices.iter().map(|v| v.pos).collect();
-            let a4: Vec<[f32;3]> = h4.vertices.iter().map(|v| v.pos).collect();
-            let ach = centroid(&ah); let ac5 = centroid(&a5); let ac4 = centroid(&a4);
-            eprintln!("authored 相对摆放 hair05-head {:?}  hair04-head {:?}", [ac5[0]-ach[0],ac5[1]-ach[1],ac5[2]-ach[2]], [ac4[0]-ach[0],ac4[1]-ach[1],ac4[2]-ach[2]]);
-            eprintln!("游戏LBS 相对 authored 的整体平移: head {:?} hair05 {:?} hair04 {:?}",
-                [ch[0]-ach[0],ch[1]-ach[1],ch[2]-ach[2]],
-                [c5[0]-ac5[0],c5[1]-ac5[1],c5[2]-ac5[2]],
-                [c4[0]-ac4[0],c4[1]-ac4[1],c4[2]-ac4[2]]);
-            // 每骨 c_b（head 上的骨骼）：M_b·local − pos 的均值与波动
-            let mut by_bone: std::collections::BTreeMap<u32, Vec<[f32;3]>> = Default::default();
-            for v in &head.vertices {
-                if v.influences.len() == 1 {
-                    let inf = &v.influences[0];
-                    let x = apply(&world[inf.bone_index as usize], inf.bone_local_pos);
-                    by_bone.entry(inf.bone_index).or_default().push([x[0]-v.pos[0], x[1]-v.pos[1], x[2]-v.pos[2]]);
-                }
-            }
-            for (b, cs) in &by_bone {
-                let mean = centroid(cs);
-                let spread = cs.iter().map(|c| ((c[0]-mean[0]).powi(2)+(c[1]-mean[1]).powi(2)+(c[2]-mean[2]).powi(2)).sqrt()).fold(0f32, f32::max);
-                eprintln!("  head 骨 {b:#x}: c̄={:?} 波动 {:.3}", mean, spread);
-            }
-            let mut by_bone5: std::collections::BTreeMap<u32, Vec<[f32;3]>> = Default::default();
-            for v in &h5.vertices {
-                if v.influences.len() == 1 {
-                    let inf = &v.influences[0];
-                    let x = apply(&world[inf.bone_index as usize], inf.bone_local_pos);
-                    by_bone5.entry(inf.bone_index).or_default().push([x[0]-v.pos[0], x[1]-v.pos[1], x[2]-v.pos[2]]);
-                }
-            }
-            for (b, cs) in &by_bone5 {
-                let mean = centroid(cs);
-                let spread = cs.iter().map(|c| ((c[0]-mean[0]).powi(2)+(c[1]-mean[1]).powi(2)+(c[2]-mean[2]).powi(2)).sqrt()).fold(0f32, f32::max);
-                eprintln!("  hair05 骨 {b:#x}: c̄={:?} 波动 {:.3} ({}点)", mean, spread, cs.len());
-            }
-        }
-    }
-
-    /// 诊断：ASCII 投影对比三种渲染：authored / 游戏LBS / viewer共识
-    #[test]
-    fn hair05_ascii_views() {
-        use crate::fskel;
-        use std::collections::BTreeMap;
         let load = |rel: &str| parse_fskin(&format!("{ROOT}/{rel}"), &fs::read(format!("{ROOT}/{rel}")).unwrap()).unwrap();
         let head = load("girl_head.fskin");
         let h1 = load("MHair/Girl_hair01.fskin");
         let h5 = load("MHair/Girl_hair05.fskin");
 
-        let skel = fskel::get_or_load(&format!("{ROOT}/act/sta.FSKEL")).unwrap();
-        let flat = skel.frames_flat(0, 1);
-        let qm = |q: [f32; 4]| -> [[f32; 3]; 3] {
-            let n = (q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]).sqrt();
-            let (x, y, z, w) = (q[0]/n, q[1]/n, q[2]/n, q[3]/n);
-            [
-                [1.0-2.0*(y*y+z*z), 2.0*(x*y-z*w), 2.0*(x*z+y*w)],
-                [2.0*(x*y+z*w), 1.0-2.0*(x*x+z*z), 2.0*(y*z-x*w)],
-                [2.0*(x*z-y*w), 2.0*(y*z+x*w), 1.0-2.0*(x*x+y*y)],
-            ]
-        };
-        let mut world = vec![[[0f32; 4]; 4]; skel.parents.len()];
-        for b in 0..skel.parents.len() {
-            let o = b * 7;
-            let r = qm([flat[o+3], flat[o+4], flat[o+5], flat[o+6]]);
-            let mut m = [[0f32; 4]; 4];
-            for i in 0..3 { for j in 0..3 { m[i][j] = r[i][j]; } m[i][3] = flat[o+i]; }
-            m[3][3] = 1.0;
-            let p = skel.parents[b];
-            if p >= 0 {
-                let pm = world[p as usize];
-                let mut w = [[0f32; 4]; 4];
-                for i in 0..4 { for j in 0..4 { w[i][j] = (0..4).map(|k| pm[i][k]*m[k][j]).sum(); } }
-                world[b] = w;
-            } else { world[b] = m; }
-        }
-        let ap = |m: &[[f32; 4]; 4], p: [f32; 3]| -> [f32; 3] {
-            [m[0][0]*p[0]+m[0][1]*p[1]+m[0][2]*p[2]+m[0][3],
-             m[1][0]*p[0]+m[1][1]*p[1]+m[1][2]*p[2]+m[1][3],
-             m[2][0]*p[0]+m[2][1]*p[1]+m[2][2]*p[2]+m[2][3]]
-        };
-        // 3x3 工具
+        // ---- 拟合工具（与 viewer.fitBindMatrix 相同：Kabsch + 极分解） ----
         fn det3(m: &[f32; 9]) -> f32 {
             m[0]*(m[4]*m[8]-m[5]*m[7]) - m[1]*(m[3]*m[8]-m[5]*m[6]) + m[2]*(m[3]*m[7]-m[4]*m[6])
         }
@@ -1036,14 +882,12 @@ mod tests {
                 (m[3]*m[7]-m[4]*m[6])*d, (m[1]*m[6]-m[0]*m[7])*d, (m[0]*m[4]-m[1]*m[3])*d,
             ])
         }
-        // Kabsch: (local, pos) 点对 → (R, t)，pos ≈ R·local + t
-        let kabsch = |pairs: &[([f32; 3], [f32; 3])]| -> ([f32; 9], [f32; 3]) {
+        let kabsch = |pairs: &[([f32; 3], [f32; 3])]| -> [[f32; 4]; 4] {
             let n = pairs.len() as f32;
             let mut ca = [0f32; 3]; let mut cb = [0f32; 3];
             for (a, b) in pairs { for k in 0..3 { ca[k] += a[k]/n; cb[k] += b[k]/n; } }
-            let mut h = [0f32; 9];
-            for (a, b) in pairs { for r in 0..3 { for c in 0..3 { h[r*3+c] += (b[r]-cb[r])*(a[c]-ca[c]); } } }
-            let mut m = h;
+            let mut m = [0f32; 9];
+            for (a, b) in pairs { for r in 0..3 { for c in 0..3 { m[r*3+c] += (b[r]-cb[r])*(a[c]-ca[c]); } } }
             for _ in 0..32 {
                 let mi = inv3(&m).unwrap();
                 let mut next = [0f32; 9]; let mut delta = 0f32;
@@ -1054,132 +898,124 @@ mod tests {
                 m = next;
                 if delta < 1e-10 { break; }
             }
+            assert!(det3(&m) > 0.5, "极分解应收敛到纯旋转");
             let t = [cb[0]-(m[0]*ca[0]+m[1]*ca[1]+m[2]*ca[2]),
                      cb[1]-(m[3]*ca[0]+m[4]*ca[1]+m[5]*ca[2]),
                      cb[2]-(m[6]*ca[0]+m[7]*ca[1]+m[8]*ca[2])];
-            (m, t)
+            let mut o = [[0f32; 4]; 4];
+            for i in 0..3 { for j in 0..3 { o[i][j] = m[i*3+j]; } o[i][3] = t[i]; }
+            o[3][3] = 1.0; o
         };
-        // 头部各骨共识拟合（viewer 的 boneInverse 来源）
-        let mut tc: BTreeMap<u32, ([f32; 9], [f32; 3])> = BTreeMap::new();
-        {
-            let mut by: BTreeMap<u32, Vec<([f32; 3], [f32; 3])>> = BTreeMap::new();
-            for v in &head.vertices {
-                if v.influences.len() == 1 {
-                    by.entry(v.influences[0].bone_index).or_default()
-                        .push((v.influences[0].bone_local_pos, v.pos));
-                }
-            }
-            for (b, pts) in by { if pts.len() >= 3 { tc.insert(b, kabsch(&pts)); } }
+        fn mm4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+            let mut w = [[0f32; 4]; 4];
+            for i in 0..4 { for j in 0..4 { w[i][j] = (0..4).map(|k| a[i][k]*b[k][j]).sum(); } }
+            w
         }
-        let inv_ap = |rt: &([f32; 9], [f32; 3]), p: [f32; 3]| -> [f32; 3] {
-            let (r, t) = rt;
-            let d = [p[0]-t[0], p[1]-t[1], p[2]-t[2]];
-            [r[0]*d[0]+r[1]*d[1]+r[2]*d[2], r[3]*d[0]+r[4]*d[1]+r[5]*d[2], r[6]*d[0]+r[7]*d[1]+r[8]*d[2]]
-        };
-
-        // 三种渲染的顶点位置
-        let authored = |m: &FskinModel| -> Vec<[f32; 3]> { m.vertices.iter().map(|v| v.pos).collect() };
-        let game = |m: &FskinModel| -> Vec<[f32; 3]> {
-            m.vertices.iter().map(|v| {
-                let mut o = [0f32; 3];
-                for inf in &v.influences {
-                    let x = ap(&world[inf.bone_index as usize], inf.bone_local_pos);
-                    for k in 0..3 { o[k] += inf.weight * x[k]; }
-                }
-                o
-            }).collect()
-        };
-        let consensus = |m: &FskinModel| -> Vec<[f32; 3]> {
-            m.vertices.iter().map(|v| {
-                let mut o = [0f32; 3];
-                for inf in &v.influences {
-                    let tb = tc.get(&inf.bone_index);
-                    let x = match tb {
-                        Some(rt) => ap(&world[inf.bone_index as usize], inv_ap(rt, v.pos)),
-                        None => v.pos,
-                    };
-                    for k in 0..3 { o[k] += inf.weight * x[k]; }
-                }
-                o
-            }).collect()
-        };
-
-        // 参考中心：authored 用原点；game/consensus 用 head 质心对齐
-        let centroid = |pts: &[[f32; 3]]| -> [f32; 3] {
-            let n = pts.len() as f32;
-            let mut c = [0f32; 3];
-            for p in pts { for k in 0..3 { c[k] += p[k]/n; } }
-            c
-        };
-
-        // ASCII 光栅化（部件叠加：head '.' hair01 ',' hair05 '@'）
-        let render = |title: &str, layers: &[(&FskinModel, Vec<[f32; 3]>, char, [f32; 3])]| {
-            let w = 100usize;
-            // 收集范围
-            let (mut mnx, mut mxx, mut mny, mut mxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
-            for (_, pts, _, _) in layers {
-                for p in pts {
-                    mnx = mnx.min(p[0]); mxx = mxx.max(p[0]);
-                    mny = mny.min(p[1]); mxy = mxy.max(p[1]);
-                }
-            }
-            let h = ((mxy-mny)/(mxx-mnx) * w as f32 / 2.2).ceil().max(10.0) as usize;
-            let mut grid = vec![vec![' '; w]; h];
-            let sx = |x: f32| ((x - mnx) / (mxx - mnx) * (w as f32 - 1.0)).round() as usize;
-            let sy = |y: f32| ((mxy - y) / (mxy - mny) * (h as f32 - 1.0)).round() as usize;
-            for (m, pts, ch, center) in layers {
-                let _ = center;
-                let idx = &m.triangles;
-                for t in idx.chunks(3) {
-                    let (a, b, c) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
-                    // 重心采样填充
-                    for i in 0..=10usize { for j in 0..=(10-i) {
-                        let (u, v) = (i as f32/10.0, j as f32/10.0);
-                        let w0 = 1.0-u-v;
-                        let x = w0*a[0]+u*b[0]+v*c[0];
-                        let y = w0*a[1]+u*b[1]+v*c[1];
-                        let (gx, gy) = (sx(x), sy(y));
-                        if gx < w && gy < h { grid[gy][gx] = *ch; }
-                    } }
-                }
-            }
-            eprintln!("---- {title} (x∈[{mnx:.0},{mxx:.0}] y∈[{mny:.0},{mxy:.0}]) ----");
-            for row in &grid { eprintln!("{}", row.iter().collect::<String>()); }
-        };
-
-        let parts = [&head, &h1, &h5];
-        let ch_of = |i: usize| if i == 0 {'.'} else if i == 1 {','} else {'@'};
-        // A: authored
-        render("A authored 静态(头'.' hair01',' hair05'@')", &parts.iter().enumerate().map(|(i, m)| {
-            (*m, authored(m), ch_of(i), [0.0;3])
-        }).collect::<Vec<_>>());
-        // B: game-true（对齐 head 质心到 authored head 质心）
-        let ah: Vec<[f32;3]> = head.vertices.iter().map(|v| v.pos).collect();
-        let ch_auth = centroid(&ah);
-        let mut layers_b: Vec<(&FskinModel, Vec<[f32;3]>, char, [f32;3])> = Vec::new();
-        let mut head_c = None;
-        for (i, m) in parts.iter().enumerate() {
-            let g = game(m);
-            if i == 0 { head_c = Some(centroid(&g)); }
-            layers_b.push((m, g, ch_of(i), [0.0;3]));
+        fn inv_rigid(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+            let mut o = [[0f32; 4]; 4];
+            for i in 0..3 { for j in 0..3 { o[i][j] = m[j][i]; } }
+            for i in 0..3 { o[i][3] = -(0..3).map(|k| o[i][k]*m[k][3]).sum::<f32>(); }
+            o[3][3] = 1.0; o
         }
-        let hc = head_c.unwrap();
-        let shift = [ch_auth[0]-hc[0], ch_auth[1]-hc[1], ch_auth[2]-hc[2]];
-        for (_, pts, _, _) in &mut layers_b { for p in pts.iter_mut() { for k in 0..3 { p[k] += shift[k]; } } }
-        render("B 游戏真实LBS(sta帧0, 头质心对齐)", &layers_b);
-        // C: viewer 共识
-        let mut layers_c: Vec<(&FskinModel, Vec<[f32;3]>, char, [f32;3])> = Vec::new();
-        let mut head_c2 = None;
-        for (i, m) in parts.iter().enumerate() {
-            let g = consensus(m);
-            if i == 0 { head_c2 = Some(centroid(&g)); }
-            layers_c.push((m, g, ch_of(i), [0.0;3]));
+        fn ap4(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+            [m[0][0]*p[0]+m[0][1]*p[1]+m[0][2]*p[2]+m[0][3],
+             m[1][0]*p[0]+m[1][1]*p[1]+m[1][2]*p[2]+m[1][3],
+             m[2][0]*p[0]+m[2][1]*p[1]+m[2][2]*p[2]+m[2][3]]
         }
-        let hc2 = head_c2.unwrap();
-        let shift2 = [ch_auth[0]-hc2[0], ch_auth[1]-hc2[1], ch_auth[2]-hc2[2]];
-        for (_, pts, _, _) in &mut layers_c { for p in pts.iter_mut() { for k in 0..3 { p[k] += shift2[k]; } } }
-        render("C viewer共识蒙皮(sta帧0, 头质心对齐)", &layers_c);
+        let diff_t = |a: &[[f32;4];4], b: &[[f32;4];4]| -> f32 {
+            let mut d = 0f32;
+            for i in 0..4 { for j in 0..4 { d = d.max((a[i][j]-b[i][j]).abs()); } }
+            d
+        };
+
+        let pairs6 = |m: &FskinModel| -> Vec<([f32;3],[f32;3])> {
+            m.vertices.iter()
+                .filter(|v| v.influences.len()==1 && v.influences[0].bone_index==6)
+                .map(|v| (v.influences[0].bone_local_pos, v.pos)).collect()
+        };
+        let t_head = kabsch(&pairs6(&head));
+        let t_h1 = kabsch(&pairs6(&h1));
+        let t_h5 = kabsch(&pairs6(&h5));
+        assert!(diff_t(&t_head, &t_h5) >= 0.1, "hair05 与头部 0x6 绑定应超过分簇阈值");
+        assert!(diff_t(&t_head, &t_h1) < 0.1, "hair01 应与头部 0x6 绑定一致");
+
+        let span_of = |m: &FskinModel| -> usize {
+            let mut s: Vec<u32> = m.vertices.iter().flat_map(|v| v.influences.iter().map(|i| i.bone_index)).collect();
+            s.sort_unstable(); s.dedup(); s.len()
+        };
+        let (sp_head, sp_h1, sp_h5) = (span_of(&head), span_of(&h1), span_of(&h5));
+
+        // 加权投票（修复后规则）：簇得分 = Σ骨骼覆盖数（同覆盖比点数）
+        // 场景1：动画模式默认装配 + hair05（hair01 已被互斥槽移除）
+        let pts_head = pairs6(&head).len();
+        let pts_h5 = pairs6(&h5).len();
+        assert!(sp_head > sp_h5,
+            "头部（{sp_head} 骨）应凭覆盖数赢得 0x6 共识，而非 hair05（{sp_h5} 骨 {pts_h5} 点 > 头部 {pts_head} 点）");
+        // 场景2：hair01 与 hair05 同场（分组面板可各自开关，不走互斥槽）
+        let pts_h1 = pairs6(&h1).len();
+        assert!(sp_head + sp_h1 > sp_h5 || (sp_head + sp_h1 == sp_h5 && pts_head + pts_h1 > pts_h5),
+            "hair01 在场时头部簇更不应输给 hair05");
+
+        // ---- 渲染验证：hair05 按头部绑定渲染后与头部保持刚性贴合 ----
+        let skel = fskel::get_or_load(&format!("{ROOT}/act/sta.FSKEL")).unwrap();
+        let bone_count = skel.parents.len();
+        assert!(bone_count > 47, "骨架应覆盖 head 用到的 0x2f 骨");
+        let flat = skel.frames_flat(0, 1);
+        let qm = |q: [f32; 4]| -> [[f32; 3]; 3] {
+            let n = (q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]).sqrt();
+            let (x, y, z, w) = (q[0]/n, q[1]/n, q[2]/n, q[3]/n);
+            [
+                [1.0-2.0*(y*y+z*z), 2.0*(x*y-z*w), 2.0*(x*z+y*w)],
+                [2.0*(x*y+z*w), 1.0-2.0*(x*x+z*z), 2.0*(y*z-x*w)],
+                [2.0*(x*z-y*w), 2.0*(y*z+x*w), 1.0-2.0*(x*x+y*y)],
+            ]
+        };
+        let mut world = vec![[[0f32; 4]; 4]; bone_count];
+        for b in 0..bone_count {
+            let o = b * 7;
+            let r = qm([flat[o+3], flat[o+4], flat[o+5], flat[o+6]]);
+            let mut m = [[0f32; 4]; 4];
+            for i in 0..3 { for j in 0..3 { m[i][j] = r[i][j]; } m[i][3] = flat[o+i]; }
+            m[3][3] = 1.0;
+            let p = skel.parents[b];
+            world[b] = if p >= 0 { mm4(&world[p as usize], &m) } else { m };
+        }
+        let w2 = mm4(&world[6], &inv_rigid(&t_head));
+        let w1 = mm4(&world[6], &inv_rigid(&t_h5));
+        // 头部 0x6 纯影响顶点：修复前后自身的位移差 = 旧规则的可见错位量
+        let mut old_bug_disp = 0f32;
+        for v in &head.vertices {
+            if v.influences.len() == 1 && v.influences[0].bone_index == 6 {
+                let a = ap4(&w2, v.pos);
+                let b = ap4(&w1, v.pos);
+                old_bug_disp = old_bug_disp.max(((a[0]-b[0]).powi(2)+(a[1]-b[1]).powi(2)+(a[2]-b[2]).powi(2)).sqrt());
+            }
+        }
+        eprintln!("旧规则（hair05 赢得 0x6）下头部顶点错位最大 {old_bug_disp:.2}");
+        assert!(old_bug_disp > 2.0, "数据前提：hair05 绑定与头部的差异应造成 >2 单位错位");
+        // hair05 与头部 0x6 纯影响顶点同过 w2 → 距离严格保持（刚性贴合）
+        let head6: Vec<[f32;3]> = head.vertices.iter()
+            .filter(|v| v.influences.len()==1 && v.influences[0].bone_index==6)
+            .map(|v| v.pos).collect();
+        let mut worst = 0f32;
+        let mut pairs_checked = 0usize;
+        for v in h5.vertices.iter().step_by(4) {
+            let pr = ap4(&w2, v.pos);
+            let mut best_a = (f32::MAX, [0f32;3]);
+            for hp in head6.iter().step_by(3) {
+                let d = ((v.pos[0]-hp[0]).powi(2)+(v.pos[1]-hp[1]).powi(2)+(v.pos[2]-hp[2]).powi(2)).sqrt();
+                if d < best_a.0 { best_a = (d, *hp); }
+            }
+            let hr = ap4(&w2, best_a.1);
+            let d_r = ((pr[0]-hr[0]).powi(2)+(pr[1]-hr[1]).powi(2)+(pr[2]-hr[2]).powi(2)).sqrt();
+            worst = worst.max((d_r - best_a.0).abs());
+            pairs_checked += 1;
+        }
+        eprintln!("修复后 hair05↔头部 0x6 距离保持最大偏差 {worst:.4}（{pairs_checked} 对）");
+        assert!(worst < 0.05, "hair05 应与头部刚性贴合（距离保持）");
     }
+
+
 
     /// 回归：同一骨骼上各部件的 (boneLocalPos→pos) 刚体变换一致性。
     /// Girl_hair05 与头部共用 0x6 骨但绑定变换不同（制作时的偏移差异，

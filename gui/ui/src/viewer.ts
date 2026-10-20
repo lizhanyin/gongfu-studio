@@ -541,10 +541,10 @@ export class Viewer {
     this.jointMesh.visible = this.skeletonVisible;
     this.scene.add(this.jointMesh);
 
-    // GPU 蒙皮。绑定矩阵按"共识"拟合：同一骨骼上取相互一致的多数部件的
-    // (boneLocalPos→pos) 刚体变换（如头部与其余发型），离群部件（Girl_hair05
-    // 与头部共用 0x6 骨但变换不同）被剔除——其 authored pos 端正贴在头上，
-    // 差异部分按刚性附件变换随骨骼运动，渲染始终贴合头部。
+    // GPU 蒙皮。绑定矩阵按"共识"拟合：同一骨骼上取相互一致、骨骼覆盖更广
+    // 的部件簇的 (boneLocalPos→pos) 刚体变换（如头部与其余发型），离群部件
+    // （Girl_hair05 与头部共用 0x6 骨但绑定变换不同）被剔除——其 authored
+    // pos 端正贴在头上，差异部分按刚性附件变换随骨骼运动，渲染始终贴合头部。
     this.skelSkeleton?.dispose();
     this.skelSkeleton = new THREE.Skeleton(
       this.skelBones,
@@ -559,31 +559,42 @@ export class Viewer {
   /**
    * 重算共享骨架的每骨绑定矩阵之逆（部件增删后调用，就地更新）。
    * 每骨：各部件先用自身单影响点对拟合变换，两两比较划分一致簇
-   * （阈值 0.1，精确刚体数据的簇内差 ~1e-3），取点数最多的簇合并拟合；
-   * 无 ≥3 点的部件不参与投票但点对照旧并入。混合权重顶点的 (局部点, pos)
-   * 只是近似对应，仅在单影响点不足 3 个时补充。无点对的骨骼权重为 0，
-   * 逆矩阵保持单位阵。
+   * （阈值 0.1，精确刚体数据的簇内差 ~1e-3），按"部件骨骼覆盖数"加权
+   * 选簇：覆盖骨架越广的部件越代表绑定约定，单骨附件（发型等）不与之
+   * 抗衡——Girl_hair05 有 256 个 0x6 单影响点，按点数投票会压过头部
+   * 124 点，把发髻渲染到游戏数据自身的错误绑定位置上（悬空偏移）。
+   * 同覆盖数再比总点数。落选部件按刚性附件随骨骼运动，贴合 authored
+   * 摆放。无 ≥3 点的部件不参与投票但点对照旧并入。混合权重顶点的
+   * (局部点, pos) 只是近似对应，仅在单影响点不足 3 个时补充。
+   * 无点对的骨骼权重为 0，逆矩阵保持单位阵。
    */
   private refreshBindInverses() {
     const skel = this.skelSkeleton;
     if (!skel) return;
     const boneCount = this.fskelBoneCount;
-    // bone -> 各部件的 exact 点对集合 与 approx 点对集合
-    const perBone: { exact: [number[], number[]][][]; approx: [number[], number[]][][] }[] =
+    // bone -> 各部件的 exact 点对集合（附部件骨骼覆盖数）与 approx 点对集合
+    interface ExactVotes {
+      pts: [number[], number[]][];
+      span: number;
+    }
+    const perBone: { exact: ExactVotes[]; approx: [number[], number[]][][] }[] =
       Array.from({ length: boneCount }, () => ({ exact: [], approx: [] }));
     for (const p of this.parts.values()) {
       const exact: [number[], number[]][][] = Array.from({ length: boneCount }, () => []);
       const approx: [number[], number[]][][] = Array.from({ length: boneCount }, () => []);
+      const spanSet = new Set<number>();
       for (const v of p.model.vertices) {
         for (const inf of v.influences) {
           if (inf.boneIndex >= boneCount) continue;
+          spanSet.add(inf.boneIndex);
           const pair: [number[], number[]] = [inf.boneLocalPos, v.pos];
           if (v.influences.length === 1 || inf.weight >= 0.99) exact[inf.boneIndex].push(pair);
           else approx[inf.boneIndex].push(pair);
         }
       }
+      const span = spanSet.size;
       for (let b = 0; b < boneCount; b++) {
-        if (exact[b].length) perBone[b].exact.push(exact[b]);
+        if (exact[b].length) perBone[b].exact.push({ pts: exact[b], span });
         if (approx[b].length) perBone[b].approx.push(approx[b]);
       }
     }
@@ -591,8 +602,8 @@ export class Viewer {
       const { exact, approx } = perBone[b];
       const pool: [number[], number[]][] = [];
       if (exact.length >= 2) {
-        // 各部件自身拟合 → 一致性分簇，取总点数最多的簇
-        const fits = exact.map((pts) => this.fitBindMatrix(pts));
+        // 各部件自身拟合 → 一致性分簇，按骨骼覆盖数加权选簇（同覆盖数比点数）
+        const fits = exact.map((e) => this.fitBindMatrix(e.pts));
         const ok = (i: number, j: number) => this.bindTransformDiff(fits[i], fits[j]) < 0.1;
         const compOf: number[][] = [];
         const seen = new Set<number>();
@@ -608,12 +619,13 @@ export class Viewer {
           }
           compOf.push(comp);
         }
-        const best = compOf.reduce((a, c) =>
-          c.reduce((s, i) => s + exact[i].length, 0) > a.reduce((s, i) => s + exact[i].length, 0) ? c : a
-        );
-        for (const i of best) pool.push(...exact[i]);
+        const score = (c: number[]) =>
+          c.reduce((s, i) => s + exact[i].span, 0) * 1e6 +
+          c.reduce((s, i) => s + exact[i].pts.length, 0);
+        const best = compOf.reduce((a, c) => (score(c) > score(a) ? c : a));
+        for (const i of best) pool.push(...exact[i].pts);
       } else if (exact.length === 1) {
-        pool.push(...exact[0]);
+        pool.push(...exact[0].pts);
       }
       const t = this.fitBindMatrix(pool.length >= 3 ? pool : pool.concat(...approx));
       skel.boneInverses[b].copy(t.invert());
