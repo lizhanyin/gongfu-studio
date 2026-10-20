@@ -1,6 +1,14 @@
 //! .fskin (SKIN v1.0) 解析与序列化
 //!
-//! 布局:
+//! 布局已与 F3D.dll 引擎解析代码逐字段对照确认（IDA，2026-10）：
+//!   ResSkin::ParseSkinFile @0x1004DED0(.​\ResSys\ResSkin.cpp) 读 312B 头
+//!   → 顶点循环 12B pos / 12B normal / 8B uv(0x1004DFD3) / 影响表；
+//!   F3D_ParseVertexInfluences @0x1004D3F0：4B 影响数(允许 0) +
+//!   n × 20B {骨骼u32, 权重f32, 骨骼局部坐标3f32}。
+//! 蒙皮消费端 SkinStream_SkinVerts_LBS @0x10050C70：
+//!   pos = Σ w·M_boneSpace·boneLocalPos（原始权重累加，无归一化），
+//!   法线/uv 为加载时静态拷贝（蒙皮循环只写位置三分量）。
+//!
 //!   0x00 "SKIN" | 0x04 版本 | 0x08 顶点数 | 0x0C 顶点偏移(恒0x138)
 //!   0x10 1 | 0x14 索引区偏移 | 0x18 1 | 0x1C 材质区偏移
 //!   0x20 bbox max/min 各3个f32 | 0x38..0x138 保留256字节
@@ -11,8 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+
+use crate::vfs;
 
 pub const VERTEX_OFFSET: usize = 0x138;
 
@@ -151,7 +159,7 @@ pub fn parse_fskin(path: &str, bytes: &[u8]) -> Result<FskinModel, String> {
             *v = r.f32()?;
         }
         let n = r.u32()?;
-        if !(1..=8).contains(&n) {
+        if n > 8 {
             return Err(format!("非法影响骨骼数 {} @0x{:x}", n, r.pos - 4));
         }
         let mut influences = Vec::with_capacity(n as usize);
@@ -440,19 +448,17 @@ pub struct ModelSet {
     pub tex_slots: Vec<TexSlot>,
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
+/// (path 是否为 root 的直接子文件, 相对目录)。path 由 vfs 以 root 为前缀拼出，
+/// 字节级前缀必然成立。
+fn rel_to_root(root: &str, path: &str) -> (bool, String) {
+    let p = path.trim_end_matches(['\\', '/']);
+    let Some(rest) = p.strip_prefix(root.trim_end_matches(['\\', '/'])) else {
+        return (false, String::new());
     };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            walk(&p, out);
-        } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-            if ext.eq_ignore_ascii_case("fskin") {
-                out.push(p);
-            }
-        }
+    let rel = rest.trim_start_matches(['\\', '/']);
+    match rel.rsplit_once(['\\', '/']) {
+        Some((dir, _)) => (false, dir.to_string()),
+        None => (true, String::new()),
     }
 }
 
@@ -466,33 +472,32 @@ fn detect_slot(name_lower: &str) -> Option<&'static str> {
         .map(|(_, slot)| slot)
 }
 
-/// 扫描目录：按 (顶点数, 索引区偏移) 几何签名把换装变体归为一组；
-/// 含根目录文件的组排在前面且默认选中根目录成员。
+/// 文件名去扩展名
+fn stem_of(name: &str) -> String {
+    name.rsplit_once('.').map(|(s, _)| s.into()).unwrap_or_else(|| name.into())
+}
+
+/// 扫描目录（或 `cpk:` 包内目录）：按 (顶点数, 索引区偏移) 几何签名把换装变体
+/// 归为一组；含根目录文件的组排在前面且默认选中根目录成员。
 pub fn scan_model_set(dir: &str) -> Result<ModelSet, String> {
-    let root = PathBuf::from(dir);
-    if !root.is_dir() {
+    if !vfs::exists(dir) {
         return Err(format!("目录不存在: {dir}"));
     }
     // 纹理索引: 小写文件名(不含扩展名) -> 路径
-    let mut tex_files = Vec::<PathBuf>::new();
-    walk_images(&root, &mut tex_files);
+    let tex_files = vfs::walk_files(dir, &["dds", "tga", "png", "jpg", "bmp"]);
     let mut tex_index: BTreeMap<String, String> = BTreeMap::new();
     for t in &tex_files {
-        if let Some(stem) = t.file_stem().and_then(|s| s.to_str()) {
-            tex_index
-                .entry(stem.to_lowercase())
-                .or_insert_with(|| t.to_string_lossy().into_owned());
-        }
+        let stem = stem_of(&t.name).to_lowercase();
+        tex_index.entry(stem).or_insert_with(|| t.path.clone());
     }
 
-    let mut files = Vec::new();
-    walk(&root, &mut files);
-    files.sort();
+    let mut files = vfs::walk_files(dir, &["fskin"]);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
     let mut parts = Vec::new();
     let mut sigs = Vec::new();
-    for f in files {
-        let bytes = fs::read(&f).map_err(|e| format!("读取 {}: {e}", f.display()))?;
-        let m = parse_fskin(&f.to_string_lossy(), &bytes)?;
+    for f in &files {
+        let bytes = vfs::read_file(&f.path).map_err(|e| format!("读取 {}: {e}", f.path))?;
+        let m = parse_fskin(&f.path, &bytes)?;
         // 几何签名: 顶点数 + 索引区偏移（变长顶点记录总长），相同即为同一网格的换装变体
         sigs.push(format!("{}_{}", m.vertices.len(), m.triangles.len()));
         let tex_file = m
@@ -509,18 +514,10 @@ pub fn scan_model_set(dir: &str) -> Result<ModelSet, String> {
             .collect();
         bones.sort_unstable();
         bones.dedup();
-        let in_root = f.parent() == Some(&root);
-        let rel_dir = f
-            .parent()
-            .and_then(|p| p.strip_prefix(&root).ok())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let (in_root, rel_dir) = rel_to_root(dir, &f.path);
         parts.push(PartInfo {
-            path: f.to_string_lossy().into_owned(),
-            file_name: f
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            path: f.path.clone(),
+            file_name: f.name.clone(),
             rel_dir,
             in_root,
             vertex_count: m.vertices.len(),
@@ -593,17 +590,16 @@ pub fn scan_model_set(dir: &str) -> Result<ModelSet, String> {
             let mut variants: Vec<TexVariant> = tex_files
                 .iter()
                 .filter(|p| {
-                    p.parent()
-                        .and_then(|d| d.file_name())
+                    // 父目录名 == TFace / TFaceDetail
+                    p.path
+                        .rsplit(['\\', '/'])
+                        .nth(1)
                         .map(|n| n.eq_ignore_ascii_case(dir_name))
                         .unwrap_or(false)
                 })
                 .map(|p| TexVariant {
-                    label: p
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    path: p.to_string_lossy().into_owned(),
+                    label: stem_of(&p.name),
+                    path: p.path.clone(),
                 })
                 .collect();
             variants.sort_by(|a, b| a.label.cmp(&b.label));
@@ -641,33 +637,161 @@ pub fn scan_model_set(dir: &str) -> Result<ModelSet, String> {
     })
 }
 
-fn walk_images(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            walk_images(&p, out);
-        } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-            if matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "dds" | "tga" | "png" | "jpg" | "bmp"
-            ) {
-                out.push(p);
-            }
-        }
-    }
-}
-
 // ---------------- 测试 ----------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// 递归收集 ROOT 下全部 .fskin 磁盘路径（原 fs::walk 的测试替代，走 vfs）
+    fn collect_fskins() -> Vec<PathBuf> {
+        vfs::walk_files(ROOT, &["fskin"])
+            .into_iter()
+            .map(|e| PathBuf::from(e.path))
+            .collect()
+    }
 
     // 项目根目录 res/system 为 pack 解压后的实际目录
     const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/system/AvatarGirl");
+
+    /// 布料骨局部四元数的逐帧变化幅度（girl 采样 + 走路全帧）：
+    /// 判定 FSKEL 是否含布料动画；对照身体骨（大腿 0x7e）应有明显摆动
+    #[test]
+    fn cloth_anim_amount() {
+        use crate::fskel;
+        for act in ["lwk1.FSKEL", "rwk1.FSKEL", "girl.FSKEL"] {
+            let skel = fskel::get_or_load(&format!("{ROOT}/act/{act}")).unwrap();
+            let nf = skel.frame_count() as usize;
+            let step = if nf > 40 { nf / 40 } else { 1 };
+            let frames: Vec<usize> = (0..nf).step_by(step).chain(std::iter::once(nf - 1)).collect();
+            let flat: Vec<Vec<f32>> = frames
+                .iter()
+                .map(|&f| skel.frames_flat(f as u32, f as u32 + 1))
+                .collect();
+            let vary = |b: usize| -> (f32, f32) {
+                let mut mx = 0f32;
+                let mut t_sum = 0f32;
+                for w in flat.windows(2) {
+                    let o0 = b * 7;
+                    let a = [w[0][o0 + 3], w[0][o0 + 4], w[0][o0 + 5], w[0][o0 + 6]];
+                    let bq = [w[1][o0 + 3], w[1][o0 + 4], w[1][o0 + 5], w[1][o0 + 6]];
+                    // 相邻帧角度差（q 与 -q 等价）
+                    let dot = (a[0] * bq[0] + a[1] * bq[1] + a[2] * bq[2] + a[3] * bq[3]).abs();
+                    let d = 2.0 * dot.min(1.0).acos().to_degrees();
+                    mx = mx.max(d);
+                    t_sum += d;
+                }
+                (mx, t_sum / (flat.len() - 1).max(1) as f32)
+            };
+            let show = |label: &str, bones: &[usize]| {
+                let parts: Vec<String> = bones
+                    .iter()
+                    .map(|&b| {
+                        let (mx, avg) = vary(b);
+                        format!("0x{b:x}:{avg:5.2}/{mx:6.1}°")
+                    })
+                    .collect();
+                eprintln!("  {label}: {}", parts.join(" "));
+            };
+            eprintln!("== {act} ({nf}帧) 相邻帧角变化 avg/max：");
+            show("布料链根", &[0x59, 0x5f, 0x65, 0x6b, 0x71, 0x77]);
+            show("布料链成员", &[0x5a, 0x60, 0x66, 0x6c, 0x72, 0x78]);
+            show("身体对照  ", &[0x2, 0x5, 0x7e, 0x82]);
+        }
+    }
+    /// 裙摆布料骨回归：Bone* 布料链的 FSKEL 姿态是布料模拟种子状态，
+    /// 与 FSKIN 绑定数据恒不一致（0x6b/0x71 链 girl.FSKEL 全 1633 帧
+    /// M·boneLocalPos 残差最小 16.7 不回落；身体骨存在 ≈2.7 的帧）——
+    /// 直接精确 LBS 会把裙摆顶点甩出 40+ 单位（穿进躯干的尖刺根因）。
+    /// viewer 因此对全部 Bone* 骨（^Bone\d+$，有顶点影响的）改做次级
+    /// 运动模拟（弹簧跟随 + 腿碰撞，见 viewer.detectCloth）。本测试固化：
+    /// ① Bone* 全员可被名字规则命中；② 纯精确 LBS 在帧 0 的尖刺量级。
+    #[test]
+    fn skirt_cloth_bones() {
+        use crate::fskel;
+        let lower = parse_fskin(
+            &format!("{ROOT}/girl_Lower.fskin"),
+            &fs::read(format!("{ROOT}/girl_Lower.fskin")).unwrap(),
+        )
+        .unwrap();
+        let skel = fskel::get_or_load(&format!("{ROOT}/act/girl.FSKEL")).unwrap();
+        let n = skel.bone_names.len();
+        let is_bone = |b: usize| skel.bone_names[b].starts_with("Bone");
+        // 部件使用的 Bone* 骨全部命中 ^Bone\d+$ 命名规则
+        let used: std::collections::BTreeSet<usize> = lower
+            .vertices
+            .iter()
+            .flat_map(|v| v.influences.iter().map(|i| i.bone_index as usize))
+            .filter(|&b| is_bone(b))
+            .collect();
+        assert!(used.len() >= 13, "girl_Lower 应使用 13+ 根 Bone* 骨");
+        for &b in &used {
+            let name = &skel.bone_names[b];
+            assert!(
+                name.len() > 4 && name[4..].chars().all(|c| c.is_ascii_digit()),
+                r"骨名 {name} 应匹配 ^Bone\d+$"
+            );
+        }
+        eprintln!("girl_Lower 使用 Bone* 骨: {used:?}");
+
+        // 纯精确 LBS 帧 0 的尖刺证据（0x6c/0x6d/0x72/0x73 链甩出 40+）
+        let flat = skel.frames_flat(0, 1);
+        let qm = |q: [f32; 4]| -> [[f32; 4]; 4] {
+            let nz = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            let (x, y, z, w) = (q[0] / nz, q[1] / nz, q[2] / nz, q[3] / nz);
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w), 0.0],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w), 0.0],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y), 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        };
+        let mut world = vec![[[0f32; 4]; 4]; n];
+        for b in 0..n {
+            let o = b * 7;
+            let mut m = qm([flat[o + 3], flat[o + 4], flat[o + 5], flat[o + 6]]);
+            m[0][3] = flat[o];
+            m[1][3] = flat[o + 1];
+            m[2][3] = flat[o + 2];
+            let p = skel.parents[b];
+            if p >= 0 && (p as usize) < b {
+                let pm = world[p as usize];
+                let mut w = [[0f32; 4]; 4];
+                for i in 0..4 {
+                    for j in 0..4 {
+                        w[i][j] = (0..4).map(|k| pm[i][k] * m[k][j]).sum();
+                    }
+                }
+                world[b] = w;
+            } else {
+                world[b] = m;
+            }
+        }
+        let mut max_dev = 0f32;
+        for v in &lower.vertices {
+            let wsum: f32 = v.influences.iter().map(|i| i.weight).sum();
+            let mut out = [0f32; 3];
+            for inf in &v.influences {
+                let m = &world[(inf.bone_index as usize).min(n - 1)];
+                let lp = inf.bone_local_pos;
+                let x = [
+                    m[0][0] * lp[0] + m[0][1] * lp[1] + m[0][2] * lp[2] + m[0][3],
+                    m[1][0] * lp[0] + m[1][1] * lp[1] + m[1][2] * lp[2] + m[1][3],
+                    m[2][0] * lp[0] + m[2][1] * lp[1] + m[2][2] * lp[2] + m[2][3],
+                ];
+                for k in 0..3 {
+                    out[k] += inf.weight / wsum * x[k];
+                }
+            }
+            max_dev = max_dev.max(
+                ((out[0] - v.pos[0]).powi(2) + (out[1] - v.pos[1]).powi(2) + (out[2] - v.pos[2]).powi(2)).sqrt(),
+            );
+        }
+        eprintln!("纯精确 LBS 帧0 裙摆最大偏差 {max_dev:.1}");
+        assert!(max_dev > 40.0, "纯 LBS 应复现 40+ 尖刺（实测 {max_dev}），若测试资源变化请重估");
+    }
 
     /// 诊断 hair05 残余位移：pos 摆放位置、部件绑定变换 vs 动作参考帧骨骼世界矩阵
     #[test]
@@ -1781,6 +1905,55 @@ mod tests {
         }
     }
 
+    /// 导出 girl_Lower 顶点 + girl.FSKEL 前 90 帧姿态 + 骨名/父表，
+    /// 供 ui 侧 verify-skirt-cloth.mjs 复刻 viewer 布料模拟数值验证。
+    #[test]
+    fn dump_skirt_json() {
+        use crate::fskel;
+        #[derive(serde::Serialize)]
+        struct Vtx {
+            pos: [f32; 3],
+            influences: Vec<(u32, f32, [f32; 3])>,
+        }
+        #[derive(serde::Serialize)]
+        struct Dump {
+            bone_count: usize,
+            bone_names: Vec<String>,
+            parents: Vec<i32>,
+            /// 连续帧姿态（帧 × 骨 × 7）
+            poses: Vec<f32>,
+            lower: Vec<Vtx>,
+        }
+        let lower = parse_fskin(
+            &format!("{ROOT}/girl_Lower.fskin"),
+            &fs::read(format!("{ROOT}/girl_Lower.fskin")).unwrap(),
+        )
+        .unwrap();
+        let skel = fskel::get_or_load(&format!("{ROOT}/act/girl.FSKEL")).unwrap();
+        let frames = skel.frame_count().min(90);
+        let dump = Dump {
+            bone_count: skel.parents.len(),
+            bone_names: skel.bone_names.clone(),
+            parents: skel.parents.clone(),
+            poses: skel.frames_flat(0, frames),
+            lower: lower
+                .vertices
+                .iter()
+                .map(|v| Vtx {
+                    pos: v.pos,
+                    influences: v
+                        .influences
+                        .iter()
+                        .map(|i| (i.bone_index, i.weight, i.bone_local_pos))
+                        .collect(),
+                })
+                .collect(),
+        };
+        let out = format!("{}/../target/skirt_check.json", env!("CARGO_MANIFEST_DIR"));
+        fs::write(&out, serde_json::to_string(&dump).unwrap()).unwrap();
+        eprintln!("dumped {out} ({}帧 {}顶点)", frames, dump.lower.len());
+    }
+
     /// 导出 head/hair05 顶点与 sta.FSKEL 首帧姿态到 JSON，
     /// 供 ui 侧 verify-hair05 脚本用真实 three.js 蒙皮管线验证。
     #[test]
@@ -1937,8 +2110,7 @@ mod tests {
 
     #[test]
     fn roundtrip_all_fskins() {
-        let mut files = Vec::new();
-        walk(Path::new(ROOT), &mut files);
+        let files = collect_fskins();
         if files.is_empty() {
             eprintln!("跳过: 测试目录不存在");
             return;
@@ -1983,8 +2155,7 @@ mod tests {
         fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
             ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
         }
-        let mut files = Vec::new();
-        walk(Path::new(ROOT), &mut files);
+        let files = collect_fskins();
         if files.is_empty() {
             eprintln!("跳过: 测试目录不存在");
             return;

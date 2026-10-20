@@ -19,7 +19,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 /// 头部(0x3C) + 保留256字节之后的子网格区固定偏移
@@ -457,10 +456,10 @@ pub fn serialize_fak(m: &FakModel) -> Result<Vec<u8>, String> {
 
 /// 目录列举用的轻量统计：(顶点数, 三角形数, 帧数)。
 /// 只读头部 + 子网格区（跳过索引数组），不解析帧数据。
-pub fn light_meta_from_file(path: &Path) -> Option<(u32, u32, u32)> {
-    let mut f = fs::File::open(path).ok()?;
+/// 泛型 Reader：磁盘 File 与 CPK 内存读取器共用。
+pub fn light_meta<R: std::io::Read>(r: &mut R) -> Option<(u32, u32, u32)> {
     let mut header = [0u8; HEADER_LEN];
-    f.read_exact(&mut header).ok()?;
+    r.read_exact(&mut header).ok()?;
     if &header[0..4] != b"AKK\0" {
         return None;
     }
@@ -474,7 +473,7 @@ pub fn light_meta_from_file(path: &Path) -> Option<(u32, u32, u32)> {
     }
     // 游标已在 0x3C，补读到 frame_off；buf 下标 = 绝对偏移 - HEADER_LEN
     let mut buf = vec![0u8; frame_off - HEADER_LEN];
-    if f.read_exact(&mut buf).is_err() {
+    if r.read_exact(&mut buf).is_err() {
         return None;
     }
     let u16at = |o: usize| u16::from_le_bytes([buf[o - HEADER_LEN], buf[o + 1 - HEADER_LEN]]);
@@ -507,6 +506,13 @@ pub fn light_meta_from_file(path: &Path) -> Option<(u32, u32, u32)> {
         return None;
     }
     Some((vertex_count, tris, frame_count))
+}
+
+/// 磁盘文件版：只读文件头与子网格区，不整读帧数据（gui 内部走 vfs，供测试与外部调用）
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn light_meta_from_file(path: &Path) -> Option<(u32, u32, u32)> {
+    let mut f = fs::File::open(path).ok()?;
+    light_meta(&mut f)
 }
 
 // ---------------- 测试 ----------------
