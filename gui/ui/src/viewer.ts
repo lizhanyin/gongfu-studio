@@ -146,14 +146,16 @@ export class Viewer {
   // ---- 裙摆布料骨（Bone* 链）----
   /** 骨架父索引（worldsFromPoses 组合世界矩阵用） */
   private skelParents: number[] = [];
+  /** 镜像骨：Bone* 链根中本地旋转带反射的（引擎骨记录 +52 标记，见 detectMirrorBones） */
+  private mirrorBones = new Set<number>();
+  private mirrorScale = new THREE.Vector3(-1, -1, -1);
   /** 布料骨：Bone* 布料链成员（见 detectCloth） */
   private clothBones = new Set<number>();
   /** 每帧布料合成矩阵（弹簧模拟驱动，updateClothMats 刷新） */
   private clothMats = new Map<number, THREE.Matrix4>();
   /** 布料链载体骨索引（链根的公共父骨，裙摆 = 骨盆），无布料骨时 -1 */
   private clothCarrier = -1;
-  /**
-   * 布料弹簧模拟开关（默认关）。F3D.dll 反汇编确证引擎无运行时布料：
+  /** 布料弹簧模拟开关（默认关）。F3D.dll 反汇编确证引擎无运行时布料：
    * 游戏对 Bone* 链直接回放 FSKEL 烘焙动画（InvalidateRenderData 帧插值
    * +父级合成，无物理步；骨骼 API 仅 GetBoneSpace 等只读）。默认走与
    * 游戏一致的精确 LBS（链骨矩阵直接来自 FSKEL 姿态，条带随舞蹈等动作
@@ -431,6 +433,7 @@ export class Viewer {
     this.parts.set(path, part);
     // 动作模式已绑骨架时立即按当前姿态蒙皮；静态模式对齐离群部件
     if (this.skelBones.length) {
+      this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
       this.detectCloth(); // 布料检测的点集随部件变化
       this.skinPart(part);
     } else {
@@ -448,6 +451,7 @@ export class Viewer {
     p.mat.dispose();
     this.parts.delete(path);
     if (this.skelBones.length) {
+      this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
       this.detectCloth(); // 布料检测的点集随部件变化
     } else {
       // 静态模式共识可能变化（如锚定部件被移除），重新对齐
@@ -611,6 +615,7 @@ export class Viewer {
     this.worldMats = Array.from({ length: n }, () => new THREE.Matrix4());
     this.skelParents = meta.parents;
     for (const p of this.parts.values()) p.skinned = true;
+    this.detectMirrorBones(); // 镜像骨检测需部件顶点（无部件时跳过，addPart 会重跑）
     this.detectCloth();
 
     this.applyFskelFrame(0, 0, 0);
@@ -749,12 +754,13 @@ export class Viewer {
   }
 
   /** 直接从姿态数组组合某帧各骨世界矩阵（不动当前骨架姿态） */
-  private worldsFromPoses(frame: number): THREE.Matrix4[] {
+  private worldsFromPoses(frame: number, mirror?: Set<number>): THREE.Matrix4[] {
     const n = this.fskelBoneCount;
     const stride = n * 7;
     const poses = this.fskelPoses!;
     const last = Math.max(Math.floor(poses.length / stride) - 1, 0);
     const base = Math.min(Math.max(frame, 0), last) * stride;
+    const mir = mirror ?? this.mirrorBones;
     const out = Array.from({ length: n }, () => new THREE.Matrix4());
     for (let b = 0; b < n; b++) {
       const o = base + b * 7;
@@ -764,10 +770,88 @@ export class Viewer {
         this.qa,
         this.tmpScale
       );
+      // 镜像骨：本地旋转乘 -1（引擎骨记录 +52 标记 → Scale(-1,-1,-1)，
+      // T·R·S 作用于点 = t + R·(-p)，与引擎 [S·R|t] 等价）；子骨经
+      // 父矩阵自然继承镜像
+      if (mir.has(b)) out[b].scale(this.mirrorScale);
       const p = this.skelParents[b];
       if (p >= 0 && p < b) out[b].premultiply(out[p]);
     }
     return out;
+  }
+
+  /**
+   * 镜像骨检测（数据推导，等价于引擎骨记录 +52 的 mirror 标记）。
+   *
+   * Bone* 链中存在镜像骨（DCC 里用镜像工具复制的骨骼，本地旋转带反射）：
+   * F3D 引擎对标记骨的世界矩阵追加 Scale(-1,-1,-1)（sub_10052100 +52），
+   * 其 FSKIN 的 boneLocalPos 也按镜像空间导出。文件里没找到显式标记位
+   * （节点 fl 的附加 dword 是子骨索引），但镜像可从绑定数据判定：对每条
+   * 链根试 镜像/不镜像 两种合成，取链上顶点 LBS 残差（vs authored）小
+   * 的一侧——实测 Bone26(0x6b)/Bone55(0x71) 镜像后残差 40.6→2.1、
+   * 38.3→3.2，其余链镜像反而变差。检测结果写入 mirrorBones 并同步到
+   * 可视骨骼的 scale（THREE 的 T·R·S 与引擎镜像语义等价）。
+   */
+  private detectMirrorBones() {
+    this.mirrorBones.clear();
+    if (!this.fskelPoses || !this.skelParents.length || !this.skelBones.length) return;
+    const n = this.fskelBoneCount;
+    const isBone = (b: number) => /^Bone\d+$/.test(this.skelBones[b]?.name ?? "");
+    // 链根 = Bone* 且父不是 Bone*
+    const roots: number[] = [];
+    for (let b = 0; b < n; b++) {
+      if (!isBone(b)) continue;
+      const p = this.skelParents[b];
+      if (p < 0 || !isBone(p)) roots.push(b);
+    }
+    if (!roots.length || !this.parts.size) {
+      for (let b = 0; b < n; b++) this.skelBones[b].scale.setScalar(1);
+      return;
+    }
+    // 链成员（含根）
+    const membersOf = (root: number) => {
+      const mem = new Set<number>([root]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (let c = 0; c < n; c++) {
+          if (!mem.has(c) && isBone(c) && mem.has(this.skelParents[c])) {
+            mem.add(c);
+            changed = true;
+          }
+        }
+      }
+      return mem;
+    };
+    // 链上顶点的 LBS 残差和（帧 0，vs authored）
+    const residual = (mem: Set<number>, mirror: Set<number>): number => {
+      const W = this.worldsFromPoses(0, mirror);
+      let sum = 0;
+      for (const p of this.parts.values()) {
+        for (const v of p.model.vertices) {
+          if (!v.influences.some((inf) => mem.has(inf.boneIndex))) continue;
+          let x = 0, y = 0, z = 0;
+          for (const inf of v.influences) {
+            const M = W[inf.boneIndex].elements;
+            const lp = inf.boneLocalPos;
+            x += inf.weight * (M[0] * lp[0] + M[4] * lp[1] + M[8] * lp[2] + M[12]);
+            y += inf.weight * (M[1] * lp[0] + M[5] * lp[1] + M[9] * lp[2] + M[13]);
+            z += inf.weight * (M[2] * lp[0] + M[6] * lp[1] + M[10] * lp[2] + M[14]);
+          }
+          sum += Math.hypot(x - v.pos[0], y - v.pos[1], z - v.pos[2]);
+        }
+      }
+      return sum;
+    };
+    for (const r of roots) {
+      const mem = membersOf(r);
+      const plain = residual(mem, new Set());
+      const mirrored = residual(mem, new Set([r]));
+      if (mirrored < plain * 0.5 && mirrored < plain - 5) this.mirrorBones.add(r);
+    }
+    for (let b = 0; b < n; b++) {
+      this.skelBones[b].scale.setScalar(this.mirrorBones.has(b) ? -1 : 1);
+    }
   }
 
   /**
@@ -1212,6 +1296,7 @@ export class Viewer {
     this.fskelBoneCount = 0;
     this.worldMats = [];
     this.skelParents = [];
+    this.mirrorBones.clear();
     this.clothBones.clear();
     this.clothMats.clear();
     this.clothSims = [];
