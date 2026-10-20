@@ -157,6 +157,8 @@ npm --prefix gui/ui run tauri dev      # 开发运行
 npm --prefix gui/ui run tauri build    # 生成 NSIS 安装包
 ```
 
+使用CDP来连接运行程序进行测试或者模拟点击
+
 ### 快捷操作
 
 - 目录输入框回车或点「扫描」重新加载；
