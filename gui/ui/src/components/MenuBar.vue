@@ -69,7 +69,6 @@ const options = computed<MenuOption[]>(() => {
       children: [
         { label: "叠加皮肤网格", key: "act-overlay", disabled: actOff, icon: tick(props.act.showSkinOverlay) },
         { label: "显示骨架", key: "act-skeleton", disabled: actOff, icon: tick(props.act.showSkeleton) },
-        { label: "裙摆布料模拟", key: "act-cloth", disabled: actOff, icon: tick(props.act.clothSim) },
         { label: "定位骨架", key: "frame-skel", disabled: actOff, icon: tick(false) },
         { type: "divider", key: "act-d1" },
         { label: "关闭动作", key: "close-act", disabled: actOff, icon: tick(false) },
@@ -131,9 +130,6 @@ function onCommand(key: string | number) {
       break;
     case "act-skeleton":
       props.act.setSkeletonVisible(!props.act.showSkeleton);
-      break;
-    case "act-cloth":
-      props.act.setClothSim(!props.act.clothSim);
       break;
     case "frame-skel":
       props.act.frameSkeleton();
