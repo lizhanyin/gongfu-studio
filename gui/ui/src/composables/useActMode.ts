@@ -31,6 +31,10 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
     return [a.firstFrame, a.firstFrame + a.frameCount];
   });
   const actionFrames = computed(() => actionRange.value[1] - actionRange.value[0]);
+  /** 当前全局帧号 = 动作起始帧 + 动作内帧号（与 viewer 诊断日志/ActTime.csv 同一坐标系） */
+  const absFrame = computed(() => actionRange.value[0] + playTime.value);
+  /** 整个文件的总帧数 */
+  const totalFrames = computed(() => actMeta.value?.frameCount ?? 0);
   /** FSKEL 恒定 30 FPS（PlayBar 显示用） */
   const fps = computed(() => 30);
 
@@ -179,6 +183,8 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
     currentActionInfo,
     actionRange,
     actionFrames,
+    absFrame,
+    totalFrames,
     fps,
     openActFile,
     closeAct,

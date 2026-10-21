@@ -11,7 +11,7 @@
       @update:value="player.scrub"
     />
     <span class="play-info">
-      {{ Math.floor(player.playTime) }}/{{ player.actionFrames - 1 }} 帧 ·
+      {{ Math.floor(player.playTime) }}/{{ player.actionFrames - 1 }} 帧{{ absText }} ·
       {{ (player.playTime / player.fps).toFixed(2) }}s
     </span>
     <n-select
@@ -25,6 +25,8 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from "vue";
+
 /** 通用播放条：FSKEL 动作与 FAK 顶点动画共用（store 均满足此结构） */
 export interface PlayerLike {
   playing: boolean;
@@ -32,11 +34,25 @@ export interface PlayerLike {
   playTime: number;
   /** 当前动作总帧数 */
   actionFrames: number;
+  /** 当前帧在文件内的全局帧号（动作起始帧 + playTime），可选 */
+  absFrame?: number;
+  /** 文件总帧数（与 absFrame 配套显示），可选 */
+  totalFrames?: number;
   /** 显示用帧率（FSKEL=30，FAK 为各帧时长倒数均值） */
   fps: number;
   speed: number;
   scrub(v: number): void;
 }
 
-defineProps<{ player: PlayerLike }>();
+const props = defineProps<{ player: PlayerLike }>();
+
+/** 全局帧号后缀；单动作即全文件（全局=动作内）时不重复显示 */
+const absText = computed(() => {
+  const p = props.player;
+  const abs = p.absFrame;
+  const total = p.totalFrames;
+  if (typeof abs !== "number" || !total) return "";
+  if (total === p.actionFrames && Math.floor(abs) === Math.floor(p.playTime)) return "";
+  return ` · 全局 ${Math.floor(abs)}/${total - 1}`;
+});
 </script>

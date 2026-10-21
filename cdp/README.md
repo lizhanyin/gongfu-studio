@@ -19,8 +19,9 @@
 - 重启应用时先 `taskkill //IM Gongfu-Studio.exe //F` **并杀掉旧 msedgewebview2 浏览器
   进程**，否则旧浏览器进程被复用、调试参数不生效（表现为端口不监听）。
   Git Bash 里 `/IM` 会被转义成路径，须写 `//IM`。
-- 就绪判定：`curl -s http://127.0.0.1:9333/json`。target 选择必须**优先
-  `tauri.localhost`**——打开过 DevTools 后 `devtools://` 页面也是 type=page，会抢首个匹配。
+- 就绪判定：`curl -s http://127.0.0.1:9333/json`。脚本 target 匹配同时认
+  `tauri.localhost`（打包构建）与 `localhost:1420`（dev 模式），且不会匹配
+  devtools:// 页面（打开过 DevTools 后它也是 type=page，会抢首个匹配）。
 - **改了前端（gui/ui）后**：Tauri 在编译期把 `ui/dist` 嵌进 exe，只跑 vite build 不够，
   必须 `npm --prefix gui/ui run build && cargo build` 后重启 exe；exe 被运行实例锁住时
   链接报 os error 5，先杀进程。（dev 模式除外，见下条）
@@ -45,6 +46,7 @@ CDP_PORT 环境变量可覆盖默认端口。
 | `node probe-hipclip.mjs [f\|f0-f1]` | 裙顶点 vs 身体网格三角形（腿/骨盆分区）最近距离 + 胶囊间隙对照（覆盖缺口定位） |
 | `node probe-triclip.mjs [f0-f1]` | girl_Lower 内 裙三角形×身体三角形 相交逐帧统计（面片跨穿） |
 | `node probe-xclip.mjs [f0-f1]` | 全部件全组合 三角形相交（含软×软：裙自折/裙×上衣/发×身）——穿模定位终极探针 |
+| `node collect-frames.mjs <f0>-<f1> [--shots] [--out=p]` | **逐帧渲染状态采集**：去穿透推出日志（阶段/顶点/幅度/胶囊，需 `__viewer.skirtRecord` 探针=新构建）+ 每裙顶点 最终vs纯LBS 位移 + 帧间抖动指标；`--shots` 逐帧抓 PNG 到 target/frameshots/；完整数据写 target/frame-report-*.json |
 | `node analyze-tail.mjs <log>` | 合并分析 `--tail` 抓的日志文件，按动作分组统计告警 |
 
 新写脚本直接复制 drive.mjs 的骨架（getJson 拿 target → ws → Runtime.evaluate）即可。
@@ -74,12 +76,17 @@ viewer 构造器把自身挂到 `window.__viewer`。TS `private` 只是编译期
 | `isBoneHelperName(b)` / `boneChainMembers(root)` | 方法：Bone* 判定 / 链成员（根+子孙骨索引） |
 | `applyFskelFrame(f, f, 0)` | 方法：**精确设帧**（暂停后调用即定格到 f，播放循环不会覆盖） |
 | `diag` | 当前 30 帧窗口累计：`i0`(帧号) `maxNeed/maxBone`(去穿透需求) `clamp`(钳制) 等 |
+| `skirtRecord` / `skirtPushLog` | 采集开关（默认关，零开销）与本帧推出日志：`{v, phase, k, cap?}`，phase 1=顶点胶囊 / 2=跨穿 tri-tri / 3=复扫 |
 | `actName` | 当前动作名（诊断日志前缀） |
 
 诊断日志同时写 `window.__diagLog`（环形 500 条，元素 `{t, level, msg}`），
 历史用 `--diag`，实时用 `--tail`；CDP 没有 console 历史 API，别指望回捞。
 
 ## 4. 常用配方
+
+**逐帧采集分析形变/抖动**：`node collect-frames.mjs 461-486 [--shots]`——
+摘要表的"帧间抖动max"列直接标出 ◀抖动 帧（同顶点位移的帧间跳变，
+"某几帧细微形变"即推出量在相交起止帧边界 0↔3 的瞬跳）。
 
 **残余穿透复查**（任何动作）：`node verify-skirt.mjs`
 → `{"residualPen": -0.46, "badOver2cm": 0, ...}`（负值 = 全在胶囊安全间隙外）。

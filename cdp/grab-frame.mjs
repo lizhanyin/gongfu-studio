@@ -2,9 +2,12 @@
 import WebSocket from "ws";
 import { request } from "node:http";
 import { writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const CDP_PORT = Number(process.env.CDP_PORT) || 9333;
-const out = process.argv[2] ?? "../target/std8_frame.png";
+const TARGET = join(dirname(fileURLToPath(import.meta.url)), "..", "target");
+const out = process.argv[2] ?? join(TARGET, "std8_frame.png");
 
 function getJson(path) {
   return new Promise((resolve, reject) => {
@@ -19,7 +22,8 @@ function getJson(path) {
 }
 
 const targets = await getJson("/json");
-const page = targets.find((t) => t.type === "page" && /tauri\.localhost/.test(t.url));
+const page = targets.find((t) => t.type === "page" && /tauri\.localhost|localhost:1420/.test(t.url));
+if (!page) { console.error("no page target"); process.exit(1); }
 const ws = new WebSocket(page.webSocketDebuggerUrl, { perMessageDeflate: false });
 let id = 0;
 const pending = new Map();

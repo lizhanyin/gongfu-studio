@@ -34,6 +34,10 @@ export function useFakMode(viewer: ShallowRef<Viewer | null>) {
     return [a.firstFrame, a.firstFrame + a.frameCount];
   });
   const actionFrames = computed(() => actionRange.value[1] - actionRange.value[0]);
+  /** 当前全局帧号 = 动作起始帧 + 动作内帧号 */
+  const absFrame = computed(() => actionRange.value[0] + playTime.value);
+  /** 整个文件的总帧数 */
+  const totalFrames = computed(() => fakModel.value?.frames.length ?? 0);
   /** 显示用平均帧率（各帧时长不一） */
   const fps = computed(() => {
     const m = fakModel.value;
@@ -157,6 +161,8 @@ export function useFakMode(viewer: ShallowRef<Viewer | null>) {
     currentActionInfo,
     actionRange,
     actionFrames,
+    absFrame,
+    totalFrames,
     fps,
     openFakFile,
     closeFak,

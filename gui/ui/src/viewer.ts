@@ -224,10 +224,51 @@ export class Viewer {
   /** 腿网格三角形（无链影响的 Thigh/Calf/Foot 权重三角形，含靴）：
    *  裙三角形-腿三角形相交测试的靶集——真实网格判定，无胶囊半径两难 */
   private skirtLegTris: { p: PartObj; a: number; b: number; c: number }[] = [];
+  /** 躯干三角形（既无链也无腿影响，含腰带/上衣/骨盆）：动态接触跟随
+   *  （防贴合开缝）的目标池——腿三角形不参与，推离腿正是去穿透目的 */
+  private skirtBodyTris: { p: PartObj; a: number; b: number; c: number }[] = [];
+  /** 数据采集开关（cdp/collect-frames.mjs）：开启时 applySkirtDePenVerts
+   *  把每次推出记入 skirtPushLog（帧开头清空；关闭时零开销）。
+   *  phase 1=顶点胶囊 / 2=跨穿 tri-tri / 3=复扫 */
+  skirtRecord = false;
+  skirtPushLog: { v: number; phase: number; k: number; cap?: string }[] = [];
+  /** 推出量时间平滑（"细微形变"修复）：无状态推出在相交起止边界
+   *  0↔2.6~3.4 瞬跳（collect-frames 帧间抖动实测）。每顶点存上帧位移
+   *  向量做入快出慢 lerp（布料式）；seek/部件变更重置；平滑后顶点若
+   *  仍在胶囊内立即回退满推出（顶点级正确性不妥协，跨穿残余仅 1 帧
+   *  且 ≤25%） */
+  private skirtPrevDisp = new Float64Array(0);
+  private skirtOrigSnap = new Float64Array(0);
+  private skirtPrevAbs = NaN;
+  /** 位移场空间松弛（尖角修复）：skirtVerts 邻接表（三角形边 + 拆缝克隆对
+   *  互为邻居，防接缝撕开）与双缓冲。阶段二按命中三角形整面外推，未命中
+   *  面的邻居零位移，同条布带位移差 2.5+ → 布面翻折尖角（run9 v29/30
+   *  外缘常驻尖角、475-477 v36 反向尖谷实测） */
+  private skirtAdj: number[][] = [];
+  private skirtRelaxA = new Float64Array(0);
+  private skirtRelaxB = new Float64Array(0);
+  /** 平滑系数：入快（2 帧到 ~94%）、出慢（布料回弹感） */
+  private static readonly SKIRT_SMOOTH_UP = 0.75;
+  private static readonly SKIRT_SMOOTH_DOWN = 0.3;
+  /** 位移场空间松弛系数（2 轮邻域均值；仿真把最大邻域差分 2.36→0.52） */
+  private static readonly SKIRT_RELAX_R = 0.5;
+  /** 动态接触跟随：裙顶边推离腿时把位移传给贴合躯干面的比例（余下
+   *  0.25 为缝上限 ~0.3，布料厚度内不可见） */
+  private static readonly SKIRT_FOLLOW = 0.75;
+  /** 接触跟随判据：LBS 基准下距躯干三角形近于此值视为贴合（非焊接） */
+  private static readonly SKIRT_WELD_D = 0.6;
+  /** 接触跟随判据：位移使距离增大超过此值才算被拉开 */
+  private static readonly SKIRT_WELD_SEP = 0.25;
   /** 腿部碰撞胶囊：骨索引 + 绑定段长（骨原点→子骨方向，蒙皮随动） */
   private legCaps: { bone: number; len: number }[] = [];
   /** 去穿透目标间隙（胶囊半径之上的余量） */
   private static readonly SKIRT_MARGIN = 0.25;
+  /** 腿网格口径收口：胶囊粗筛命中后再验腿网格最近距离，距网格面
+   *  小于它才真推。真实腿面比 0.18 系数胶囊瘦 ~1.6，纯胶囊口径会把
+   *  贴合腿面的裙顶边（裙腰贴腿根 0.5~0.6，设计如此）推离腿面，
+   *  沿贴合线开缝（wlk4 105-112 裙腰横缝根因；与跨穿推出的胶囊
+   *  误伤同源，见阶段二注释） */
+  private static readonly SKIRT_MESH_MARGIN = 0.15;
   /** 单顶点单帧最大推出量（防动作数据极端穿透撕裂网格） */
   private static readonly SKIRT_MAX_PUSH = 6;
   /** 近静止链的锚定门槛：|纯LBS−锚定摆放| 帧平均失配超过它才视为链数据
@@ -1175,6 +1216,7 @@ export class Viewer {
     this.skirtVerts = [];
     this.skirtTris = [];
     this.skirtLegTris = [];
+    this.skirtBodyTris = [];
     this.legCaps = [];
     const n = this.fskelBoneCount;
     if (!this.fskelPoses || !this.skelParents.length || !n) return;
@@ -1218,9 +1260,46 @@ export class Viewer {
           this.skirtTris.push({ p, a, b, c });
         } else if (leg[a] || leg[b] || leg[c]) {
           this.skirtLegTris.push({ p, a, b, c });
+        } else {
+          this.skirtBodyTris.push({ p, a, b, c });
         }
       }
     }
+    // 平滑状态随裙顶点集重建（部件增删会改变下标）
+    this.skirtPrevDisp = new Float64Array(this.skirtVerts.length * 3);
+    this.skirtOrigSnap = new Float64Array(this.skirtVerts.length * 3);
+    this.skirtPrevAbs = NaN;
+    // 邻接表：skirtTris 三角形边 + 拆缝克隆对（副本与源顶点互为邻居，
+    // 松弛时同步位移防接缝撕开）
+    {
+      const svIdx = new Map<PartObj, Map<number, number>>();
+      this.skirtVerts.forEach((sv, s) => {
+        let m = svIdx.get(sv.p);
+        if (!m) svIdx.set(sv.p, (m = new Map()));
+        m.set(sv.i, s);
+      });
+      const adj: Set<number>[] = Array.from({ length: this.skirtVerts.length }, () => new Set<number>());
+      for (const t of this.skirtTris) {
+        const m = svIdx.get(t.p)!;
+        const vs = [m.get(t.a), m.get(t.b), m.get(t.c)].filter((x) => x !== undefined) as number[];
+        for (let a = 0; a < vs.length; a++)
+          for (let b = 0; b < vs.length; b++) if (a !== b) adj[vs[a]].add(vs[b]);
+      }
+      for (const [p, m] of svIdx) {
+        const vcount = p.model.vertices.length;
+        for (const [i, s] of m) {
+          if (i < vcount) continue;
+          const src = m.get(p.clones[i - vcount].src);
+          if (src !== undefined) {
+            adj[s].add(src);
+            adj[src].add(s);
+          }
+        }
+      }
+      this.skirtAdj = adj.map((a) => [...a]);
+    }
+    this.skirtRelaxA = new Float64Array(this.skirtVerts.length * 3);
+    this.skirtRelaxB = new Float64Array(this.skirtVerts.length * 3);
   }
 
   /**
@@ -1338,6 +1417,97 @@ export class Viewer {
     return false;
   }
 
+  /** 点到三角形最近距离（Ericson，标量无分配；用于跨穿推出的幅度收口） */
+  private static ptTriDist(
+    px: number, py: number, pz: number,
+    ax: number, ay: number, az: number,
+    bx: number, by: number, bz: number,
+    cx: number, cy: number, cz: number
+  ): number {
+    const abx = bx - ax, aby = by - ay, abz = bz - az;
+    const acx = cx - ax, acy = cy - ay, acz = cz - az;
+    const apx = px - ax, apy = py - ay, apz = pz - az;
+    const d1 = abx * apx + aby * apy + abz * apz;
+    const d2 = acx * apx + acy * apy + acz * apz;
+    if (d1 <= 0 && d2 <= 0) return Math.hypot(apx, apy, apz);
+    const bpx = px - bx, bpy = py - by, bpz = pz - bz;
+    const d3 = abx * bpx + aby * bpy + abz * bpz;
+    const d4 = acx * bpx + acy * bpy + acz * bpz;
+    if (d3 >= 0 && d4 <= d3) return Math.hypot(bpx, bpy, bpz);
+    const vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+      const t = d1 / (d1 - d3);
+      return Math.hypot(ax + abx * t - px, ay + aby * t - py, az + abz * t - pz);
+    }
+    const cpx = px - cx, cpy = py - cy, cpz = pz - cz;
+    const d5 = abx * cpx + aby * cpy + abz * cpz;
+    const d6 = acx * cpx + acy * cpy + acz * cpz;
+    if (d6 >= 0 && d5 <= d6) return Math.hypot(cpx, cpy, cpz);
+    const vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+      const t = d2 / (d2 - d6);
+      return Math.hypot(ax + acx * t - px, ay + acy * t - py, az + acz * t - pz);
+    }
+    const va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+      const t = (d4 - d3) / (d4 - d3 + (d5 - d6));
+      return Math.hypot(bx + (cx - bx) * t - px, by + (cy - by) * t - py, bz + (cz - bz) * t - pz);
+    }
+    const den = va + vb + vc;
+    const t0 = vb / den, t1 = vc / den;
+    return Math.hypot(ax + abx * t0 + acx * t1 - px, ay + aby * t0 + acy * t1 - py, az + abz * t0 + acz * t1 - pz);
+  }
+
+  /** 点到三角形最近点 + 重心权（wA+wB+wC=1，out 复用避免分配；
+   *  与 ptTriDist 同分支结构，供接触跟随把位移分配到三顶点） */
+  private static ptTriBary(
+    out: Float64Array,
+    px: number, py: number, pz: number,
+    ax: number, ay: number, az: number,
+    bx: number, by: number, bz: number,
+    cx: number, cy: number, cz: number
+  ): number {
+    const abx = bx - ax, aby = by - ay, abz = bz - az;
+    const acx = cx - ax, acy = cy - ay, acz = cz - az;
+    const apx = px - ax, apy = py - ay, apz = pz - az;
+    const d1 = abx * apx + aby * apy + abz * apz;
+    const d2 = acx * apx + acy * apy + acz * apz;
+    const set = (d: number, wa: number, wb: number, wc: number) => {
+      out[0] = d; out[1] = wa; out[2] = wb; out[3] = wc;
+      return d;
+    };
+    if (d1 <= 0 && d2 <= 0) return set(Math.hypot(apx, apy, apz), 1, 0, 0);
+    const bpx = px - bx, bpy = py - by, bpz = pz - bz;
+    const d3 = abx * bpx + aby * bpy + abz * bpz;
+    const d4 = acx * bpx + acy * bpy + acz * bpz;
+    if (d3 >= 0 && d4 <= d3) return set(Math.hypot(bpx, bpy, bpz), 0, 1, 0);
+    const vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+      const t = d1 / (d1 - d3);
+      return set(Math.hypot(ax + abx * t - px, ay + aby * t - py, az + abz * t - pz), 1 - t, t, 0);
+    }
+    const cpx = px - cx, cpy = py - cy, cpz = pz - cz;
+    const d5 = abx * cpx + aby * cpy + abz * cpz;
+    const d6 = acx * cpx + acy * cpy + acz * cpz;
+    if (d6 >= 0 && d5 <= d6) return set(Math.hypot(cpx, cpy, cpz), 0, 0, 1);
+    const vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+      const t = d2 / (d2 - d6);
+      return set(Math.hypot(ax + acx * t - px, ay + acy * t - py, az + acz * t - pz), 1 - t, 0, t);
+    }
+    const va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+      const t = (d4 - d3) / (d4 - d3 + (d5 - d6));
+      return set(Math.hypot(bx + (cx - bx) * t - px, by + (cy - by) * t - py, bz + (cz - bz) * t - pz), 0, 1 - t, t);
+    }
+    const den = va + vb + vc;
+    const t0 = vb / den, t1 = vc / den;
+    return set(
+      Math.hypot(ax + abx * t0 + acx * t1 - px, ay + aby * t0 + acy * t1 - py, az + abz * t0 + acz * t1 - pz),
+      1 - t0 - t1, t0, t1
+    );
+  }
+
   /** 点在三角形内（已知三角形法线；绕向：cross(边, 点-边起点)·n ≥ 0 全边成立） */
   private static inTri(
     px: number, py: number, pz: number,
@@ -1377,8 +1547,9 @@ export class Viewer {
    * 相交（triTri，与验证探针同口径），命中才沿径向外推三顶点；胶囊
    * 半径/网格内采样等代理判据都有反例（详见阶段二注释）。
    */
-  private applySkirtDePenVerts() {
+  private applySkirtDePenVerts(abs = NaN) {
     if (!this.skirtVerts.length || !this.legCaps.length || !this.worldMats.length) return;
+    if (this.skirtRecord) this.skirtPushLog = [];
     const caps: {
       ax: number; ay: number; az: number; bx: number; by: number; bz: number;
       r: number; bone: number;
@@ -1397,6 +1568,58 @@ export class Viewer {
     if (!caps.length) return;
     const touched = new Set<THREE.BufferAttribute>();
     const attrOf = (p: PartObj) => p.geom.getAttribute("position") as THREE.BufferAttribute;
+    // 带符号腿网格距离（粗筛半径 6）：phase 1/3/4 安全网的胶囊→网格口径
+    // 收口。取最近腿三角形，按其外向法线侧别定号——腿管近似凸，网格
+    // 内（真穿透）为负、外（贴合/远离）为正。不能用无符号距离：压进
+    // 腿管内的顶点到腿面距离恒正，会被误判成"贴合外"放掉穿透
+    // （run9 475 深穿 1.7 回归实测）。
+    const baryScratch = new Float64Array(4);
+    const legSignedDist = (px: number, py: number, pz: number): number => {
+      let best = Infinity;
+      let bwx = 0, bwy = 0, bwz = 0;
+      let ba3 = 0, bb3 = 0, bc3 = 0;
+      let bp: PartObj | null = null;
+      for (const t of this.skirtLegTris) {
+        const pa = attrOf(t.p).array as Float32Array;
+        const a3 = t.a * 3, b3 = t.b * 3, c3 = t.c * 3;
+        const da = (pa[a3] - px) ** 2 + (pa[a3 + 1] - py) ** 2 + (pa[a3 + 2] - pz) ** 2;
+        const db = (pa[b3] - px) ** 2 + (pa[b3 + 1] - py) ** 2 + (pa[b3 + 2] - pz) ** 2;
+        const dc = (pa[c3] - px) ** 2 + (pa[c3 + 1] - py) ** 2 + (pa[c3 + 2] - pz) ** 2;
+        if (da > 64 && db > 64 && dc > 64) continue;
+        const d = Viewer.ptTriBary(baryScratch, px, py, pz,
+          pa[a3], pa[a3 + 1], pa[a3 + 2], pa[b3], pa[b3 + 1], pa[b3 + 2], pa[c3], pa[c3 + 1], pa[c3 + 2]);
+        if (d < best) {
+          best = d;
+          bp = t.p; ba3 = a3; bb3 = b3; bc3 = c3;
+          bwx = baryScratch[1]; bwy = baryScratch[2]; bwz = baryScratch[3];
+        }
+      }
+      if (!bp) return Infinity;
+      const pa = attrOf(bp).array as Float32Array;
+      const cx = pa[ba3] * bwx + pa[bb3] * bwy + pa[bc3] * bwz;
+      const cy = pa[ba3 + 1] * bwx + pa[bb3 + 1] * bwy + pa[bc3 + 1] * bwz;
+      const cz = pa[ba3 + 2] * bwx + pa[bb3 + 2] * bwy + pa[bc3 + 2] * bwz;
+      // 侧别用胶囊径向（腿管≈圆柱，轴=腿骨）：p−closest 与
+      // closest−轴投影 同向=面外正、反向=面内负。不依赖网格绕向——
+      // 腿三角形绕向不统一（实测胯区全反），而"三角形中心−轴"参考在
+      // 腿管端帽区退化（方向沿轴，符号随机，run9 475 深穿被判外 2.5）
+      let refx = 0, refy = 0, refz = 0, refLen = Infinity;
+      for (const c of caps) {
+        const abx = c.bx - c.ax, aby = c.by - c.ay, abz = c.bz - c.az;
+        const ab2 = abx * abx + aby * aby + abz * abz;
+        let t = ab2 > 1e-9 ? ((cx - c.ax) * abx + (cy - c.ay) * aby + (cz - c.az) * abz) / ab2 : 0;
+        t = Math.min(Math.max(t, 0), 1);
+        const dx = cx - (c.ax + abx * t), dy = cy - (c.ay + aby * t), dz = cz - (c.az + abz * t);
+        const l2 = dx * dx + dy * dy + dz * dz;
+        if (l2 > 1e-9 && l2 < refLen) { refLen = l2; refx = dx; refy = dy; refz = dz; }
+      }
+      if (refLen < Infinity) {
+        const rl = Math.sqrt(refLen);
+        const sgn = ((px - cx) * refx + (py - cy) * refy + (pz - cz) * refz) / rl;
+        return Math.hypot(px - cx, py - cy, pz - cz) * Math.sign(sgn || 1);
+      }
+      return best;
+    };
     // (part, inflOf 下标) → skirtVerts 下标：边/三角引用非裙端点时跳过推送
     const svIdx = new Map<PartObj, Map<number, number>>();
     this.skirtVerts.forEach((sv, s) => {
@@ -1405,6 +1628,18 @@ export class Viewer {
       m.set(sv.i, s);
     });
     const budget = new Float64Array(this.skirtVerts.length).fill(Viewer.SKIRT_MAX_PUSH);
+    // 阶段二"全外面片斜切满推"的顶点标记：阶段四点五豁免衰减（斜切
+    // 修复的推出量不能被贴合衰减砍掉）
+    const noDecay = new Uint8Array(this.skirtVerts.length);
+    // 去穿透前快照（阶段四平滑的位移基准 = skinPart 输出位置）
+    for (let s = 0; s < this.skirtVerts.length; s++) {
+      const sv = this.skirtVerts[s];
+      const pa = attrOf(sv.p).array as Float32Array;
+      const o = sv.i * 3;
+      this.skirtOrigSnap[s * 3] = pa[o];
+      this.skirtOrigSnap[s * 3 + 1] = pa[o + 1];
+      this.skirtOrigSnap[s * 3 + 2] = pa[o + 2];
+    }
     const pushVert = (s: number, k: number, dx: number, dy: number, dz: number) => {
       if (s < 0 || k <= 0) return;
       const sv = this.skirtVerts[s];
@@ -1416,6 +1651,7 @@ export class Viewer {
       pa[o + 2] += dz * k;
       budget[s] -= k;
       touched.add(attr);
+      if (this.skirtRecord) this.skirtPushLog.push({ v: s, phase: 2, k });
     };
 
     // 阶段一：顶点推出（最多 3 轮：Thigh/Calf 胶囊在膝盖交叠，单遍依次
@@ -1439,12 +1675,15 @@ export class Viewer {
           const qx = c.ax + abx * t, qy = c.ay + aby * t, qz = c.az + abz * t;
           const vx = px - qx, vy = py - qy, vz = pz - qz;
           const d = Math.hypot(vx, vy, vz);
-          const need = c.r + Viewer.SKIRT_MARGIN - d;
+          let need = c.r + Viewer.SKIRT_MARGIN - d;
           if (need <= 1e-3) continue;
           if (need > this.diag.maxNeed) {
             this.diag.maxNeed = need;
             this.diag.maxBone = c.bone;
           }
+          // 网格口径收口：胶囊命中但贴腿网格（裙腰顶边贴腿根）不推
+          need = Math.min(need, Math.max(0, Viewer.SKIRT_MESH_MARGIN - legSignedDist(px, py, pz)));
+          if (need <= 1e-3) continue;
           if (budget[s] <= 1e-3) {
             this.diag.clamp++; // 预算耗尽，余量仍穿
             exhausted = true;
@@ -1453,6 +1692,8 @@ export class Viewer {
           const k = Math.min(need, budget[s]);
           if (k < need) this.diag.clamp++;
           budget[s] -= k;
+          if (this.skirtRecord)
+            this.skirtPushLog.push({ v: s, phase: 1, k, cap: this.skelBones[c.bone]?.name });
           if (d > 1e-6) {
             px += (vx / d) * k;
             py += (vy / d) * k;
@@ -1522,6 +1763,26 @@ export class Viewer {
             }
           }
         }
+        // 幅度收口：臀根等区域网格戳出胖胶囊，胶囊口径会把仅 1~3 间隙的
+        // 浅剐蹭推 3.5+（run9 465-468 左大腿上方持续凸起实测；同一顶点
+        // 的多个父三角各自命中还会累计）。取"三顶点到被剐腿三角形的最近
+        // 距离 + 0.3"为上限——剐蹭角就在表面附近，该距离≈真实切入深度，
+        // 浅剐浅推；且推出后距离实时缩小，多父三角累计自然收敛
+        {
+          const la = [hitLt.a * 3, hitLt.b * 3, hitLt.c * 3];
+          const lx = [pa2[la[0]], pa2[la[1]], pa2[la[2]]];
+          const ly = [pa2[la[0] + 1], pa2[la[1] + 1], pa2[la[2] + 1]];
+          const lz = [pa2[la[0] + 2], pa2[la[1] + 2], pa2[la[2] + 2]];
+          let dmin = Infinity;
+          for (const vi of [t.a * 3, t.b * 3, t.c * 3]) {
+            dmin = Math.min(
+              dmin,
+              Viewer.ptTriDist(pa[vi], pa[vi + 1], pa[vi + 2], lx[0], ly[0], lz[0], lx[1], ly[1], lz[1], lx[2], ly[2], lz[2])
+            );
+          }
+          need = Math.min(need, dmin + 0.3);
+          if (need < 0.35) need = 0.35;
+        }
         const k = Math.min(
           need,
           sa >= 0 ? budget[sa] : Infinity,
@@ -1529,12 +1790,93 @@ export class Viewer {
           sc >= 0 ? budget[sc] : Infinity
         );
         if (k > 1e-3) {
-          pushVert(sa, k, ddx, ddy, ddz);
-          pushVert(sb, k, ddx, ddy, ddz);
-          pushVert(sc, k, ddx, ddy, ddz);
+          // 面上存在真插入顶点（dm<0，wlk4 裙腰顶边贴腿根、底边插腿
+          // 的斜插面）→ 按各顶点带符号腿网格距离加权：贴面顶边不带走
+          // 开缝、插入段满推，三角形弯曲而非平移。面上全在腿外但面片
+          // 仍与腿相交（run9 475 动画把裙面斜压切入腿，顶点级口径挡
+          // 不住）→ 整面满推并标记免衰减（衰减判据 dm 区分不了贴合法
+          // 与斜切）。变形由阶段二点五松弛抹平
+          const dmOf = (s: number) => {
+            if (s < 0) return Infinity;
+            // 用帧首 LBS 基准位置：当帧位置在两轮迭代间漂移，第二轮
+            // 会把第一轮刚推出的顶点 dm 推过 0.65 而误判"不贴"满推
+            return legSignedDist(
+              this.skirtOrigSnap[s * 3], this.skirtOrigSnap[s * 3 + 1], this.skirtOrigSnap[s * 3 + 2]
+            );
+          };
+          const dma = dmOf(sa), dmb = dmOf(sb), dmc = dmOf(sc);
+          const wOf = (dm: number) =>
+            dm <= Viewer.SKIRT_MESH_MARGIN ? 1
+              : Math.max(0, 1 - (dm - Viewer.SKIRT_MESH_MARGIN) / 0.5);
+          if (dma < 0 || dmb < 0 || dmc < 0) {
+            pushVert(sa, k * wOf(dma), ddx, ddy, ddz);
+            pushVert(sb, k * wOf(dmb), ddx, ddy, ddz);
+            pushVert(sc, k * wOf(dmc), ddx, ddy, ddz);
+          } else {
+            // 斜切满推也要区分：贴着腿面的顶点（dm<0.65，wlk4 裙腰顶
+            // 边贴腿根）整面推走会与贴合界开缝——按贴合度压到 0.3；
+            // 不贴的（run9 大腿后侧 dm≥0.65）满推修复斜切
+            const wPush = (dm: number) => (dm >= Viewer.SKIRT_MESH_MARGIN + 0.5 ? 1 : 0.3);
+            const mark = (s: number, dm: number) => {
+              if (s >= 0 && wPush(dm) >= 1) noDecay[s] = 1;
+            };
+            mark(sa, dma); mark(sb, dmb); mark(sc, dmc);
+            pushVert(sa, k * wPush(dma), ddx, ddy, ddz);
+            pushVert(sb, k * wPush(dmb), ddx, ddy, ddz);
+            pushVert(sc, k * wPush(dmc), ddx, ddy, ddz);
+          }
         }
       }
       if (!anyHit) break;
+    }
+
+    // 阶段二点五：位移场空间松弛。阶段一/二都是逐顶点/逐面独立推出，
+    // 未命中的邻居顶点零位移，同条布带上位移梯度可达 2.5+ → 布面翻折
+    // 尖角（run9 462-486 v29/30 外缘常驻尖角、475-477 v36 反向尖谷
+    // collect-frames 邻域差分实测）。对位移场（非位置）做邻域均值松弛，
+    // 把推出量扩散给相邻顶点抹平梯度；均值保持不放大位移。被拉回胶囊
+    // 内的顶点由阶段三复扫补推到胶囊面——顶点级正确性不妥协，且补推
+    // 后恰停在最小必要位置（整面外推的过冲被松弛吸收）。
+    if (this.skirtAdj.length === this.skirtVerts.length && this.skirtVerts.length) {
+      const n = this.skirtVerts.length;
+      const d = this.skirtRelaxA, t = this.skirtRelaxB;
+      for (let s = 0; s < n; s++) {
+        const sv = this.skirtVerts[s];
+        const pa = attrOf(sv.p).array as Float32Array;
+        const o = sv.i * 3;
+        d[s * 3] = pa[o] - this.skirtOrigSnap[s * 3];
+        d[s * 3 + 1] = pa[o + 1] - this.skirtOrigSnap[s * 3 + 1];
+        d[s * 3 + 2] = pa[o + 2] - this.skirtOrigSnap[s * 3 + 2];
+      }
+      for (let iter = 0; iter < 2; iter++) {
+        for (let s = 0; s < n; s++) {
+          const nbs = this.skirtAdj[s];
+          const s3 = s * 3;
+          if (!nbs.length) {
+            t[s3] = d[s3]; t[s3 + 1] = d[s3 + 1]; t[s3 + 2] = d[s3 + 2];
+            continue;
+          }
+          let ax = 0, ay = 0, az = 0;
+          for (const nb of nbs) {
+            ax += d[nb * 3]; ay += d[nb * 3 + 1]; az += d[nb * 3 + 2];
+          }
+          ax /= nbs.length; ay /= nbs.length; az /= nbs.length;
+          t[s3] = d[s3] + (ax - d[s3]) * Viewer.SKIRT_RELAX_R;
+          t[s3 + 1] = d[s3 + 1] + (ay - d[s3 + 1]) * Viewer.SKIRT_RELAX_R;
+          t[s3 + 2] = d[s3 + 2] + (az - d[s3 + 2]) * Viewer.SKIRT_RELAX_R;
+        }
+        d.set(t);
+      }
+      for (let s = 0; s < n; s++) {
+        const sv = this.skirtVerts[s];
+        const attr = attrOf(sv.p);
+        const pa = attr.array as Float32Array;
+        const o = sv.i * 3;
+        pa[o] = this.skirtOrigSnap[s * 3] + d[s * 3];
+        pa[o + 1] = this.skirtOrigSnap[s * 3 + 1] + d[s * 3 + 1];
+        pa[o + 2] = this.skirtOrigSnap[s * 3 + 2] + d[s * 3 + 2];
+        touched.add(attr);
+      }
     }
 
     // 阶段三：复扫顶点（跨穿推出可能把端点推进其他胶囊，一轮收敛）
@@ -1553,7 +1895,10 @@ export class Viewer {
         t = Math.min(Math.max(t, 0), 1);
         const vx = px - (c.ax + abx * t), vy = py - (c.ay + aby * t), vz = pz - (c.az + abz * t);
         const d = Math.hypot(vx, vy, vz);
-        const need = c.r + Viewer.SKIRT_MARGIN - d;
+        let need = c.r + Viewer.SKIRT_MARGIN - d;
+        if (need <= 1e-3) continue;
+        // 网格口径收口（与阶段一同口径）
+        need = Math.min(need, Math.max(0, Viewer.SKIRT_MESH_MARGIN - legSignedDist(px, py, pz)));
         if (need <= 1e-3) continue;
         if (budget[s] <= 1e-3) {
           this.diag.clamp++;
@@ -1562,6 +1907,8 @@ export class Viewer {
         const k = Math.min(need, budget[s]);
         if (k < need) this.diag.clamp++;
         budget[s] -= k;
+        if (this.skirtRecord)
+          this.skirtPushLog.push({ v: s, phase: 3, k, cap: this.skelBones[c.bone]?.name });
         if (d > 1e-6) {
           px += (vx / d) * k;
           py += (vy / d) * k;
@@ -1577,6 +1924,168 @@ export class Viewer {
         touched.add(attr);
       }
     }
+    // 阶段四：推出量时间平滑。无状态推出在相交起止帧边界瞬跳（0↔3，
+    // collect-frames 帧间抖动实测 2.6~3.4）即"细微形变"主源。对每顶点
+    // 总位移做入快出慢 lerp；seek（倒放/大跳/scrub/部件变更后首帧）
+    // 直接用当帧原始值。平滑后若顶点仍在任一胶囊内 → 回退满推出，
+    // 顶点级正确性不妥协（跨穿残余最多 1 帧且 ≤25% 深度）
+    const seek =
+      !Number.isFinite(abs) ||
+      !Number.isFinite(this.skirtPrevAbs) ||
+      Math.abs(abs - this.skirtPrevAbs) > 2;
+    this.skirtPrevAbs = abs;
+    for (let s = 0; s < this.skirtVerts.length; s++) {
+      const sv = this.skirtVerts[s];
+      const attr = attrOf(sv.p);
+      const pa = attr.array as Float32Array;
+      const o = sv.i * 3;
+      const ox = this.skirtOrigSnap[s * 3], oy = this.skirtOrigSnap[s * 3 + 1], oz = this.skirtOrigSnap[s * 3 + 2];
+      const dx = pa[o] - ox, dy = pa[o + 1] - oy, dz = pa[o + 2] - oz;
+      let nx: number, ny: number, nz: number;
+      if (seek) {
+        nx = dx; ny = dy; nz = dz;
+      } else {
+        const px = this.skirtPrevDisp[s * 3], py = this.skirtPrevDisp[s * 3 + 1], pz = this.skirtPrevDisp[s * 3 + 2];
+        const r =
+          Math.hypot(dx, dy, dz) >= Math.hypot(px, py, pz) - 1e-9
+            ? Viewer.SKIRT_SMOOTH_UP
+            : Viewer.SKIRT_SMOOTH_DOWN;
+        nx = px + (dx - px) * r;
+        ny = py + (dy - py) * r;
+        nz = pz + (dz - pz) * r;
+        // 顶点级安全网：平滑结果仍在胶囊内 → 满推出（网格口径收口，
+        // 贴腿网格不回退——平滑值即停留在贴合面附近）
+        const fx = ox + nx, fy = oy + ny, fz = oz + nz;
+        let need = 0;
+        for (const c of caps) {
+          const abx = c.bx - c.ax, aby = c.by - c.ay, abz = c.bz - c.az;
+          const apx = fx - c.ax, apy = fy - c.ay, apz = fz - c.az;
+          const ab2 = abx * abx + aby * aby + abz * abz;
+          let t = ab2 > 1e-9 ? (apx * abx + apy * aby + apz * abz) / ab2 : 0;
+          t = Math.min(Math.max(t, 0), 1);
+          const d = Math.hypot(fx - (c.ax + abx * t), fy - (c.ay + aby * t), fz - (c.az + abz * t));
+          need = Math.max(need, c.r + Viewer.SKIRT_MARGIN - d);
+        }
+        if (need > 1e-3) {
+          need = Math.min(need, Math.max(0, Viewer.SKIRT_MESH_MARGIN - legSignedDist(fx, fy, fz)));
+        }
+        if (need > 1e-3) {
+          nx = dx; ny = dy; nz = dz;
+        }
+      }
+      pa[o] = ox + nx;
+      pa[o + 1] = oy + ny;
+      pa[o + 2] = oz + nz;
+      this.skirtPrevDisp[s * 3] = nx;
+      this.skirtPrevDisp[s * 3 + 1] = ny;
+      this.skirtPrevDisp[s * 3 + 2] = nz;
+      touched.add(attr);
+    }
+
+    // 阶段四点五：贴腿外侧裙顶点的位移最终衰减。这些顶点（裙腰顶边
+    // 贴腿根 ~0.5，设计贴合非焊接）不该有位移，但三路来源都会喂它：
+    // 跨穿整面外推、松弛扩散（邻居深推）、时间平滑出慢（上帧深推的
+    // 残留 lerp）。全部位移确定后按带符号腿网格距离统一收口：
+    // dm≤margin 满位移，dm∈[margin, margin+0.5] 线性降到 0.2 保底
+    // （留两成跟随防与邻居断裂出尖角）。位置与 skirtPrevDisp 同步缩
+    // 放——衰减结果即下一帧平滑基线（wlk4 105-112 裙腰横缝实测）。
+    for (let s = 0; s < this.skirtVerts.length; s++) {
+      const sv = this.skirtVerts[s];
+      const attr = attrOf(sv.p);
+      const pa = attr.array as Float32Array;
+      const o = sv.i * 3;
+      // 判据用 LBS 基准位置的 dm：原本贴合的（外 0.5）衰减；原本穿腿
+      // 的（dm<margin）不衰减——用推出后位置会把刚推到位的顶点也砍掉
+      // （run9 475 深穿修复被衰减到 20% 实测）
+      const dm = legSignedDist(
+        this.skirtOrigSnap[s * 3], this.skirtOrigSnap[s * 3 + 1], this.skirtOrigSnap[s * 3 + 2]
+      );
+      if (dm <= Viewer.SKIRT_MESH_MARGIN || noDecay[s]) continue;
+      const w = Math.max(0.2, 1 - (dm - Viewer.SKIRT_MESH_MARGIN) / 0.5);
+      const dx0 = this.skirtOrigSnap[s * 3], dy0 = this.skirtOrigSnap[s * 3 + 1], dz0 = this.skirtOrigSnap[s * 3 + 2];
+      pa[o] = dx0 + (pa[o] - dx0) * w;
+      pa[o + 1] = dy0 + (pa[o + 1] - dy0) * w;
+      pa[o + 2] = dz0 + (pa[o + 2] - dz0) * w;
+      this.skirtPrevDisp[s * 3] *= w;
+      this.skirtPrevDisp[s * 3 + 1] *= w;
+      this.skirtPrevDisp[s * 3 + 2] *= w;
+      touched.add(attr);
+    }
+
+    // 阶段五：动态接触跟随（防贴合开缝）。裙腰顶边与腰带等躯干面是
+    // "位置贴合非焊接"（authored 距离 ≥1，动作中可动态贴到 ~0.5）——
+    // 去穿透把裙顶边推离腿的同时也推离贴合面，沿贴合线裂开 0.7~1.0
+    // （wlk4 105-112 裙腰横缝实测）。对有位移的裙顶点按 LBS 基准位置
+    // 找最近躯干三角形（skirtBodyTris：非链且非腿影响，含腰带/上衣），
+    // 原本贴合（d0<SKIRT_WELD_D）且被拉开（>SKIRT_WELD_SEP）时，把该
+    // 顶点最终位移按最近点重心权传给三角形三顶点（SKIRT_FOLLOW），
+    // 贴合面随裙侧移动。腿三角形不在池内——推离腿正是去穿透的目的。
+    if (this.skirtBodyTris.length) {
+      const bary = new Float64Array(4);
+      // 累积缓冲：同一躯干顶点可能收到多个裙点的跟随位移，最后统一施加
+      const acc = new Map<THREE.BufferAttribute, Map<number, [number, number, number]>>();
+      for (let s = 0; s < this.skirtVerts.length; s++) {
+        const Dx = this.skirtPrevDisp[s * 3];
+        const Dy = this.skirtPrevDisp[s * 3 + 1];
+        const Dz = this.skirtPrevDisp[s * 3 + 2];
+        if (Math.hypot(Dx, Dy, Dz) < 0.3) continue;
+        const ox = this.skirtOrigSnap[s * 3];
+        const oy = this.skirtOrigSnap[s * 3 + 1];
+        const oz = this.skirtOrigSnap[s * 3 + 2];
+        let bestD = Viewer.SKIRT_WELD_D;
+        let bt: { p: PartObj; a: number; b: number; c: number } | null = null;
+        let wa = 0, wb = 0, wc = 0;
+        for (const t of this.skirtBodyTris) {
+          const pa2 = attrOf(t.p).array as Float32Array;
+          const a3 = t.a * 3, b3 = t.b * 3, c3 = t.c * 3;
+          // 粗筛：三顶点都远于 4 不可能贴合（三角形外接半径 <3.4）
+          const da = (pa2[a3] - ox) ** 2 + (pa2[a3 + 1] - oy) ** 2 + (pa2[a3 + 2] - oz) ** 2;
+          const db = (pa2[b3] - ox) ** 2 + (pa2[b3 + 1] - oy) ** 2 + (pa2[b3 + 2] - oz) ** 2;
+          const dc = (pa2[c3] - ox) ** 2 + (pa2[c3 + 1] - oy) ** 2 + (pa2[c3 + 2] - oz) ** 2;
+          if (da > 16 && db > 16 && dc > 16) continue;
+          const d = Viewer.ptTriBary(bary, ox, oy, oz,
+            pa2[a3], pa2[a3 + 1], pa2[a3 + 2],
+            pa2[b3], pa2[b3 + 1], pa2[b3 + 2],
+            pa2[c3], pa2[c3 + 1], pa2[c3 + 2]);
+          if (d < bestD) {
+            bestD = d;
+            bt = t;
+            wa = bary[1]; wb = bary[2]; wc = bary[3];
+          }
+        }
+        if (!bt) continue;
+        // 位移后与同一三角形的距离（三角形未被推，位置即 LBS）
+        const pa2 = attrOf(bt.p).array as Float32Array;
+        const d1 = Viewer.ptTriBary(bary, ox + Dx, oy + Dy, oz + Dz,
+          pa2[bt.a * 3], pa2[bt.a * 3 + 1], pa2[bt.a * 3 + 2],
+          pa2[bt.b * 3], pa2[bt.b * 3 + 1], pa2[bt.b * 3 + 2],
+          pa2[bt.c * 3], pa2[bt.c * 3 + 1], pa2[bt.c * 3 + 2]);
+        if (d1 - bestD <= Viewer.SKIRT_WELD_SEP) continue;
+        const f = Viewer.SKIRT_FOLLOW;
+        const attr2 = attrOf(bt.p);
+        let m = acc.get(attr2);
+        if (!m) acc.set(attr2, (m = new Map()));
+        const vs: [number, number][] = [[bt.a, wa], [bt.b, wb], [bt.c, wc]];
+        for (const [vi, w] of vs) {
+          if (w <= 1e-3) continue;
+          let e = m.get(vi);
+          if (!e) m.set(vi, (e = [0, 0, 0]));
+          e[0] += Dx * f * w;
+          e[1] += Dy * f * w;
+          e[2] += Dz * f * w;
+        }
+      }
+      for (const [attr, m] of acc) {
+        const pa = attr.array as Float32Array;
+        for (const [vi, e] of m) {
+          pa[vi * 3] += e[0];
+          pa[vi * 3 + 1] += e[1];
+          pa[vi * 3 + 2] += e[2];
+        }
+        touched.add(attr);
+      }
+    }
+
     for (const a of touched) a.needsUpdate = true;
   }
 
@@ -2165,6 +2674,12 @@ export class Viewer {
     const poses = this.fskelPoses;
     const n = this.fskelBoneCount;
     const stride = n * 7;
+    // 越界钳制：数组外读取会产出 NaN 网格（探针脚本传大帧号实测）
+    const last = Math.max(Math.floor(poses.length / stride) - 1, 0);
+    const c0 = Math.min(Math.max(Math.round(i0), 0), last);
+    const c1 = Math.min(Math.max(Math.round(i1), 0), last);
+    i0 = c0;
+    i1 = c1;
     const base0 = i0 * stride;
     const base1 = i1 * stride;
     const lerp = alpha > 0 && i1 !== i0;
@@ -2202,7 +2717,7 @@ export class Viewer {
     if (this.jointMesh) this.jointMesh.instanceMatrix.needsUpdate = true;
     // 全部件按当前姿态重新蒙皮，随后逐顶点去穿透（改顶点位置，不改骨矩阵）
     for (const p of this.parts.values()) this.skinPart(p);
-    this.applySkirtDePenVerts();
+    this.applySkirtDePenVerts(i0 + alpha);
     // 诊断窗口：按新帧号去重（scrub 反复应用同帧不重复计），每 30 帧 flush
     if (i0 !== this.diag.i0) {
       this.diag.i0 = i0;
@@ -2551,3 +3066,5 @@ export class Viewer {
     this.renderer.domElement.remove();
   }
 }
+
+// vite-watch-bust 2026-10-22

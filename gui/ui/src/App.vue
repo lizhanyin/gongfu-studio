@@ -28,7 +28,7 @@
               <div class="viewport-overlay">
                 <template v-if="fak.fakModel">
                   <div>FAK 顶点动画 · {{ fak.currentActionInfo?.name ?? "" }}</div>
-                  <div>顶点: {{ fak.fakModel.vertexCount }} · 帧: {{ fak.fakModel.frames.length }}</div>
+                  <div>顶点: {{ fak.fakModel.vertexCount }} · 当前帧 {{ Math.floor(fak.absFrame) }}/{{ fak.fakModel.frames.length }}</div>
                 </template>
                 <template v-else-if="fsm.fsmModel">
                   <div>FSM 静态网格 · {{ shortName(fsm.fsmModel.path) }}</div>
@@ -38,6 +38,10 @@
                   </div>
                 </template>
                 <template v-else>
+                  <div v-if="act.actMeta">
+                    动作 {{ act.currentActionInfo?.name ?? "" }} · 当前帧
+                    {{ Math.floor(act.absFrame) }}/{{ act.totalFrames - 1 }}
+                  </div>
                   <div>部件: {{ skin.visibleCount }} / 组: {{ skin.modelSet?.groups.length ?? 0 }}</div>
                   <div>顶点: {{ skin.statVerts }} · 三角形: {{ skin.statTris }}</div>
                 </template>

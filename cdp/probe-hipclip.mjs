@@ -26,7 +26,7 @@ function getJson(path) {
 }
 
 const targets = await getJson("/json");
-const page = targets.find((t) => t.type === "page" && /tauri\.localhost/.test(t.url));
+const page = targets.find((t) => t.type === "page" && /tauri\.localhost|localhost:1420/.test(t.url));
 if (!page) { console.error("no page target"); process.exit(1); }
 const ws = new WebSocket(page.webSocketDebuggerUrl, { perMessageDeflate: false });
 let id = 0;
