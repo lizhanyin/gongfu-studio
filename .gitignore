@@ -1,7 +1,7 @@
 # Node / Vite（gui/ui）
 gui/ui/node_modules/
 gui/ui/dist/
-
+cdp/node_modules/
 # Rust / Cargo
 target/
 gui/target/

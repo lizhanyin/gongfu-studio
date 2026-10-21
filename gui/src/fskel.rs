@@ -27,6 +27,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::vfs;
+
 const MAGIC: [u8; 4] = [0x2e, 0xbd, 0x3b, 0xb3];
 /// EOF 尾注里的帧间隔，兜底用
 const DEFAULT_DT: f32 = 1.0 / 30.0;
@@ -433,7 +435,7 @@ pub fn get_or_load(path: &str) -> Result<Arc<FskelFile>, String> {
     if let Some(f) = cache().lock().unwrap().get(path) {
         return Ok(f.clone());
     }
-    let bytes = fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+    let bytes = vfs::read_file(path)?;
     let file = Arc::new(parse_fskel(path, &bytes)?);
     let mut c = cache().lock().unwrap();
     if c.len() >= 4 {
@@ -445,20 +447,15 @@ pub fn get_or_load(path: &str) -> Result<Arc<FskelFile>, String> {
     Ok(file)
 }
 
-/// 目录内全部 .fskel 的轻量扫描
+/// 目录（或 `cpk:` 包内目录）内全部 .fskel 的轻量扫描
 pub fn scan_dir(dir: &str) -> Result<Vec<FskelBrief>, String> {
-    let entries = fs::read_dir(dir).map_err(|e| format!("读取目录失败: {e}"))?;
+    let entries = vfs::walk_files(dir, &["fskel"]);
+    if entries.is_empty() && !vfs::exists(dir) {
+        return Err(format!("目录不存在: {dir}"));
+    }
     let mut out = Vec::new();
-    for e in entries.filter_map(|e| e.ok()) {
-        let p = e.path();
-        let is_fskel = p
-            .extension()
-            .map(|x| x.to_string_lossy().eq_ignore_ascii_case("fskel"))
-            .unwrap_or(false);
-        if !is_fskel {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&p) else { continue };
+    for e in entries {
+        let Ok(bytes) = vfs::read_file(&e.path) else { continue };
         let Ok((_v, _c, frame_count, hs)) = read_header(&bytes) else {
             continue;
         };
@@ -468,14 +465,15 @@ pub fn scan_dir(dir: &str) -> Result<Vec<FskelBrief>, String> {
             .map(|(_, n)| n.clone())
             .unwrap_or_default();
         out.push(FskelBrief {
-            path: p.to_string_lossy().into_owned(),
-            file_name: p
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            file_name: e
+                .name
+                .rsplit_once('.')
+                .map(|(s, _)| s.into())
+                .unwrap_or_else(|| e.name.clone()),
+            path: e.path,
             frame_count,
             bone_count,
-            byte_len: p.metadata().map(|m| m.len()).unwrap_or(0),
+            byte_len: e.byte_len,
             action_name,
         });
     }

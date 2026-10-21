@@ -194,3 +194,31 @@ export interface FakModel {
   materials: FakMaterial[];
   actions: FakAction[];
 }
+
+/** FSM 子网格/材质记录与 FAK 逐字节同构（见 gui/src/fsm.rs） */
+export type FsmSubmesh = FakSubmesh;
+export type FsmMaterial = FakMaterial;
+
+export interface FsmDummy {
+  /** 定长 4 字节名（GE2/GE1/F02/F01） */
+  name: string;
+  /** 前 3 个为位置，后 4 个疑似四元数 */
+  values: number[];
+  tail: number[];
+}
+
+export interface FsmModel {
+  path: string;
+  version: number;
+  unknown: number;
+  vertexCount: number;
+  /** 头部包围盒：min 在前 max 在后（子网格记录相反） */
+  bboxMin: number[];
+  bboxMax: number[];
+  reserved256: number[];
+  /** 扁平顶点数据：每顶点 8 个 f32 = [pos3][normal3][uv2] */
+  vertices: number[];
+  submeshes: FsmSubmesh[];
+  materials: FsmMaterial[];
+  dummies: FsmDummy[];
+}

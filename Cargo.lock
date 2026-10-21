@@ -7,6 +7,7 @@ name = "Gongfu-Studio"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "cpk",
  "serde",
  "serde_json",
  "tauri",

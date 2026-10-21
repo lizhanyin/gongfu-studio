@@ -1,8 +1,19 @@
 //! OBJ 导出：多个 fskin 合并为一个完整模型
 
 use crate::fskin::parse_fskin;
+use crate::vfs;
 use std::fs;
 use std::path::Path;
+
+/// 虚拟路径的父目录（去最后一段）
+fn parent_of(path: &str) -> Option<&str> {
+    path.rsplit_once(['\\', '/']).map(|(d, _)| d)
+}
+
+/// 文件名去扩展名
+fn stem_of(name: &str) -> &str {
+    name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name)
+}
 
 /// 导出为一组 obj + mtl，纹理复制到输出目录
 pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<String, String> {
@@ -22,7 +33,7 @@ pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<St
     let mut tex_seq = 0usize;
 
     for p in paths {
-        let bytes = fs::read(p).map_err(|e| format!("读取 {p}: {e}"))?;
+        let bytes = vfs::read_file(p).map_err(|e| format!("读取 {p}: {e}"))?;
         let m = parse_fskin(p, &bytes)?;
         let name = Path::new(p)
             .file_stem()
@@ -52,14 +63,21 @@ pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<St
             .map(|b| b.to_string())
         {
             let stem = src.rsplit_once('.').map(|(s, _)| s).unwrap_or(&src);
-            // 在部件同目录树中查找同名 dds/tga
-            if let Some(found) = find_texture(Path::new(p).parent().and_then(|x| x.parent()), stem) {
+            // 在部件同目录树（模型根目录）中查找同名 dds/tga
+            let model_root = parent_of(p).and_then(parent_of);
+            if let Some(found) = find_texture(model_root, stem) {
                 tex_seq += 1;
-                let ext = found.extension().and_then(|e| e.to_str()).unwrap_or("dds");
+                let ext = found
+                    .rsplit('.')
+                    .next()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "dds".into());
                 let tex_name = format!("tex_{tex_seq:02}_{stem}.{ext}");
                 let dst = dir.join(&tex_name);
-                if fs::copy(&found, &dst).is_ok() {
-                    mtl.push_str(&format!("map_Kd {tex_name}\n"));
+                if let Ok(data) = vfs::read_file(&found) {
+                    if fs::write(&dst, &data).is_ok() {
+                        mtl.push_str(&format!("map_Kd {tex_name}\n"));
+                    }
                 }
             }
         }
@@ -148,29 +166,11 @@ pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<St
     Ok(obj_path.to_string_lossy().into_owned())
 }
 
-/// 从部件根目录（AvatarGirl）向下查找与纹理 stem 同名的图片文件
-fn find_texture(root: Option<&Path>, stem: &str) -> Option<std::path::PathBuf> {
+/// 从模型根目录（AvatarGirl 等，含 `cpk:` 寻址）向下查找与纹理 stem 同名的图片文件
+fn find_texture(root: Option<&str>, stem: &str) -> Option<String> {
     let root = root?;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if let Some(s) = p.file_stem().and_then(|x| x.to_str()) {
-                if s.eq_ignore_ascii_case(stem) {
-                    if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
-                        if matches!(
-                            ext.to_ascii_lowercase().as_str(),
-                            "dds" | "tga" | "png" | "jpg" | "bmp"
-                        ) {
-                            return Some(p);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    vfs::walk_files(root, &["dds", "tga", "png", "jpg", "bmp"])
+        .into_iter()
+        .find(|e| stem_of(&e.name).eq_ignore_ascii_case(stem))
+        .map(|e| e.path)
 }

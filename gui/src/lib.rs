@@ -1,12 +1,23 @@
 mod dds;
 mod fak;
+mod fsm;
 mod fskin;
 mod fskel;
 mod obj;
 mod res;
+mod vfs;
 
 use base64::Engine;
 use serde::Serialize;
+
+/// CPK 包内路径暂不支持写回（读浏览/预览已支持）
+fn reject_cpk_write(path: &str) -> Result<(), String> {
+    if vfs::is_cpk_path(path) {
+        Err("暂不支持保存到 CPK 包内，请解包为目录后编辑".into())
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,19 +34,20 @@ fn scan_model_set(dir: String) -> Result<fskin::ModelSet, String> {
 
 #[tauri::command]
 fn load_fskin(path: String) -> Result<fskin::FskinModel, String> {
-    let bytes = std::fs::read(&path).map_err(|e| format!("读取失败: {e}"))?;
+    let bytes = vfs::read_file(&path)?;
     fskin::parse_fskin(&path, &bytes)
 }
 
 #[tauri::command]
 fn save_fskin(path: String, model: fskin::FskinModel) -> Result<(), String> {
+    reject_cpk_write(&path)?;
     let bytes = fskin::serialize_fskin(&model)?;
     std::fs::write(&path, bytes).map_err(|e| format!("写入失败: {e}"))
 }
 
 #[tauri::command]
 fn load_texture(path: String) -> Result<TexImageDto, String> {
-    let bytes = std::fs::read(&path).map_err(|e| format!("读取失败: {e}"))?;
+    let bytes = vfs::read_file(&path)?;
     let t = dds::decode_dds(&bytes)?;
     Ok(TexImageDto {
         width: t.width,
@@ -104,14 +116,30 @@ fn export_fskel_glb(path: String, out_path: String) -> Result<String, String> {
 /// .fak 顶点动画模型（含全部帧顶点数据）
 #[tauri::command]
 fn load_fak(path: String) -> Result<fak::FakModel, String> {
-    let bytes = std::fs::read(&path).map_err(|e| format!("读取失败: {e}"))?;
+    let bytes = vfs::read_file(&path)?;
     fak::parse_fak(&path, &bytes)
 }
 
 /// 保存 .fak（未修改的模型字节级还原，见 fak roundtrip 测试）
 #[tauri::command]
 fn save_fak(path: String, model: fak::FakModel) -> Result<(), String> {
+    reject_cpk_write(&path)?;
     let bytes = fak::serialize_fak(&model)?;
+    std::fs::write(&path, bytes).map_err(|e| format!("写入失败: {e}"))
+}
+
+/// .fsm 静态武器网格（含顶点 / 材质 / 挂点）
+#[tauri::command]
+fn load_fsm(path: String) -> Result<fsm::FsmModel, String> {
+    let bytes = vfs::read_file(&path)?;
+    fsm::parse_fsm(&path, &bytes)
+}
+
+/// 保存 .fsm（未修改的模型字节级还原，见 fsm roundtrip 测试）
+#[tauri::command]
+fn save_fsm(path: String, model: fsm::FsmModel) -> Result<(), String> {
+    reject_cpk_write(&path)?;
+    let bytes = fsm::serialize_fsm(&model)?;
     std::fs::write(&path, bytes).map_err(|e| format!("写入失败: {e}"))
 }
 
@@ -140,6 +168,8 @@ pub fn run() {
             export_fskel_glb,
             load_fak,
             save_fak,
+            load_fsm,
+            save_fsm,
             list_res_dir
         ])
         .run(tauri::generate_context!())

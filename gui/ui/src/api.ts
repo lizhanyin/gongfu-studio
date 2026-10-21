@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   FakModel,
+  FsmModel,
   FskinModel,
   FskelMeta,
   ModelSet,
@@ -34,4 +35,8 @@ export const api = {
   loadFak: (path: string) => invoke<FakModel>("load_fak", { path }),
   saveFak: (path: string, model: FakModel) =>
     invoke<void>("save_fak", { path, model }),
+  // FSM 静态武器网格（含顶点 / 材质 / 挂点）
+  loadFsm: (path: string) => invoke<FsmModel>("load_fsm", { path }),
+  saveFsm: (path: string, model: FsmModel) =>
+    invoke<void>("save_fsm", { path, model }),
 };

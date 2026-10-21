@@ -11,6 +11,7 @@
           @keyup.enter="res.changeRoot(res.rootDir)"
         />
         <n-button size="small" @click="res.pickRoot">浏览</n-button>
+        <n-button size="small" @click="res.pickCpk">打开 CPK</n-button>
         <n-button size="small" :loading="res.treeLoading" @click="res.refreshRoot">刷新</n-button>
         <n-divider vertical />
         <SkinToolbar v-if="skin.hasParts" :skin="skin" />
@@ -31,6 +32,13 @@
                 <template v-if="fak.fakModel">
                   <div>FAK 顶点动画 · {{ fak.currentActionInfo?.name ?? "" }}</div>
                   <div>顶点: {{ fak.fakModel.vertexCount }} · 帧: {{ fak.fakModel.frames.length }}</div>
+                </template>
+                <template v-else-if="fsm.fsmModel">
+                  <div>FSM 静态网格 · {{ shortName(fsm.fsmModel.path) }}</div>
+                  <div>
+                    顶点: {{ fsm.fsmModel.vertexCount }} · 三角形:
+                    {{ fsm.fsmModel.submeshes.reduce((s, x) => s + x.triangles.length / 3, 0) }}
+                  </div>
                 </template>
                 <template v-else>
                   <div>部件: {{ skin.visibleCount }} / 组: {{ skin.modelSet?.groups.length ?? 0 }}</div>
@@ -69,7 +77,7 @@
                 <n-collapse
                   class="inspector-collapse"
                   display-directive="show"
-                  :default-expanded-names="['variants', 'tex', 'act', 'fak', 'part']"
+                  :default-expanded-names="['variants', 'tex', 'act', 'fak', 'fsm', 'part']"
                 >
                   <n-collapse-item
                     v-if="skin.modelSet?.groups.length"
@@ -91,12 +99,15 @@
                   <n-collapse-item v-if="fak.fakModel" title="FAK 信息" name="fak">
                     <FakFileInfo :fak="fak" />
                   </n-collapse-item>
+                  <n-collapse-item v-if="fsm.fsmModel" title="FSM 信息" name="fsm">
+                    <FsmFileInfo :fsm="fsm" />
+                  </n-collapse-item>
                   <n-collapse-item v-if="skin.selectedPart" title="部件检查" name="part">
                     <PartInspector :skin="skin" />
                   </n-collapse-item>
                 </n-collapse>
                 <div
-                  v-if="!skin.hasParts && !act.actMeta && !fak.fakModel"
+                  v-if="!skin.hasParts && !act.actMeta && !fak.fakModel && !fsm.fsmModel"
                   class="inspector-empty"
                 >
                   从资源网格选择文件预览
@@ -122,6 +133,7 @@
         <span v-if="skin.modelSet">模型: {{ skin.modelSet.rootDir }}</span>
         <span v-if="act.actMeta">动作: {{ act.actMeta.fileName }}</span>
         <span v-if="fak.fakModel">FAK: {{ shortName(fak.fakModel.path) }}</span>
+        <span v-if="fsm.fsmModel">FSM: {{ shortName(fsm.fsmModel.path) }}</span>
         <span>可见部件: {{ skin.visiblePaths.map(shortName).join(" + ") || "无" }}</span>
       </footer>
     </div>
@@ -135,6 +147,7 @@ import { useViewer } from "./composables/useViewer";
 import { useSkinMode } from "./composables/useSkinMode";
 import { useActMode } from "./composables/useActMode";
 import { useFakMode } from "./composables/useFakMode";
+import { useFsmMode } from "./composables/useFsmMode";
 import { useResourceTree } from "./composables/useResourceTree";
 import { texDataFromDto } from "./viewer";
 import { api } from "./api";
@@ -150,6 +163,7 @@ import TexSlotPanel from "./components/TexSlotPanel.vue";
 import PlayBar from "./components/PlayBar.vue";
 import ActFileInfo from "./components/ActFileInfo.vue";
 import FakFileInfo from "./components/FakFileInfo.vue";
+import FsmFileInfo from "./components/FsmFileInfo.vue";
 import PartInspector from "./components/PartInspector.vue";
 
 const themeOverrides: GlobalThemeOverrides = {
@@ -165,6 +179,7 @@ const viewer = useViewer(viewportRef);
 const skin = useSkinMode(viewer);
 const act = useActMode(viewer);
 const fak = useFakMode(viewer);
+const fsm = useFsmMode(viewer);
 const res = useResourceTree();
 
 // ---------------- 预览路由 ----------------
@@ -196,16 +211,22 @@ async function previewEntry(e: ResEntry) {
     case "fskin":
       texPreview.value = null;
       fak.closeFak();
+      fsm.closeFsm();
       await skin.soloPreview(e.path);
       break;
     case "fskel":
       texPreview.value = null;
       fak.closeFak();
+      fsm.closeFsm();
       act.openActFile(e.path);
       break;
     case "fak":
       texPreview.value = null;
       await openFakPreview(e.path);
+      break;
+    case "fsm":
+      texPreview.value = null;
+      await openFsmPreview(e.path);
       break;
     case "dds":
     case "tga":
@@ -219,14 +240,22 @@ async function previewEntry(e: ResEntry) {
   }
 }
 
-/** FAK 与皮肤/骨架模式互斥 */
+/** FAK / FSM 与皮肤/骨架模式互斥 */
 async function openFakPreview(path: string) {
   skin.clearScene();
   act.closeAct();
+  fsm.closeFsm();
   await fak.openFakFile(path);
 }
 
-/** 整体模型预览：含 .fak 的目录（怪物）走顶点动画，其余走 fskin 装配 */
+async function openFsmPreview(path: string) {
+  skin.clearScene();
+  act.closeAct();
+  fak.closeFak();
+  await fsm.openFsmFile(path);
+}
+
+/** 整体模型预览：含 .fak（怪物）或 .fsm（武器）的目录走对应网格，其余走 fskin 装配 */
 async function previewModelDir(dir: string) {
   texPreview.value = null;
   try {
@@ -236,10 +265,16 @@ async function previewModelDir(dir: string) {
       await openFakPreview(fakFile.path);
       return;
     }
+    const fsmFile = entries.find((e) => e.kind === "fsm");
+    if (fsmFile) {
+      await openFsmPreview(fsmFile.path);
+      return;
+    }
   } catch {
     // 目录列举失败时退回皮肤扫描（会自行报错）
   }
   fak.closeFak();
+  fsm.closeFsm();
   skin.scan(dir);
 }
 
@@ -247,6 +282,7 @@ async function previewModelDir(dir: string) {
 async function overlayAdd(e: ResEntry) {
   texPreview.value = null;
   fak.closeFak();
+  fsm.closeFsm();
   await skin.addToViewer(e.path);
   if (skin.selectedPart !== e.path) skin.selectPart(e.path);
 }

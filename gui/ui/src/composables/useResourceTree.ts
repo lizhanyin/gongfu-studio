@@ -42,16 +42,20 @@ export function useResourceTree() {
   async function init() {
     treeLoading.value = true;
     try {
+      const r = rootDir.value;
+      const label = r.startsWith("cpk:")
+        ? `📦 ${shortName(r) || r.slice(4)}（CPK）`
+        : shortName(r) || r;
       treeData.value = [
         {
-          key: rootDir.value,
-          label: shortName(rootDir.value) || rootDir.value,
+          key: r,
+          label,
           isDir: true,
           isModel: false,
           isLeaf: false,
         },
       ];
-      await selectDir(rootDir.value);
+      await selectDir(r);
     } catch (e) {
       message.error(`资源根目录加载失败: ${e}`);
     } finally {
@@ -69,6 +73,16 @@ export function useResourceTree() {
   async function pickRoot() {
     const d = await open({ directory: true, defaultPath: rootDir.value });
     if (d) await changeRoot(d);
+  }
+
+  /** 选择 system.cpk 等资源包：以 `cpk:<包路径>` 为根浏览包内目录 */
+  async function pickCpk() {
+    const d = await open({
+      multiple: false,
+      filters: [{ name: "CPK 资源包", extensions: ["cpk"] }],
+      defaultPath: rootDir.value.replace(/^cpk:/, ""),
+    });
+    if (d) await changeRoot(`cpk:${d}`);
   }
 
   /** 选中目录：网格切换为该目录内容 */
@@ -100,6 +114,7 @@ export function useResourceTree() {
     init,
     changeRoot,
     pickRoot,
+    pickCpk,
     refreshRoot: init,
     selectDir,
     loadChildren,
