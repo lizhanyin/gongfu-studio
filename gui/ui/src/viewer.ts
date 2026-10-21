@@ -161,6 +161,7 @@ export class Viewer {
    * 游戏一致的精确 LBS（链骨矩阵直接来自 FSKEL 姿态，条带随舞蹈等动作
    * 里的烘焙链动画摆动）；开启后 detectCloth/updateClothMats 的次级运动
    * 模拟接管链骨渲染（"比游戏更好"的增强，走路时裙摆滞后摆动）。
+   * 无论开关，applySkirtDePen 的去穿透 pass 恒开兜底裙片-腿穿模。
    */
   private clothSimEnabled = false;
   /** 载体数据绑定拟合的逆（骨盆绑定系 ↔ 世界） */
@@ -175,16 +176,31 @@ export class Viewer {
     pos: THREE.Vector3;
     prev: THREE.Vector3;
   }[] = [];
-  /** 腿部碰撞球（骨盆绑定系半径 + 骨索引，中心取骨骼局部 X 轴中点） */
-  private clothColliders: { bone: number; len: number }[] = [];
   /** 上次 applyFskelFrame 的绝对帧（i0+alpha），检测 seek */
   private clothLastAbs = NaN;
+
+  // ---- 裙摆防穿模（恒开，与布料模拟开关无关）----
+  /** 裙片几何顶点（受 Bone* 链影响的，含接缝克隆）：part + inflOf 下标 */
+  private skirtVerts: { p: PartObj; i: number }[] = [];
+  /** 裙片顶点涉及的布料骨（去穿透的写入目标） */
+  private skirtBones = new Set<number>();
+  /** 腿部碰撞胶囊：骨索引 + 绑定段长（骨原点→子骨方向，蒙皮随动） */
+  private legCaps: { bone: number; len: number }[] = [];
+  /** 去穿透目标间隙（胶囊半径之上的余量） */
+  private static readonly SKIRT_MARGIN = 0.25;
+  /** 单帧单骨最大推出量（防 seek 跳变） */
+  private static readonly SKIRT_MAX_PUSH = 6;
+  /** 去穿透迭代轮数（逐骨推出后邻片重新求值） */
+  private static readonly SKIRT_ITERS = 3;
   private tmpScale = new THREE.Vector3(1, 1, 1);
-  // 模拟参数：弹簧 K（s⁻²）、速度阻尼、重力（u/s²，模型身高 ~160）
+  // 模拟参数：弹簧 K（s⁻²）、速度阻尼（上扬加重/下落轻放，借鉴 AniCloth_SW
+  // 各向异性空气阻尼：y↑3.2 vs y↓0.4）、重力（u/s²，模型身高 ~160）
   private static readonly CLOTH_K = 260;
   private static readonly CLOTH_DAMP = 0.9;
+  private static readonly CLOTH_DAMP_UP = 0.78;
+  private static readonly CLOTH_DAMP_DOWN = 0.92;
   private static readonly CLOTH_G = 300;
-  /** 腿部碰撞球半径系数（×段长）：真实腿半径远小于半段长，肥球会把静止裙摆直接顶飞 */
+  /** 腿部胶囊半径系数（×段长）：实测大腿网格面 ≈0.145×段长，取 0.18 含余量 */
   private static readonly CLOTH_LEG_R = 0.18;
   // 每帧复用的临时对象
   private cCarry = new THREE.Matrix4();
@@ -192,7 +208,6 @@ export class Viewer {
   private cTarget = new THREE.Vector3();
   private cVel = new THREE.Vector3();
   private cDir1 = new THREE.Vector3();
-  private cCenter = new THREE.Vector3();
   private cT1 = new THREE.Matrix4();
 
   // ---- FAK 顶点动画 ----
@@ -434,6 +449,7 @@ export class Viewer {
     // 动作模式已绑骨架时立即按当前姿态蒙皮；静态模式对齐离群部件
     if (this.skelBones.length) {
       this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
+      this.setupSkirtRig(); // 裙摆防穿模点集随部件变化
       this.detectCloth(); // 布料检测的点集随部件变化
       this.skinPart(part);
     } else {
@@ -452,6 +468,7 @@ export class Viewer {
     this.parts.delete(path);
     if (this.skelBones.length) {
       this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
+      this.setupSkirtRig(); // 裙摆防穿模点集随部件变化
       this.detectCloth(); // 布料检测的点集随部件变化
     } else {
       // 静态模式共识可能变化（如锚定部件被移除），重新对齐
@@ -616,6 +633,7 @@ export class Viewer {
     this.skelParents = meta.parents;
     for (const p of this.parts.values()) p.skinned = true;
     this.detectMirrorBones(); // 镜像骨检测需部件顶点（无部件时跳过，addPart 会重跑）
+    this.setupSkirtRig(); // 裙摆防穿模点集（腿胶囊 + 裙片顶点）
     this.detectCloth();
 
     this.applyFskelFrame(0, 0, 0);
@@ -646,12 +664,12 @@ export class Viewer {
     if (this.clothSimEnabled === on) return;
     this.clothSimEnabled = on;
     if (on) {
+      this.setupSkirtRig(); // 腿胶囊等共享数据（addPart/fskel 加载时已建则幂等）
       this.detectCloth();
     } else {
       this.clothBones.clear();
       this.clothMats.clear();
       this.clothSims = [];
-      this.clothColliders = [];
       this.clothCarrier = -1;
       this.clothTpInv = null;
       this.clothLastAbs = NaN;
@@ -659,12 +677,153 @@ export class Viewer {
     for (const p of this.parts.values()) this.skinPart(p);
   }
 
+  /**
+   * 裙摆防穿模数据（恒开）：裙片顶点清单 + 腿部碰撞胶囊。
+   * 与布料模拟开关无关，applyFskelFrame 每帧用一个纯位置的去穿透 pass
+   * （applySkirtDePen）保证裙片不进腿。部件增删后重跑。
+   */
+  private setupSkirtRig() {
+    this.skirtVerts = [];
+    this.skirtBones.clear();
+    this.legCaps = [];
+    const n = this.fskelBoneCount;
+    if (!this.fskelPoses || !this.skelParents.length || !n) return;
+    const isBoneHelper = (b: number) => /^Bone\d+$/.test(this.skelBones[b]?.name ?? "");
+    for (let b = 0; b < n; b++) {
+      const name = this.skelBones[b]?.name ?? "";
+      if (!/Thigh|Calf|Foot/.test(name)) continue;
+      // 段长 = 子骨局部平移长度（骨骼沿 +X）
+      let len = 12;
+      for (let c = 0; c < n; c++) {
+        if (this.skelParents[c] === b) {
+          const o = c * 7;
+          len = Math.hypot(this.fskelPoses[o], this.fskelPoses[o + 1], this.fskelPoses[o + 2]);
+          break;
+        }
+      }
+      this.legCaps.push({ bone: b, len });
+    }
+    // 与 skinPart 同源遍历（inflOf 含接缝克隆），收集受 Bone* 链影响的顶点
+    for (const p of this.parts.values()) {
+      const vcount = p.model.vertices.length;
+      for (let i = 0; i < p.inflOf.length; i++) {
+        const infl = p.inflOf[i];
+        let hit = false;
+        for (const inf of infl) {
+          if (inf.boneIndex < n && isBoneHelper(inf.boneIndex)) {
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) continue;
+        this.skirtVerts.push({ p, i });
+        for (const inf of infl) {
+          if (inf.boneIndex < n && isBoneHelper(inf.boneIndex)) this.skirtBones.add(inf.boneIndex);
+        }
+      }
+    }
+  }
+
+  /**
+   * 裙摆去穿透（纯位置修正，无速度状态 → seek/倒放确定性）：
+   * 对每块裙片骨的顶点簇求与腿部胶囊的最深穿透，整片平移推出（≤SKIRT_MAX_PUSH，
+   * 迭代 SKIRT_ITERS 轮）。默认模式下烘焙数据与腿保持 1.5~2.8 间隙（离线对
+   * girl.FSKEL 全部走/跑动作逐帧验证），基本不触发、保持游戏忠实；模拟模式下
+   * 兜底弹簧滞后把裙片推进抬起的腿（右大腿最高点穿模的来源）。
+   */
+  private applySkirtDePen() {
+    if (!this.skirtVerts.length || !this.legCaps.length || !this.worldMats.length) return;
+    const caps: { ax: number; ay: number; az: number; bx: number; by: number; bz: number; r: number }[] = [];
+    for (const c of this.legCaps) {
+      const m = this.worldMats[c.bone];
+      if (!m) continue;
+      const e = m.elements;
+      caps.push({
+        ax: e[12], ay: e[13], az: e[14],
+        bx: e[12] + e[0] * c.len, by: e[13] + e[1] * c.len, bz: e[14] + e[2] * c.len,
+        r: c.len * Viewer.CLOTH_LEG_R,
+      });
+    }
+    if (!caps.length) return;
+    const useCloth = this.clothMats.size > 0;
+    const boneList = [...this.skirtBones];
+    for (let iter = 0; iter < Viewer.SKIRT_ITERS; iter++) {
+      let any = false;
+      for (const b of boneList) {
+        let best = 0;
+        let dx = 0, dy = 0, dz = 0;
+        for (const sv of this.skirtVerts) {
+          const infl = sv.p.inflOf[sv.i];
+          let uses = false;
+          for (const inf of infl) {
+            if (inf.boneIndex === b && inf.weight > 0.001) {
+              uses = true;
+              break;
+            }
+          }
+          if (!uses) continue;
+          // 顶点当前世界位置（与 skinPart 相同的混合分支）
+          const vcount = sv.p.model.vertices.length;
+          const si = sv.i < vcount ? sv.i : sv.p.clones[sv.i - vcount].src;
+          const sp = sv.p.model.vertices[si].pos;
+          let px = 0, py = 0, pz = 0;
+          for (const inf of infl) {
+            const bi = inf.boneIndex;
+            if (bi >= this.worldMats.length) continue;
+            const w = inf.weight; // 引擎用原始权重，不归一化
+            if (useCloth && this.clothMats.has(bi)) {
+              const C = this.clothMats.get(bi)!.elements;
+              px += w * (C[0] * sp[0] + C[4] * sp[1] + C[8] * sp[2] + C[12]);
+              py += w * (C[1] * sp[0] + C[5] * sp[1] + C[9] * sp[2] + C[13]);
+              pz += w * (C[2] * sp[0] + C[6] * sp[1] + C[10] * sp[2] + C[14]);
+            } else {
+              const M = this.worldMats[bi].elements;
+              const lp = inf.boneLocalPos;
+              px += w * (M[0] * lp[0] + M[4] * lp[1] + M[8] * lp[2] + M[12]);
+              py += w * (M[1] * lp[0] + M[5] * lp[1] + M[9] * lp[2] + M[13]);
+              pz += w * (M[2] * lp[0] + M[6] * lp[1] + M[10] * lp[2] + M[14]);
+            }
+          }
+          for (const c of caps) {
+            const abx = c.bx - c.ax, aby = c.by - c.ay, abz = c.bz - c.az;
+            const apx = px - c.ax, apy = py - c.ay, apz = pz - c.az;
+            const ab2 = abx * abx + aby * aby + abz * abz;
+            let t = ab2 > 1e-9 ? (apx * abx + apy * aby + apz * abz) / ab2 : 0;
+            t = Math.min(Math.max(t, 0), 1);
+            const qx = c.ax + abx * t, qy = c.ay + aby * t, qz = c.az + abz * t;
+            const vx = px - qx, vy = py - qy, vz = pz - qz;
+            const d = Math.hypot(vx, vy, vz);
+            const need = c.r + Viewer.SKIRT_MARGIN - d;
+            if (need > best) {
+              best = need;
+              if (d > 1e-6) {
+                dx = (vx / d) * need;
+                dy = (vy / d) * need;
+                dz = (vz / d) * need;
+              } else {
+                dx = 0; dy = need; dz = 0; // 退化：朝上推出
+              }
+            }
+          }
+        }
+        if (best > 1e-3) {
+          any = true;
+          const m = useCloth && this.clothMats.has(b) ? this.clothMats.get(b)! : this.worldMats[b];
+          const k = Math.min(1, Viewer.SKIRT_MAX_PUSH / best);
+          m.elements[12] += dx * k;
+          m.elements[13] += dy * k;
+          m.elements[14] += dz * k;
+        }
+      }
+      if (!any) break;
+    }
+  }
+
   private detectCloth() {
     if (!this.clothSimEnabled) return; // 游戏忠实模式：链骨走精确 LBS
     this.clothBones.clear();
     this.clothMats.clear();
     this.clothSims = [];
-    this.clothColliders = [];
     this.clothCarrier = -1;
     this.clothTpInv = null;
     this.clothLastAbs = NaN;
@@ -711,22 +870,7 @@ export class Viewer {
       return;
     }
     this.clothTpInv = this.fitBindMatrix(pairsOf[this.clothCarrier]).invert();
-
-    // 腿部碰撞球：Thigh/Calf/Foot 骨局部 X 轴（骨骼方向）中点，半径按段长
-    for (let b = 0; b < n; b++) {
-      const name = this.skelBones[b].name;
-      if (!/Thigh|Calf|Foot/.test(name)) continue;
-      // 段长 = 子骨局部平移长度（骨骼沿 +X）
-      let len = 12;
-      for (let c = 0; c < n; c++) {
-        if (this.skelParents[c] === b) {
-          const o = c * 7;
-          len = Math.hypot(this.fskelPoses[o], this.fskelPoses[o + 1], this.fskelPoses[o + 2]);
-          break;
-        }
-      }
-      this.clothColliders.push({ bone: b, len });
-    }
+    // 腿部碰撞胶囊由 setupSkirtRig 恒开维护（this.legCaps）
 
     // 每骨模拟状态：锚点 = 顶点簇上端 40% 质心，弹簧目标 = 全簇质心
     // （骨盆绑定系；世界→绑定系用 Tp⁻¹）
@@ -883,8 +1027,13 @@ export class Viewer {
         s.pos.copy(this.cTarget);
         s.prev.copy(this.cTarget);
       } else if (dt > 0) {
-        // verlet：速度阻尼 + 微重力 + 弹簧拉向携带目标（速度限幅防炸）
-        this.cVel.subVectors(s.pos, s.prev).multiplyScalar(Viewer.CLOTH_DAMP);
+        // verlet：速度阻尼（y 上扬加重抑制裙摆翻上腰，下落轻放保垂感——
+        // 借鉴 AniCloth_SW 各向异性空气阻尼 y↑3.2/y↓0.4）+ 微重力 +
+        // 弹簧拉向携带目标（速度限幅防炸）
+        this.cVel.subVectors(s.pos, s.prev);
+        this.cVel.x *= Viewer.CLOTH_DAMP;
+        this.cVel.z *= Viewer.CLOTH_DAMP;
+        this.cVel.y *= this.cVel.y > 0 ? Viewer.CLOTH_DAMP_UP : Viewer.CLOTH_DAMP_DOWN;
         const vmax = 6 * dt * 30; // ≤6 单位/帧
         if (this.cVel.length() > vmax) this.cVel.setLength(vmax);
         s.prev.copy(s.pos);
@@ -892,17 +1041,25 @@ export class Viewer {
         s.pos.y -= Viewer.CLOTH_G * dt * dt;
         s.pos.lerp(this.cTarget, Math.min(1, Viewer.CLOTH_K * dt * dt));
       }
-      // 腿部碰撞球推出（两轮；半径=真实腿粗，避免静止裙摆被顶飞）
+      // 腿部胶囊推出（两轮；胶囊沿骨段全长，膝/踝关节处无球间空洞）
       for (let iter = 0; iter < 2; iter++) {
-        for (const c of this.clothColliders) {
+        for (const c of this.legCaps) {
           const m = this.worldMats[c.bone];
           if (!m) continue;
-          this.cCenter.set(c.len * 0.45, 0, 0).applyMatrix4(m);
-          this.cDir1.subVectors(s.pos, this.cCenter);
+          const e = m.elements;
+          const abx = e[0] * c.len, aby = e[1] * c.len, abz = e[2] * c.len;
+          const ab2 = abx * abx + aby * aby + abz * abz;
+          if (ab2 < 1e-9) continue;
+          let t =
+            ((s.pos.x - e[12]) * abx + (s.pos.y - e[13]) * aby + (s.pos.z - e[14]) * abz) / ab2;
+          t = Math.min(Math.max(t, 0), 1);
+          const qx = e[12] + abx * t, qy = e[13] + aby * t, qz = e[14] + abz * t;
+          const dx = s.pos.x - qx, dy = s.pos.y - qy, dz = s.pos.z - qz;
+          const d2 = dx * dx + dy * dy + dz * dz;
           const r = c.len * Viewer.CLOTH_LEG_R;
-          const d2 = this.cDir1.lengthSq();
           if (d2 < r * r && d2 > 1e-8) {
-            s.pos.copy(this.cCenter).addScaledVector(this.cDir1.normalize(), r);
+            const d = Math.sqrt(d2);
+            s.pos.set(qx + (dx / d) * r, qy + (dy / d) * r, qz + (dz / d) * r);
           }
         }
       }
@@ -1263,6 +1420,7 @@ export class Viewer {
       this.worldMats[b].copy(this.skelBones[b].matrixWorld);
     }
     this.updateClothMats(i0 + alpha);
+    this.applySkirtDePen(); // 裙摆去穿透（恒开，纯位置修正；见 applySkirtDePen 注释）
     // 关节小球跟随世界坐标
     const m = new THREE.Matrix4();
     for (let b = 0; b < n; b++) {
@@ -1300,10 +1458,12 @@ export class Viewer {
     this.clothBones.clear();
     this.clothMats.clear();
     this.clothSims = [];
-    this.clothColliders = [];
     this.clothCarrier = -1;
     this.clothTpInv = null;
     this.clothLastAbs = NaN;
+    this.skirtVerts = [];
+    this.skirtBones.clear();
+    this.legCaps = [];
     this.applyStaticSkin(); // 默认状态对齐离群部件（hair05）
   }
 
