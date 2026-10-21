@@ -3,19 +3,16 @@
     <div class="app">
       <header class="app-header">
         <span class="title">Gongfu Studio</span>
+        <MenuBar :skin="skin" :act="act" :res="res" />
+        <div class="header-spacer"></div>
         <n-input
           v-model:value="res.rootDir"
           size="small"
           class="root-input"
-          placeholder="资源根目录 (res)"
+          placeholder="资源根目录 (res / cpk:…)"
+          title="回车切换；或用 文件 菜单打开"
           @keyup.enter="res.changeRoot(res.rootDir)"
         />
-        <n-button size="small" @click="res.pickRoot">浏览</n-button>
-        <n-button size="small" @click="res.pickCpk">打开 CPK</n-button>
-        <n-button size="small" :loading="res.treeLoading" @click="res.refreshRoot">刷新</n-button>
-        <n-divider vertical />
-        <SkinToolbar v-if="skin.hasParts" :skin="skin" />
-        <ActToolbar v-if="act.actMeta" :act="act" />
       </header>
 
       <div class="app-main">
@@ -154,8 +151,7 @@ import { api } from "./api";
 import { message } from "./message";
 import { shortName } from "./utils";
 import type { ResEntry } from "./types";
-import SkinToolbar from "./components/SkinToolbar.vue";
-import ActToolbar from "./components/ActToolbar.vue";
+import MenuBar from "./components/MenuBar.vue";
 import ResourceTree from "./components/ResourceTree.vue";
 import ResourceGrid from "./components/ResourceGrid.vue";
 import PartGroupList from "./components/PartGroupList.vue";

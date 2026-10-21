@@ -33,7 +33,7 @@ if app_running; then
 fi
 
 echo "[2/4] 清理: 删除旧产物..."
-rm -f "target/release/$EXE_NAME"
+rm -f "target/debug/$EXE_NAME"
 rm -rf gui/ui/dist
 
 if [ "$1" = "--full" ]; then
@@ -50,9 +50,9 @@ echo "[3/4] 构建前端 (gui/ui)..."
 npm --prefix gui/ui run build
 
 echo "[3/4] 构建 Rust..."
-cargo build --release
+cargo build
 
 echo "[4/4] 启动 Gongfu Studio..."
-./target/release/"$EXE_NAME" &
+./target/debug/"$EXE_NAME" &
 disown 2>/dev/null || true
 echo "完成。"

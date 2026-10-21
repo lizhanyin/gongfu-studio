@@ -28,7 +28,7 @@ exit /b 1
 :killed
 
 echo [2/4] remove old outputs...
-if exist "target\release\%EXE_NAME%" del /q "target\release\%EXE_NAME%"
+if exist "target\debug\%EXE_NAME%" del /q "target\debug\%EXE_NAME%"
 if exist "gui\ui\dist" rmdir /s /q "gui\ui\dist"
 
 if "%~1"=="--full" (
@@ -47,11 +47,11 @@ call npm --prefix gui/ui run build
 if errorlevel 1 goto :err
 
 echo [3/4] build rust...
-call cargo build --release
+call cargo build
 if errorlevel 1 goto :err
 
 echo [4/4] start Gongfu Studio...
-start "" "target\release\%EXE_NAME%"
+start "" "target\debug\%EXE_NAME%"
 echo done.
 exit /b 0
 

@@ -37,15 +37,22 @@ body {
 
 .app { display: flex; flex-direction: column; height: 100%; }
 .app-header {
-  display: flex; align-items: center; gap: 8px; row-gap: 6px;
-  padding: 8px 12px; border-bottom: 1px solid #2a2a32; flex-shrink: 0;
-  background: #16161c; flex-wrap: wrap;
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 12px; border-bottom: 1px solid #2a2a32; flex-shrink: 0;
+  background: #16161c;
 }
 .app-header .title { font-weight: 600; font-size: 14px; color: #ffb86c; white-space: nowrap; }
-.app-header .root-input { width: 260px; }
-/* 工具栏作为整体换行的单元（不压缩内容，宽度不够时整体换到下一行） */
-.toolbar { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.toolbar .spacer { flex: 1; }
+.app-header .header-spacer { flex: 1; }
+.app-header .root-input { width: 260px; flex-shrink: 0; }
+/* 菜单栏融入头部：透明背景；n-menu 水平模式默认 flex:1 撑满整行，
+   需锁死宽度让右侧路径输入框保持在视口内 */
+.app-header .menubar.n-menu {
+  background: transparent; font-size: 13px; flex: 0 0 auto; width: auto;
+}
+.app-header .menubar.n-menu .n-menu-item-content { height: 40px; }
+/* 下拉条目（传送至 body 渲染，须用全局样式）左侧勾选槽：
+   占满 naive-ui 图标位宽度居中显示 ✓，未勾选时仅占位，保证文字左缘对齐 */
+.menu-tick { display: inline-flex; justify-content: center; width: 100%; color: #63e2b7; }
 .app-main { flex: 1; display: flex; min-height: 0; }
 
 /* ---- 左：资源树（全高） ---- */
