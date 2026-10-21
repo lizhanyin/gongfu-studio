@@ -2,7 +2,8 @@ import { computed, reactive, ref, watch, type ShallowRef } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { FskinModel, ModelSet, PartGroup, PartInfo, TexSlot, TexVariant } from "../types";
-import { texDataFromDto, type TexData, type Viewer } from "../viewer";
+import { texDataFromDto } from "../tex";
+import type { TexData, Viewer } from "../viewer";
 import { message } from "../message";
 import { shortName } from "../utils";
 

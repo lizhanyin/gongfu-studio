@@ -1,21 +1,23 @@
-import { onMounted, onUnmounted, shallowRef, type Ref } from "vue";
-import { Viewer } from "../viewer";
+import { onUnmounted, shallowRef } from "vue";
+import type { Viewer } from "../viewer";
 
 /**
- * 管理 three.js Viewer 实例的生命周期：挂载时创建，卸载时销毁。
- * 返回的 shallowRef 供各模式 composable 共享调用。
+ * 持有 three.js Viewer 实例的共享 shallowRef，供各模式 composable 调用。
+ * 实例的创建在 ViewerHost.vue（全工程唯一运行时引用 viewer.ts 的模块，
+ * 即 viewer.ts 的 HMR 边界）；视口重建（挂载 / viewer.ts 热更）时经
+ * adopt() 换新实例并销毁旧的。
  */
-export function useViewer(viewportRef: Ref<HTMLElement | null>) {
+export function useViewer() {
   const viewer = shallowRef<Viewer | null>(null);
 
-  onMounted(() => {
-    if (viewportRef.value) viewer.value = new Viewer(viewportRef.value);
-  });
+  function adopt(instance: Viewer | null) {
+    if (viewer.value === instance) return;
+    const old = viewer.value;
+    viewer.value = instance;
+    old?.dispose(); // dispose 会移除旧实例自己的 canvas，避免叠加
+  }
 
-  onUnmounted(() => {
-    viewer.value?.dispose();
-    viewer.value = null;
-  });
+  onUnmounted(() => adopt(null));
 
-  return viewer;
+  return { viewer, adopt };
 }

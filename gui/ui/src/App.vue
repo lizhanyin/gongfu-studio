@@ -57,60 +57,11 @@
               </div>
             </div>
 
-            <!-- 检查器（可折叠）：变体 / 动作信息 / 部件检查 -->
-            <aside class="inspector" :class="{ collapsed: inspectorCollapsed }">
-              <div class="inspector-head">
-                <span v-if="!inspectorCollapsed">检查器</span>
-                <n-button
-                  size="tiny"
-                  quaternary
-                  :title="inspectorCollapsed ? '展开' : '折叠'"
-                  @click="inspectorCollapsed = !inspectorCollapsed"
-                >
-                  {{ inspectorCollapsed ? "«" : "»" }}
-                </n-button>
-              </div>
-              <div v-show="!inspectorCollapsed" class="inspector-body">
-                <n-collapse
-                  class="inspector-collapse"
-                  display-directive="show"
-                  :default-expanded-names="['variants', 'tex', 'act', 'fak', 'fsm', 'part']"
-                >
-                  <n-collapse-item
-                    v-if="skin.modelSet?.groups.length"
-                    title="换装变体"
-                    name="variants"
-                  >
-                    <PartGroupList :skin="skin" />
-                  </n-collapse-item>
-                  <n-collapse-item
-                    v-if="skin.modelSet?.texSlots.length || skin.partTexVariants.length"
-                    title="纹理切换"
-                    name="tex"
-                  >
-                    <TexSlotPanel :skin="skin" />
-                  </n-collapse-item>
-                  <n-collapse-item v-if="act.actMeta || skin.hasParts" title="动作" name="act">
-                    <ActFileInfo :act="act" :act-dir="skin.rootDir + '\\act'" />
-                  </n-collapse-item>
-                  <n-collapse-item v-if="fak.fakModel" title="FAK 信息" name="fak">
-                    <FakFileInfo :fak="fak" />
-                  </n-collapse-item>
-                  <n-collapse-item v-if="fsm.fsmModel" title="FSM 信息" name="fsm">
-                    <FsmFileInfo :fsm="fsm" />
-                  </n-collapse-item>
-                  <n-collapse-item v-if="skin.selectedPart" title="部件检查" name="part">
-                    <PartInspector :skin="skin" />
-                  </n-collapse-item>
-                </n-collapse>
-                <div
-                  v-if="!skin.hasParts && !act.actMeta && !fak.fakModel && !fsm.fsmModel"
-                  class="inspector-empty"
-                >
-                  从资源网格选择文件预览
-                </div>
-              </div>
-            </aside>
+            <!-- 无渲染宿主：viewer.ts 的 HMR 边界，改 viewer.ts 只重建视口 -->
+            <ViewerHost :target="viewportRef" @ready="onViewerReady" />
+
+            <!-- 检查器（可折叠）：独立组件，改 InspectorPanel.vue 只重载检查器子树 -->
+            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" />
           </div>
 
           <!-- 右下：当前目录资源网格 -->
@@ -146,7 +97,8 @@ import { useActMode } from "./composables/useActMode";
 import { useFakMode } from "./composables/useFakMode";
 import { useFsmMode } from "./composables/useFsmMode";
 import { useResourceTree } from "./composables/useResourceTree";
-import { texDataFromDto } from "./viewer";
+import { texDataFromDto } from "./tex";
+import type { Viewer } from "./viewer";
 import { api } from "./api";
 import { message } from "./message";
 import { shortName } from "./utils";
@@ -154,29 +106,58 @@ import type { ResEntry } from "./types";
 import MenuBar from "./components/MenuBar.vue";
 import ResourceTree from "./components/ResourceTree.vue";
 import ResourceGrid from "./components/ResourceGrid.vue";
-import PartGroupList from "./components/PartGroupList.vue";
-import TexSlotPanel from "./components/TexSlotPanel.vue";
 import PlayBar from "./components/PlayBar.vue";
-import ActFileInfo from "./components/ActFileInfo.vue";
-import FakFileInfo from "./components/FakFileInfo.vue";
-import FsmFileInfo from "./components/FsmFileInfo.vue";
-import PartInspector from "./components/PartInspector.vue";
+import ViewerHost from "./components/ViewerHost.vue";
+import InspectorPanel from "./components/InspectorPanel.vue";
 
 const themeOverrides: GlobalThemeOverrides = {
   common: { bodyColor: "#101014", cardColor: "#181820" },
 };
 
 const viewportRef = ref<HTMLElement | null>(null);
-const inspectorCollapsed = ref(false);
 /** 视口内的 2D 贴图预览（选 3D 内容时关闭） */
 const texPreview = ref<{ url: string; name: string } | null>(null);
 
-const viewer = useViewer(viewportRef);
+const { viewer, adopt } = useViewer();
 const skin = useSkinMode(viewer);
 const act = useActMode(viewer);
 const fak = useFakMode(viewer);
 const fsm = useFsmMode(viewer);
 const res = useResourceTree();
+
+// ---------------- 视口宿主（viewer.ts 的 HMR 边界）----------------
+
+/** ViewerHost 重建视口（首次挂载 / viewer.ts 热更）后：换实例、重挂拾取、重放当前内容 */
+let viewportBooted = false;
+function onViewerReady(v: Viewer) {
+  const first = !viewportBooted;
+  viewportBooted = true;
+  adopt(v);
+  viewer.value?.setPickHandler((p) => skin.selectPart(p));
+  // 首次挂载的内容加载由下方 onMounted 负责，避免双扫描
+  if (!first) rerenderViewport();
+}
+
+/** 视口重建后重放当前内容（互斥优先级与 previewModelDir 一致：fak > fsm > act > skin 扫描） */
+async function rerenderViewport() {
+  if (fak.fakModel) {
+    const action = fak.currentAction;
+    await fak.openFakFile(fak.fakModel.path);
+    fak.currentAction = action;
+    return;
+  }
+  if (fsm.fsmModel) {
+    await fsm.openFsmFile(fsm.fsmModel.path);
+    return;
+  }
+  if (act.actMeta) {
+    const action = act.currentAction;
+    await act.openActFile(act.actMeta.path);
+    act.currentAction = action;
+    return;
+  }
+  skin.scan();
+}
 
 // ---------------- 预览路由 ----------------
 
@@ -284,7 +265,7 @@ async function overlayAdd(e: ResEntry) {
 }
 
 onMounted(() => {
-  viewer.value?.setPickHandler((p) => skin.selectPart(p));
+  // 视口实例与拾取接线由 ViewerHost 的 ready 回调负责
   res.init();
   skin.scan(); // 开箱默认整体预览 rootDir（res/system/AvatarGirl）
 });

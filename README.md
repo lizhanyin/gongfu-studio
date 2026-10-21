@@ -164,6 +164,13 @@ dev 模式原理：`gui/Cargo.toml` 的 `[features]` 转发 `tauri/custom-protoc
 （run-dev.bat / tauri dev）进入 cfg(dev)，窗口加载 tauri.conf.json 的 devUrl（vite，
 端口 1420）。改前端 HMR 即时生效，改 Rust 关闭应用重跑脚本即可。
 
+HMR 边界：改 `.vue` 组件 = 组件级热替换；改检查器 = 只重载检查器子树
+（`components/InspectorPanel.vue`）；改 `viewer.ts` = **原位热替换，零重建**——
+ViewerHost.vue 对 viewer.ts 做依赖级 accept，把存活实例的原型换到新类上，方法体 /
+模块常量的修改即刻生效，视口、已加载模型、检查器、资源树全部不动（改构造器 /
+类字段初始化不作用于已存在实例，需要时按 F5 整页重建）。改 App.vue 或 composable
+仍是整窗重挂。
+
 使用CDP来连接运行程序进行测试或者模拟点击
 
 ### 快捷操作
