@@ -42,9 +42,7 @@ pub fn split_cpk(vpath: &str) -> Option<(PathBuf, String)> {
                 .unwrap_or(false);
         if is_cpk_file {
             let n = anc.as_os_str().len();
-            let inner = rest[n..]
-                .trim_matches(['\\', '/'])
-                .replace('/', "\\");
+            let inner = rest[n..].trim_matches(['\\', '/']).replace('/', "\\");
             return Some((anc.to_path_buf(), inner));
         }
     }
@@ -70,38 +68,80 @@ pub fn join_vpath(root: &str, name: &str) -> String {
     format!("{}\\{}", root.trim_end_matches(['\\', '/']), name)
 }
 
-fn cpk_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<cpk::Cpk>>>> {
-    static CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<cpk::Cpk>>>>> =
+/// 打开的包：句柄 + 只读浏览索引。大包（如 system.cpk）两万余条目，
+/// 若每次列举/读取都重新物化全表（沿父链拼全路径 + GBK 解码）代价极高，
+/// 故打开时一次性构建目录索引并常驻（GUI 只读包，索引无失效问题）。
+struct PackHandle {
+    pack: Mutex<cpk::Cpk>,
+    /// 全表条目快照（表序），下方索引均存此处下标
+    entries: Vec<cpk::Entry>,
+    /// 小写全路径 → 条目下标（表序首个；文件与目录条目均可定位）
+    by_lower: HashMap<String, usize>,
+    /// 小写目录路径（包根为空串）→ 直接子项条目下标（表序）。
+    /// 目录条目可能缺失，深层文件路径同样能推导出各级目录。
+    children: HashMap<String, Vec<usize>>,
+}
+
+fn cpk_cache() -> &'static Mutex<HashMap<PathBuf, Arc<PackHandle>>> {
+    static CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<PackHandle>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     &CACHE
 }
 
-/// 打开（并缓存）CPK 包句柄；表解析一次后常驻，避免逐文件重复读表
-fn open_cpk(path: &Path) -> Result<Arc<Mutex<cpk::Cpk>>, String> {
-    let key = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
-    if let Some(c) = cpk_cache().lock().unwrap().get(&key) {
-        return Ok(c.clone());
+/// 打开（并缓存）CPK 包并构建目录索引；表解析与索引构建各只做一次
+fn open_cpk(path: &Path) -> Result<Arc<PackHandle>, String> {
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if let Some(h) = cpk_cache().lock().unwrap().get(&key) {
+        return Ok(h.clone());
     }
-    let pack = cpk::Cpk::open(path)
-        .map_err(|e| format!("打开 CPK 失败 {}: {e}", path.display()))?;
-    let arc = Arc::new(Mutex::new(pack));
+    let pack =
+        cpk::Cpk::open(path).map_err(|e| format!("打开 CPK 失败 {}: {e}", path.display()))?;
+    let entries = pack.entries();
+    let mut by_lower = HashMap::with_capacity(entries.len());
+    let mut children: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        let lp = e.full_path.to_lowercase();
+        // 末段为空的损坏条目不进子项表，避免拼出空段路径
+        match lp.rfind('\\') {
+            Some(p) if p + 1 < lp.len() => {
+                children.entry(lp[..p].to_string()).or_default().push(i);
+            }
+            None if !lp.is_empty() => {
+                children.entry(String::new()).or_default().push(i);
+            }
+            _ => {}
+        }
+        by_lower.entry(lp).or_insert(i);
+    }
+    let arc = Arc::new(PackHandle {
+        pack: Mutex::new(pack),
+        entries,
+        by_lower,
+        children,
+    });
     cpk_cache().lock().unwrap().insert(key, arc.clone());
     Ok(arc)
 }
 
-/// 读出包内一个文件条目（大小写不敏感匹配全路径）
+/// 读出包内一个文件条目（大小写不敏感匹配全路径，索引 O(1) 定位）
 fn read_cpk_entry(cpk_path: &Path, inner: &str) -> Result<Vec<u8>, String> {
-    let pack = open_cpk(cpk_path)?;
-    let mut pack = pack.lock().unwrap();
-    let entry = pack
-        .entries()
-        .into_iter()
-        .find(|e| !e.is_dir && e.full_path.eq_ignore_ascii_case(inner))
+    let h = open_cpk(cpk_path)?;
+    let key = inner.to_lowercase();
+    let entry = h
+        .by_lower
+        .get(&key)
+        .map(|&i| &h.entries[i])
         .ok_or_else(|| format!("CPK 内文件不存在: {inner}"))?;
-    pack.read_file(&entry)
-        .map_err(|e| format!("读取 {inner} 失败: {e}"))
+    if entry.is_dir {
+        return Err(format!("CPK 内文件不存在: {inner}"));
+    }
+    let bytes = h
+        .pack
+        .lock()
+        .unwrap()
+        .read_file(entry)
+        .map_err(|e| format!("读取 {inner} 失败: {e}"))?;
+    Ok(bytes)
 }
 
 /// 读文件（两种模式统一入口）
@@ -116,14 +156,15 @@ pub fn read_file(vpath: &str) -> Result<Vec<u8>, String> {
 pub fn exists(vpath: &str) -> bool {
     match split_cpk(vpath) {
         Some((cpk_path, inner)) => {
-            let Ok(pack) = open_cpk(&cpk_path) else { return false };
-            let pack = pack.lock().unwrap();
+            let Ok(h) = open_cpk(&cpk_path) else {
+                return false;
+            };
             if inner.is_empty() {
                 return true;
             }
-            pack.entries()
-                .iter()
-                .any(|e| e.full_path.eq_ignore_ascii_case(&inner))
+            // 条目自身（文件或目录条目），或作为隐式目录（有子项）均存在
+            let key = inner.to_lowercase();
+            h.by_lower.contains_key(&key) || h.children.contains_key(&key)
         }
         None => Path::new(vpath).exists(),
     }
@@ -134,31 +175,35 @@ pub fn list_dir(vpath: &str) -> Result<Vec<VfsEntry>, String> {
     let Some((cpk_path, inner)) = split_cpk(vpath) else {
         return list_fs_dir(vpath);
     };
-    let pack = open_cpk(&cpk_path)?;
-    let pack = pack.lock().unwrap();
-    let prefix = if inner.is_empty() {
-        String::new()
-    } else {
-        format!("{}\\", inner.to_lowercase())
-    };
-    // first 分量聚合：目录条目与文件路径都能推导出目录（包内目录条目可能缺失）
+    let h = open_cpk(&cpk_path)?;
+    let key = inner.to_lowercase();
+    // 直接子项按首段聚合：目录条目与文件路径都能推导出目录（包内目录条目可能缺失）
+    let off = if key.is_empty() { 0 } else { key.len() + 1 };
     let mut agg: BTreeMap<String, (bool, u64, String)> = BTreeMap::new();
-    for e in pack.entries() {
-        let lp = e.full_path.to_lowercase();
-        if !lp.starts_with(&prefix) {
-            continue;
-        }
-        let rest = &lp[prefix.len()..];
-        if rest.is_empty() {
-            continue; // 目录自身
-        }
-        let first = rest.split('\\').next().unwrap_or_default().to_string();
-        let display = first_name_of(&e.full_path, prefix.len());
-        let slot = agg.entry(first).or_insert((false, 0, display));
-        if rest.contains('\\') || e.is_dir {
-            slot.0 = true; // 有更深路径或是目录条目 → first 是目录
-        } else {
-            slot.1 = e.origin_size as u64;
+    if let Some(kids) = h.children.get(&key) {
+        for &i in kids {
+            let e = &h.entries[i];
+            let lp = e.full_path.to_lowercase();
+            let rest = lp.get(off..).unwrap_or_default();
+            if rest.is_empty() {
+                continue;
+            }
+            let first = rest.split('\\').next().unwrap_or_default().to_string();
+            // 显示名保留条目存储的大小写（键与全路径仅 ASCII 大小写差异，长度一致）
+            let display = e
+                .full_path
+                .get(off..)
+                .unwrap_or_default()
+                .split('\\')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let slot = agg.entry(first).or_insert((false, 0, display));
+            if rest.contains('\\') || e.is_dir {
+                slot.0 = true; // 有更深路径或是目录条目 → first 是目录
+            } else {
+                slot.1 = e.origin_size as u64;
+            }
         }
     }
     Ok(agg
@@ -170,15 +215,6 @@ pub fn list_dir(vpath: &str) -> Result<Vec<VfsEntry>, String> {
             byte_len,
         })
         .collect())
-}
-
-/// 从存储大小写的全路径取 prefix 之后的首段显示名
-fn first_name_of(full: &str, prefix_len: usize) -> String {
-    full[prefix_len..]
-        .split('\\')
-        .next()
-        .unwrap_or_default()
-        .to_string()
 }
 
 fn list_fs_dir(dir: &str) -> Result<Vec<VfsEntry>, String> {
@@ -194,7 +230,11 @@ fn list_fs_dir(dir: &str) -> Result<Vec<VfsEntry>, String> {
             continue;
         }
         let Ok(ft) = e.file_type() else { continue };
-        let byte_len = if ft.is_dir() { 0 } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
+        let byte_len = if ft.is_dir() {
+            0
+        } else {
+            e.metadata().map(|m| m.len()).unwrap_or(0)
+        };
         out.push(VfsEntry {
             name,
             path: p.to_string_lossy().into_owned(),
@@ -215,30 +255,61 @@ pub fn walk_files(vroot: &str, exts: &[&str]) -> Vec<VfsEntry> {
     };
     match split_cpk(vroot) {
         Some((cpk_path, inner)) => {
-            let Ok(pack) = open_cpk(&cpk_path) else { return Vec::new() };
-            let pack = pack.lock().unwrap();
-            let prefix = if inner.is_empty() {
-                String::new()
-            } else {
-                format!("{}\\", inner.to_lowercase())
+            let Ok(h) = open_cpk(&cpk_path) else {
+                return Vec::new();
             };
-            let mut out = Vec::new();
-            for e in pack.entries() {
-                if e.is_dir || !e.full_path.to_lowercase().starts_with(&prefix) {
-                    continue;
+            let key = inner.to_lowercase();
+            // 沿子项索引深度优先收集子树文件下标（只碰子树，不扫全表）
+            fn walk_dir(
+                h: &PackHandle,
+                key: &str,
+                hits: &mut Vec<usize>,
+                ext_match: &dyn Fn(&str) -> bool,
+            ) {
+                let Some(kids) = h.children.get(key) else {
+                    return;
+                };
+                let off = if key.is_empty() { 0 } else { key.len() + 1 };
+                for &i in kids {
+                    let e = &h.entries[i];
+                    let lp = e.full_path.to_lowercase();
+                    let first = lp
+                        .get(off..)
+                        .unwrap_or_default()
+                        .split('\\')
+                        .next()
+                        .unwrap_or_default();
+                    if first.is_empty() {
+                        continue;
+                    }
+                    let child = if key.is_empty() {
+                        first.to_string()
+                    } else {
+                        format!("{key}\\{first}")
+                    };
+                    if e.is_dir || h.children.contains_key(&child) {
+                        walk_dir(h, &child, hits, ext_match);
+                    } else if ext_match(&e.full_path) {
+                        hits.push(i);
+                    }
                 }
-                if ext_match(&e.full_path) {
-                    // 子路径 = full_path 去掉根前缀（仅 ASCII 大小写差异，长度相同）
-                    let rel = e.full_path[prefix.len()..].to_string();
-                    out.push(VfsEntry {
-                        path: join_vpath(vroot, &rel),
+            }
+            let mut hits = Vec::new();
+            walk_dir(&h, &key, &mut hits, &ext_match);
+            hits.sort_unstable(); // 表序输出，与全表过滤的历史顺序一致
+            let off = if inner.is_empty() { 0 } else { inner.len() + 1 };
+            hits.into_iter()
+                .map(|i| {
+                    let e = &h.entries[i];
+                    VfsEntry {
+                        // 子路径 = full_path 去掉根前缀（仅 ASCII 大小写差异，长度相同）
+                        path: join_vpath(vroot, e.full_path.get(off..).unwrap_or(&e.full_path)),
                         name: e.name.clone(),
                         is_dir: false,
                         byte_len: e.origin_size as u64,
-                    });
-                }
-            }
-            out
+                    }
+                })
+                .collect()
         }
         None => {
             let mut out = Vec::new();
@@ -293,9 +364,9 @@ impl Read for VfsReader {
 
 pub fn open_reader(vpath: &str) -> Result<VfsReader, String> {
     match split_cpk(vpath) {
-        Some((cpk_path, inner)) => Ok(VfsReader(ReaderInner::Mem(Cursor::new(
-            read_cpk_entry(&cpk_path, &inner)?,
-        )))),
+        Some((cpk_path, inner)) => Ok(VfsReader(ReaderInner::Mem(Cursor::new(read_cpk_entry(
+            &cpk_path, &inner,
+        )?)))),
         None => {
             let f = fs::File::open(vpath).map_err(|e| format!("打开失败: {e}"))?;
             Ok(VfsReader(ReaderInner::File(f)))
@@ -347,8 +418,8 @@ mod tests {
 
     #[test]
     fn split_cpk_addresses() {
-        let (pack, inner) = split_cpk("cpk:D:\\game\\system.cpk\\AvatarGirl\\act\\bck1.FSKEL")
-            .unwrap();
+        let (pack, inner) =
+            split_cpk("cpk:D:\\game\\system.cpk\\AvatarGirl\\act\\bck1.FSKEL").unwrap();
         assert_eq!(pack, PathBuf::from("D:\\game\\system.cpk"));
         assert_eq!(inner, "AvatarGirl\\act\\bck1.FSKEL");
         // 正斜杠混写 + 尾分隔符归一
@@ -428,6 +499,42 @@ mod tests {
         let _ = fs::remove_dir_all(cpk_path.parent().unwrap());
     }
 
+    /// 本机大包性能冒烟（手动 `--ignored` 运行；包不存在则跳过）
+    #[test]
+    #[ignore = "需要本地 E:\\Workspace\\res\\system.cpk"]
+    fn real_system_cpk_perf() {
+        let p = Path::new("E:\\Workspace\\res\\system.cpk");
+        if !p.is_file() {
+            return;
+        }
+        let root = format!("cpk:{}", p.display());
+        let t = std::time::Instant::now();
+        let top = list_dir(&root).unwrap();
+        println!("根列举: {:?}（{} 项）", t.elapsed(), top.len());
+        let sys = top
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("system"))
+            .unwrap();
+        let t = std::time::Instant::now();
+        let subs = crate::res::list_dir(&sys.path).unwrap();
+        println!(
+            "system 列举（含逐子目录 is_model）: {:?}（{} 项）",
+            t.elapsed(),
+            subs.len()
+        );
+        let mon = subs
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("Monster"))
+            .unwrap();
+        let t = std::time::Instant::now();
+        let ms = crate::res::list_dir(&mon.path).unwrap();
+        println!(
+            "Monster 列举（含逐子目录 is_model）: {:?}（{} 项）",
+            t.elapsed(),
+            ms.len()
+        );
+    }
+
     /// 高层链路：CPK 寻址下的整体模型扫描与动作扫描（fskin/fskel 均走 vfs）
     #[test]
     fn cpk_model_and_act_scan() {
@@ -436,7 +543,10 @@ mod tests {
         let girl = join_vpath(&root, "AvatarGirl");
         let set = crate::fskin::scan_model_set(&girl).unwrap();
         assert!(
-            set.groups.iter().any(|g| g.parts.iter().any(|p| p.file_name.eq_ignore_ascii_case("girl_head.fskin"))),
+            set.groups.iter().any(|g| g
+                .parts
+                .iter()
+                .any(|p| p.file_name.eq_ignore_ascii_case("girl_head.fskin"))),
             "换装分组应含 girl_head"
         );
         assert!(!set.tex_slots.is_empty(), "TFace 纹理槽应被识别");
