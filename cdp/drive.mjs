@@ -2,9 +2,11 @@
 //   node drive.mjs "<js 表达式>"   一次性求值并打印结果
 //   node drive.mjs --diag [N]      取 window.__diagLog 最近 N 条（默认 100，含动作诊断日志历史）
 //   node drive.mjs --tail          实时打印页面 console 输出（Runtime.consoleAPICalled）
+//   node drive.mjs --shot <file>   页面截图（Page.captureScreenshot，不受窗口遮挡影响）
 // 注意 9222 落在本机 Windows 保留端口段 9181-9280 内无法绑定，故用 9333。
 import WebSocket from "ws";
 import { request } from "node:http";
+import { writeFileSync } from "node:fs";
 
 const CDP_PORT = Number(process.env.CDP_PORT) || 9333;
 
@@ -24,7 +26,8 @@ function getJson(path) {
 }
 
 const args = process.argv.slice(2);
-const mode = args[0] === "--diag" ? "diag" : args[0] === "--tail" ? "tail" : "eval";
+const mode =
+  args[0] === "--diag" ? "diag" : args[0] === "--tail" ? "tail" : args[0] === "--shot" ? "shot" : "eval";
 const expr = mode === "eval" ? args[0] : null;
 if (mode === "eval" && !expr) {
   console.error('usage: node drive.mjs "<expr>" | --diag [N] | --tail');
@@ -85,6 +88,18 @@ ws.on("open", async () => {
   if (mode === "tail") {
     console.error("[tail] connected, streaming console (Ctrl+C to stop)...");
     return; // 长驻
+  }
+  if (mode === "shot") {
+    const r = await send("Page.captureScreenshot", { format: "png" });
+    if (r.result?.data) {
+      writeFileSync(args[1] ?? "shot.png", Buffer.from(r.result.data, "base64"));
+      console.log("saved " + (args[1] ?? "shot.png"));
+    } else {
+      console.error("capture failed");
+      process.exit(1);
+    }
+    ws.close();
+    process.exit(0);
   }
   const expression =
     mode === "diag"

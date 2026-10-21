@@ -225,3 +225,111 @@ pub fn run() {
 pub fn dds_decode_for_test(bytes: &[u8]) -> Result<Vec<u8>, String> {
     dds::decode_dds(bytes).map(|t| t.rgba)
 }
+
+/// 诊断探针（skirt_probe 示例用）：裙摆防穿模/布料链排查——FSKEL 骨名、
+/// 腿胶囊长度（与 viewer setupSkirtRig 同口径：len=子骨帧0局部平移长度，
+/// r=0.18×len），以及各 FSKIN 部件中 Bone* 链骨的顶点影响分布
+/// （权重范围、单影响顶点数、共混骨 top3）。
+pub fn skirt_probe_for_test(fskel_path: &str, fskin_paths: &[String]) -> Result<String, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let bytes = std::fs::read(fskel_path).map_err(|e| format!("读 FSKEL 失败: {e}"))?;
+    let f = fskel::parse_fskel(fskel_path, &bytes)?;
+    let meta = f.meta();
+    let n = meta.bone_count as usize;
+    let frame0 = f.frames_flat(0, 1);
+    let mut out = format!("== FSKEL {}: {} 骨 · {} 帧\n", meta.file_name, n, meta.frame_count);
+
+    let is_bone_name = |s: &str| s.len() > 4 && s.starts_with("Bone") && s[4..].bytes().all(|b| b.is_ascii_digit());
+
+    for b in 0..n {
+        let name = &meta.bone_names[b];
+        if !(name.contains("Thigh") || name.contains("Calf") || name.contains("Foot")) {
+            continue;
+        }
+        if let Some(c) = (0..n).find(|&c| meta.parents[c] == b as i32) {
+            let o = c * 7;
+            let len = (frame0[o] * frame0[o] + frame0[o + 1] * frame0[o + 1] + frame0[o + 2] * frame0[o + 2]).sqrt();
+            out += &format!("  腿骨 {name}(#{b}): len={len:.2} 胶囊半径={:.2}\n", len * 0.18);
+        }
+    }
+
+    let bone_ids: BTreeSet<usize> = (0..n).filter(|&b| is_bone_name(&meta.bone_names[b])).collect();
+    out += &format!("  Bone* 链骨 {} 根\n", bone_ids.len());
+
+    for path in fskin_paths {
+        let bytes = std::fs::read(path).map_err(|e| format!("读 FSKIN 失败: {e}"))?;
+        let m = fskin::parse_fskin(path, &bytes)?;
+        let fname = path.rsplit(['\\', '/']).next().unwrap_or(path);
+        out += &format!("== {fname} ({} 顶点)\n", m.vertices.len());
+        struct St {
+            cnt: usize,
+            solo: usize,
+            wmin: f32,
+            wmax: f32,
+            wsum: f64,
+            co: BTreeMap<usize, usize>,
+        }
+        let mut stats: BTreeMap<usize, St> = BTreeMap::new();
+        for v in &m.vertices {
+            for inf in &v.influences {
+                let bi = inf.bone_index as usize;
+                if !bone_ids.contains(&bi) {
+                    continue;
+                }
+                let s = stats.entry(bi).or_insert_with(|| St {
+                    cnt: 0,
+                    solo: 0,
+                    wmin: f32::MAX,
+                    wmax: 0.0,
+                    wsum: 0.0,
+                    co: BTreeMap::new(),
+                });
+                s.cnt += 1;
+                s.wmin = s.wmin.min(inf.weight);
+                s.wmax = s.wmax.max(inf.weight);
+                s.wsum += inf.weight as f64;
+                if v.influences.len() == 1 || inf.weight >= 0.99 {
+                    s.solo += 1;
+                }
+                for other in &v.influences {
+                    if (other.bone_index as usize) != bi {
+                        *s.co.entry(other.bone_index as usize).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        if stats.is_empty() {
+            out += "  (无 Bone* 链影响)\n";
+            continue;
+        }
+        for (bi, s) in &stats {
+            let bname = meta.bone_names.get(*bi).map(String::as_str).unwrap_or("?");
+            let mut co: Vec<_> = s.co.iter().collect();
+            co.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+            let co_txt = co
+                .iter()
+                .take(3)
+                .map(|(ob, c)| {
+                    let oname = meta
+                        .bone_names
+                        .get(**ob)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{ob}"));
+                    format!("{oname}(#{ob})×{c}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out += &format!(
+                "  {bname}(#{bi}): 影响 {} 顶点 · 权重 min/avg/max {:.2}/{:.2}/{:.2} · 单影响 {} · 共混 {}\n",
+                s.cnt,
+                s.wmin,
+                s.wsum / s.cnt as f64,
+                s.wmax,
+                s.solo,
+                if co_txt.is_empty() { "-" } else { &co_txt }
+            );
+        }
+    }
+    Ok(out)
+}

@@ -7,6 +7,7 @@
 | `cpk/` | CPK 资源包格式（`RST\x1A`）读写库，Cpack2009 官方打包器（CPKCore 2.0）的 Rust 移植 |
 | `cpktool/` | 命令行工具：查看 / 列表 / 解包 / 打包 / 添加 / 删除 / 校验 |
 | `gui/` | Gongfu Studio（见下节），从 gongfu-studio 迁入的 Tauri 2 + Vue 3 GUI；前端在 `gui/ui`，Rust 端在 `gui/src` |
+| `cdp/` | CDP 渲染数据提取工具集（见 `cdp/README.md`）：驱动运行中的 Tauri 应用、读 viewer 内部蒙皮/锚定/穿模数据、抓 WebGL 帧 |
 
 原 C++ 参考源码保留在 `G:\workspace\tools\Cpack2009`（MFC/x86，VS2026 可编译）；
 游戏端 CPK 读取器在 `G:\pojie\ai\vEngine\vfs\CPKFast.cpp`（file system 1.0）。
@@ -151,11 +152,17 @@ target\release\gongfu-studio.exe
 开发模式：
 
 ```
+run.bat                # 发布式：npm build 前端 → cargo build → 直跑 exe（嵌入 ui/dist）
+run-dev.bat            # 开发式：vite dev (HMR) + cargo build --no-default-features → 运行
 npm --prefix gui/ui install    # 首次
-npm --prefix gui/ui run build  # 构建前端（gui/ui/dist）
-npm --prefix gui/ui run tauri dev      # 开发运行
+npm --prefix gui/ui run tauri dev      # 开发运行（等价 run-dev.bat，由 tauri CLI 托管并监听 Rust 改动）
 npm --prefix gui/ui run tauri build    # 生成 NSIS 安装包
 ```
+
+dev 模式原理：`gui/Cargo.toml` 的 `[features]` 转发 `tauri/custom-protocol`——默认构建
+（run.bat / tauri build）嵌入 ui/dist，无视 devUrl；`--no-default-features` 构建
+（run-dev.bat / tauri dev）进入 cfg(dev)，窗口加载 tauri.conf.json 的 devUrl（vite，
+端口 1420）。改前端 HMR 即时生效，改 Rust 关闭应用重跑脚本即可。
 
 使用CDP来连接运行程序进行测试或者模拟点击
 

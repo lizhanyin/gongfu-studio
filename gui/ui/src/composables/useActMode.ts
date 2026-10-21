@@ -19,7 +19,7 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
   const playTime = ref(0);
   const speed = ref(1);
   const showSkinOverlay = ref(true);
-  const showSkeleton = ref(true);
+  const showSkeleton = ref(false);
   let playRaf = 0;
   let lastTs = 0;
 
@@ -42,11 +42,18 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
       const arr = await api.loadFskelFrames(path, 0, meta.frameCount);
       actMeta.value = meta;
       actPoses.value = Float32Array.from(arr);
+      const first = meta.actions[0];
+      // 诊断日志前缀先于 setFskel：加载/镜像检测日志即带动作名
+      viewer.value?.setLogAction(first?.name ?? meta.fileName);
       viewer.value?.setFskel(meta, actPoses.value);
       currentAction.value = 0;
       playTime.value = 0;
       playing.value = true;
       viewer.value?.frameSkeleton();
+      viewer.value?.diagnoseAction(
+        first?.firstFrame ?? 0,
+        first ? first.firstFrame + first.frameCount : meta.frameCount
+      );
     } catch (e) {
       message.error(`动作加载失败: ${e}`);
     } finally {
@@ -59,12 +66,19 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
     playing.value = false;
     actMeta.value = null;
     actPoses.value = null;
+    viewer.value?.setLogAction(null);
     viewer.value?.clearFskel();
   }
 
   function selectAction(i: number) {
     currentAction.value = i;
     playTime.value = 0;
+    // 切动作即切换诊断日志前缀并跑一次该动作区间的诊断
+    const a = actMeta.value?.actions[i];
+    if (a && viewer.value) {
+      viewer.value.setLogAction(a.name);
+      viewer.value.diagnoseAction(a.firstFrame, a.firstFrame + a.frameCount);
+    }
   }
 
   function scrub(v: number) {

@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.pojie.Gongfutudio",
   "build": {
-    "frontendDist": "ui/dist"
+    "frontendDist": "ui/dist",
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420"
   },
   "app": {
     "windows": [
