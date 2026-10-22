@@ -101,8 +101,8 @@ import { useActMode } from "./composables/useActMode";
 import { useFakMode } from "./composables/useFakMode";
 import { useFsmMode } from "./composables/useFsmMode";
 import { useResourceTree } from "./composables/useResourceTree";
-import { texDataFromDto } from "./tex";
-import type { Viewer } from "./viewer";
+import { texDataFromDto, b64ToBytes, decodeTga, imageUrlFromB64 } from "./tex";
+import type { TexData, Viewer } from "./viewer";
 import { api } from "./api";
 import { message } from "./message";
 import { shortName } from "./utils";
@@ -165,20 +165,35 @@ async function rerenderViewport() {
 
 // ---------------- 预览路由 ----------------
 
+/** RGBA8 数据 → canvas data URL（DDS / TGA 解码结果展示用） */
+function texCanvasUrl(d: TexData): string {
+  const cv = document.createElement("canvas");
+  cv.width = d.width;
+  cv.height = d.height;
+  const ctx = cv.getContext("2d")!;
+  const img = ctx.createImageData(d.width, d.height);
+  img.data.set(d.rgba);
+  ctx.putImageData(img, 0, 0);
+  return cv.toDataURL();
+}
+
 async function previewTexture(e: ResEntry) {
   try {
-    const dto = await api.loadTexture(e.path);
-    const d = texDataFromDto(dto);
-    const cv = document.createElement("canvas");
-    cv.width = d.width;
-    cv.height = d.height;
-    const ctx = cv.getContext("2d")!;
-    const img = ctx.createImageData(d.width, d.height);
-    img.data.set(d.rgba);
-    ctx.putImageData(img, 0, 0);
-    texPreview.value = { url: cv.toDataURL(), name: `${e.name} (${d.width}×${d.height})` };
+    if (e.kind === "dds") {
+      const d = texDataFromDto(await api.loadTexture(e.path));
+      texPreview.value = { url: texCanvasUrl(d), name: `${e.name} (${d.width}×${d.height})` };
+      return;
+    }
+    if (e.kind === "tga") {
+      const d = decodeTga(b64ToBytes(await api.readFileB64(e.path)));
+      texPreview.value = { url: texCanvasUrl(d), name: `${e.name} (${d.width}×${d.height})` };
+      return;
+    }
+    // png / jpg / bmp / gif / webp：原始字节交给 webview 原生解码
+    const { url, width, height } = await imageUrlFromB64(await api.readFileB64(e.path), e.kind);
+    texPreview.value = { url, name: `${e.name} (${width}×${height})` };
   } catch (err) {
-    message.error(`贴图读取失败 ${e.name}: ${err}`);
+    message.error(`图片读取失败 ${e.name}: ${err}`);
   }
 }
 
@@ -213,7 +228,10 @@ async function previewEntry(e: ResEntry) {
     case "tga":
     case "png":
     case "jpg":
+    case "jpeg":
     case "bmp":
+    case "gif":
+    case "webp":
       await previewTexture(e);
       break;
     default:

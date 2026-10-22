@@ -3,8 +3,10 @@
 //! 经由 crate::vfs 统一寻址：既支持磁盘目录，也支持 `cpk:` 前缀的
 //! CPK 包内路径（如 `cpk:D:\game\system.cpk\AvatarGirl`）。
 //!
-//! "整体模型目录"判定：直接子项含 .fskin / .fak / .fsm，或 act/ 子目录含
-//! .FSKEL（如 system/AvatarGirl、system/Monster/G080、system/Weapon/Jian）。
+//! "整体模型目录"判定：仅限 AvatarBoy / AvatarGirl / Monster 下的目录（整体
+//! 预览目前只支持这些），且直接子项含 .fskin / .fak / .fsm，或 act/ 子目录含
+//! .FSKEL（如 system/AvatarGirl、system/Monster/G080）。其余目录（如
+//! system/Weapon/Jian 含 .fsm）不开放整体预览，后续支持的目录类型再加。
 
 use serde::Serialize;
 use std::io::Read;
@@ -20,7 +22,7 @@ pub struct ResEntry {
     /// 小写扩展名（fskin/fskel/dds/...），目录为 "dir"
     pub kind: String,
     pub byte_len: u64,
-    /// 目录是否为"整体模型"
+    /// 目录是否为"整体模型"（仅 AvatarBoy/AvatarGirl/Monster 范围内可整体预览）
     pub is_model: bool,
     pub vertex_count: Option<u32>,
     pub triangle_count: Option<u32>,
@@ -41,7 +43,20 @@ fn dir_contains(dir: &str, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 整体预览支持的根目录名（路径任一层级命中即视为在范围内，大小写不敏感）
+const MODEL_PREVIEW_ROOTS: [&str; 3] = ["avatarboy", "avatargirl", "monster"];
+
+/// 整体预览范围：目前仅 AvatarBoy / AvatarGirl / Monster 下的目录支持；
+/// 其余目录（如 Weapon）即使含模型文件也不开放，后续有支持的类型再扩充
+fn in_model_scope(dir: &str) -> bool {
+    dir.split(['\\', '/'])
+        .any(|seg| MODEL_PREVIEW_ROOTS.iter().any(|r| seg.eq_ignore_ascii_case(r)))
+}
+
 fn is_model_dir(dir: &str) -> bool {
+    if !in_model_scope(dir) {
+        return false;
+    }
     if dir_contains(dir, "fskin") || dir_contains(dir, "fak") || dir_contains(dir, "fsm") {
         return true;
     }
@@ -234,10 +249,10 @@ mod tests {
 
     #[test]
     fn list_jian_has_fsm_meta() {
-        // 含 .fsm 的目录在上级列表中标为"整体模型"
+        // Jian 含 .fsm 但不在 AvatarBoy/AvatarGirl/Monster 下，不标为"整体模型"
         let weapon = list_dir(&format!("{RES}/system/Weapon")).unwrap();
         let dir = weapon.iter().find(|e| e.name == "Jian").unwrap();
-        assert!(dir.is_dir && dir.is_model);
+        assert!(dir.is_dir && !dir.is_model);
         let entries = list_dir(&format!("{RES}/system/Weapon/Jian")).unwrap();
         let fsm = entries
             .iter()

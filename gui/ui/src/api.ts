@@ -15,6 +15,8 @@ export const api = {
   saveFskin: (path: string, model: FskinModel) =>
     invoke<void>("save_fskin", { path, model }),
   loadTexture: (path: string) => invoke<TexImageDto>("load_texture", { path }),
+  /** 原始文件字节（base64，支持 cpk: 包内路径） */
+  readFileB64: (path: string) => invoke<string>("read_file_b64", { path }),
   exportObj: (paths: string[], outDir: string, baseName: string) =>
     invoke<string>("export_obj", { paths, outDir, baseName }),
   computeBbox: (model: FskinModel) =>

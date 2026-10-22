@@ -77,6 +77,16 @@ async fn export_obj(
     run_blocking(move || obj::export_obj(&paths, &out_dir, &base_name)).await
 }
 
+/// 读取任意资源文件原始字节（base64）：通用图片（png/jpg/bmp 等）由前端 webview 解码
+#[tauri::command]
+async fn read_file_b64(path: String) -> Result<String, String> {
+    run_blocking(move || {
+        let bytes = vfs::read_file(&path)?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    })
+    .await
+}
+
 /// 根据当前顶点重算包围盒，返回新值（前端确认后写回）
 #[tauri::command]
 async fn compute_bbox(model: fskin::FskinModel) -> Result<([f32; 3], [f32; 3]), String> {
@@ -262,6 +272,7 @@ pub fn run() {
             save_fskin,
             load_texture,
             export_obj,
+            read_file_b64,
             compute_bbox,
             toggle_devtools,
             scan_act_dir,

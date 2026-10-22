@@ -531,6 +531,31 @@ mod tests {
         fs::read(&p).ok()
     }
 
+    /// 临时诊断：直接解析用户文件
+    #[test]
+    fn tmp_parse_user_fak() {
+        let bytes = fs::read(r"E:\Workspace\res\bs001\bs001.fak").unwrap();
+        match parse_fak("bs001.fak", &bytes) {
+            Ok(m) => {
+                eprintln!(
+                    "OK: v={} verts={} submeshes={} frames={} materials={} actions={:?}",
+                    m.version,
+                    m.vertex_count,
+                    m.submeshes.len(),
+                    m.frames.len(),
+                    m.materials.len(),
+                    m.actions
+                        .iter()
+                        .map(|a| format!("{}×{}", a.name, a.frame_count))
+                        .collect::<Vec<_>>()
+                );
+                let out = serialize_fak(&m).unwrap();
+                eprintln!("roundtrip byte-equal: {}", bytes == out);
+            }
+            Err(e) => panic!("解析失败: {e}"),
+        }
+    }
+
     #[test]
     fn roundtrip_g080() {
         let Some(bytes) = read_sample() else {

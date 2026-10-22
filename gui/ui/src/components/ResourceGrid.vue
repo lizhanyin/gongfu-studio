@@ -10,31 +10,44 @@
       <span class="meta-inline">{{ tree.gridEntries.length }} 项</span>
       <n-spin v-if="tree.gridLoading" :size="12" />
     </div>
-    <div class="grid-body">
-      <div
-        v-for="e in tree.gridEntries"
-        :key="e.path"
-        class="res-card"
-        :class="{ dir: e.isDir, model: e.isModel }"
-        :title="e.path"
-        @click="onClick(e)"
-        @contextmenu="onCtx($event, e)"
-      >
-        <div class="card-top">
-          <span class="kind" :class="e.isDir ? (e.isModel ? 'model' : 'dir') : e.kind">
-            {{ kindTag(e) }}
-          </span>
-          <n-button
-            v-if="e.isDir && e.isModel"
-            size="tiny"
-            class="whole-btn"
-            @click.stop="emit('previewModel', e.path)"
-          >整体预览</n-button>
-        </div>
-        <div class="card-name">{{ e.name }}</div>
-        <div class="card-meta">{{ metaText(e) }}</div>
-      </div>
+    <div
+      ref="bodyRef"
+      class="grid-body"
+      @scroll.passive="onScroll"
+    >
       <div v-if="!tree.gridLoading && !tree.gridEntries.length" class="grid-empty">空目录</div>
+      <div v-else class="grid-spacer" :style="{ height: totalH + 'px' }">
+        <div
+          v-for="row in visibleRows"
+          :key="row.i"
+          class="grid-row"
+          :style="{ top: row.i * PITCH + 'px', gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }"
+        >
+          <div
+            v-for="e in row.items"
+            :key="e.path"
+            class="res-card"
+            :class="{ dir: e.isDir, model: e.isModel }"
+            :title="e.path"
+            @click="onClick(e)"
+            @contextmenu="onCtx($event, e)"
+          >
+            <div class="card-top">
+              <span class="kind" :class="e.isDir ? (e.isModel ? 'model' : 'dir') : e.kind">
+                {{ kindTag(e) }}
+              </span>
+              <n-button
+                v-if="e.isDir && e.isModel"
+                size="tiny"
+                class="whole-btn"
+                @click.stop="emit('previewModel', e.path)"
+              >整体预览</n-button>
+            </div>
+            <div class="card-name">{{ e.name }}</div>
+            <div class="card-meta">{{ metaText(e) }}</div>
+          </div>
+        </div>
+      </div>
     </div>
     <n-dropdown
       placement="bottom-start"
@@ -50,7 +63,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { DropdownOption } from "naive-ui";
 import type { ResourceTreeStore } from "../composables/useResourceTree";
 import type { ResEntry } from "../types";
@@ -121,6 +134,64 @@ function onClick(e: ResEntry) {
   if (e.isDir) emit("openDir", e.path);
   else emit("preview", e);
 }
+
+// ---------- 虚拟滚动 ----------
+// 尺寸常量需与 style.css 一致：卡片定高 CARD_H、行/列间距 GAP、最小列宽 CARD_MIN_W
+const CARD_H = 82;
+const GAP = 8;
+const CARD_MIN_W = 150;
+const PITCH = CARD_H + GAP;
+const OVERSCAN = 2;
+
+const bodyRef = ref<HTMLElement | null>(null);
+const scrollTop = ref(0);
+const viewH = ref(300);
+const cols = ref(1);
+
+let ro: ResizeObserver | null = null;
+onMounted(() => {
+  const el = bodyRef.value;
+  if (!el) return;
+  ro = new ResizeObserver((entries) => {
+    const r = entries[entries.length - 1].contentRect;
+    viewH.value = r.height || viewH.value;
+    // 与原 CSS repeat(auto-fill, minmax(CARD_MIN_W, 1fr)) 同公式的列数
+    cols.value = Math.max(1, Math.floor((r.width + GAP) / (CARD_MIN_W + GAP)));
+  });
+  ro.observe(el);
+});
+onBeforeUnmount(() => ro?.disconnect());
+
+/** 按当前列数把条目切成行 */
+const rows = computed(() => {
+  const list = props.tree.gridEntries;
+  const n = cols.value;
+  const out: ResEntry[][] = [];
+  for (let i = 0; i < list.length; i += n) out.push(list.slice(i, i + n));
+  return out;
+});
+const totalH = computed(() => rows.value.length * PITCH);
+const visibleRows = computed(() => {
+  const n = rows.value.length;
+  const first = Math.max(0, Math.floor(scrollTop.value / PITCH) - OVERSCAN);
+  const last = Math.min(n, Math.ceil((scrollTop.value + viewH.value) / PITCH) + OVERSCAN);
+  const out: { i: number; items: ResEntry[] }[] = [];
+  for (let i = first; i < last; i++) out.push({ i, items: rows.value[i] });
+  return out;
+});
+
+function onScroll() {
+  scrollTop.value = bodyRef.value?.scrollTop ?? 0;
+}
+
+// 切换目录 / 刷新后回到顶部
+watch(
+  () => props.tree.gridEntries,
+  () => {
+    scrollTop.value = 0;
+    if (bodyRef.value) bodyRef.value.scrollTop = 0;
+  },
+);
 
 // ---------- 右键菜单 ----------
 const menuShow = ref(false);
