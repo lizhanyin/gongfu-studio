@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{fsm, fskin, vfs};
+use crate::{fsm, fskin, fskel, vfs};
 
 /// 基础模型目录（目录名小写, 标签, 性别）
 const BASE_DIRS: [(&str, &str, &str); 2] = [
@@ -166,28 +166,7 @@ fn tex_stem_of(texture_path: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// act 目录的默认骨架：优先名称含基础模型关键词（girl/boy）且无数字的
-/// （girl.FSKEL），其次无数字者，再按名称最短
-fn default_fskel_of(act_dir: &str, keyword: &str) -> Option<String> {
-    let files = vfs::walk_files(act_dir, &["fskel"]);
-    files
-        .into_iter()
-        .min_by_key(|f| {
-            let stem = f
-                .name
-                .rsplit_once('.')
-                .map(|(s, _)| s)
-                .unwrap_or(&f.name)
-                .to_lowercase();
-            let has_digit = stem.bytes().any(|b| b.is_ascii_digit());
-            (
-                !(stem.contains(keyword) && !has_digit),
-                has_digit,
-                stem.len(),
-            )
-        })
-        .map(|f| f.path)
-}
+/// act 目录的默认骨架选取见 fskel::default_fskel_of（与皮肤模式共用）
 
 /// 扫描装备/时装目录：逐文件解析统计与材质贴图。
 /// 解析失败的文件跳过（目录列举照常）；fskin 无材质槽 = 特效网格，剔除。
@@ -273,7 +252,7 @@ pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
             key: dir_name.to_string(),
             label: label.to_string(),
             gender: gender.to_string(),
-            default_fskel: default_fskel_of(&act_dir, kw),
+            default_fskel: fskel::default_fskel_of(&act_dir, kw),
             dir,
             act_dir,
         });

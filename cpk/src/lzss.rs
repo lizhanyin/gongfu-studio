@@ -236,7 +236,17 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
 
 /// LZSS 解压。`expected` 为原始长度，用于预分配并防越界。
 pub fn decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(expected);
+    decompress_impl(input, expected, usize::MAX)
+}
+
+/// LZSS 前缀解压：解出前 `max_len` 字节即停（`max_len` 由调用方保证 <= expected）。
+/// 与全量解压共用一个循环，仅多一个"已到前缀长度"的提前退出。
+pub fn decompress_prefix(input: &[u8], expected: usize, max_len: usize) -> Result<Vec<u8>, Error> {
+    decompress_impl(input, expected, max_len.min(expected))
+}
+
+fn decompress_impl(input: &[u8], expected: usize, want: usize) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(want.min(expected));
     let mut text_buf = vec![0u8; N + F - 1];
     for i in 0..N - F {
         text_buf[i] = b' ';
@@ -246,6 +256,9 @@ pub fn decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     let mut in_pos = 0usize;
 
     loop {
+        if out.len() >= want {
+            break;
+        }
         flags >>= 1;
         if flags & 0x100 == 0 {
             if in_pos >= input.len() {
@@ -292,6 +305,8 @@ pub fn decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
             }
         }
     }
+    // 匹配段整组拷出，可能越过 want 几个字节（<= F），统一截回
+    out.truncate(want);
     Ok(out)
 }
 

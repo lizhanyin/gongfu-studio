@@ -8,7 +8,7 @@
 //! | 4    | LZSS      | Okumura 经典实现（核心库未默认使用）         |
 
 use crate::error::Error;
-use crate::lzss;
+use crate::{lzo, lzss};
 
 /// 直通存储。
 pub const FILTER_CHANGELESS: u32 = 1;
@@ -29,6 +29,29 @@ pub fn decompress(filter: u32, input: &[u8], origin_size: u32) -> Result<Vec<u8>
             Ok(dst)
         }
         FILTER_LZSS => lzss::decompress(input, origin_size as usize),
+        other => Err(Error::UnsupportedFilter(other as u16)),
+    }
+}
+
+/// 按过滤器解出前 `max_len` 字节即停（`max_len` 自动钳到 origin_size）。
+/// LZO/LZSS 均为流式编码，前缀解压不解码剩余数据，供大文件只读头部；
+/// Changeless 直通截断。`input` 为整条压缩块。
+pub fn decompress_prefix(
+    filter: u32,
+    input: &[u8],
+    origin_size: u32,
+    max_len: usize,
+) -> Result<Vec<u8>, Error> {
+    let want = max_len.min(origin_size as usize);
+    match filter {
+        FILTER_CHANGELESS => Ok(input.get(..want).unwrap_or(input).to_vec()),
+        FILTER_MINILZO => {
+            let mut dst = vec![0u8; want];
+            let written = lzo::decompress_prefix(input, &mut dst)?;
+            dst.truncate(written);
+            Ok(dst)
+        }
+        FILTER_LZSS => lzss::decompress_prefix(input, origin_size as usize, want),
         other => Err(Error::UnsupportedFilter(other as u16)),
     }
 }
@@ -62,5 +85,29 @@ mod tests {
     fn changeless_passthrough() {
         let d = b"0123456789";
         assert_eq!(decompress(FILTER_CHANGELESS, d, 10).unwrap(), d);
+        assert_eq!(decompress_prefix(FILTER_CHANGELESS, d, 10, 4).unwrap(), &d[..4]);
+        // max_len 超过 origin_size 时钳到 origin_size
+        assert_eq!(decompress_prefix(FILTER_CHANGELESS, d, 4, 100).unwrap(), &d[..4]);
+    }
+
+    /// 前缀解压与全量解压在各截断点逐字节一致（LZO 与 LZSS）
+    #[test]
+    fn prefix_matches_full_both_filters() {
+        let data: Vec<u8> = (0..40_000u32)
+            .map(|i| if i / 3000 % 2 == 0 { (i % 251) as u8 } else { (i / 257) as u8 })
+            .collect();
+        for filter in [FILTER_MINILZO, FILTER_LZSS] {
+            let packed = match filter {
+                FILTER_MINILZO => compress_lzo(&data).unwrap(),
+                _ => lzss::compress(&data),
+            };
+            let full = decompress(filter, &packed, data.len() as u32).unwrap();
+            assert_eq!(full, data, "全量解压不一致 filter={filter}");
+            for k in [0usize, 1, 0x3C, 5000, data.len() - 1, data.len()] {
+                let pre = decompress_prefix(filter, &packed, data.len() as u32, k).unwrap();
+                assert_eq!(pre.len(), k, "前缀长度不符 filter={filter} k={k}");
+                assert_eq!(pre, &full[..k], "前缀内容不符 filter={filter} k={k}");
+            }
+        }
     }
 }

@@ -807,6 +807,8 @@ export class Viewer {
     this.detectMirrorBones(); // 镜像骨检测需部件顶点（无部件时跳过，addPart 会重跑）
     this.setupSkirtRig(); // 裙摆防穿模点集（腿胶囊 + 裙片顶点）
     this.detectCloth();
+    this.setupChainAnchors(); // 链锚定随骨架重拟合：换骨架后部件仍在场时，
+    // addPart 时按旧骨架拟合的锚定必须作废（错锚会拉歪上身/裙片）
     this.diagnoseParts();
 
     this.applyFskelFrame(0, 0, 0);

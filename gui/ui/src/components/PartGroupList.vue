@@ -102,20 +102,27 @@ const props = defineProps<{ skin: SkinStore; dress?: DressStore }>();
 const replacedBy = (slot: string) => props.dress?.replacedBaseSlots[slot] ?? null;
 
 /** 独立组显示名：girl_head / boy_head 显示为「头」（保留" (附加)"等后缀） */
-const groupLabel = (g: PartGroup) => g.label.replace(/(?:girl|boy)_head/i, "头");
+const HEAD_RE = /(?:girl|boy)_head/i;
+const groupLabel = (g: PartGroup) => g.label.replace(HEAD_RE, "头");
 
-/** 渲染行：槽卡片在前（每个槽一张），其后独立组（跳过已并入槽的组） */
+/** 槽卡片固定身体顺序：头组置顶，其后 头发→上衣→下装→鞋子，其余独立组殿后 */
+const SLOT_ORDER = ["hair", "upper", "lower", "boot"];
+const slotRank = (s: string) => {
+  const i = SLOT_ORDER.indexOf(s);
+  return i === -1 ? SLOT_ORDER.length : i;
+};
 const rows = computed(() => {
   const groups = props.skin.modelSet?.groups ?? [];
-  const slots: string[] = [];
-  for (const g of groups) {
-    if (g.slot && !slots.includes(g.slot)) slots.push(g.slot);
-  }
+  const slots = [...new Set(groups.map((g) => g.slot).filter((s): s is string => !!s))].sort(
+    (a, b) => slotRank(a) - slotRank(b),
+  );
+  const independent = groups.filter((g) => !g.slot);
+  const head = independent.filter((g) => HEAD_RE.test(g.label));
+  const rest = independent.filter((g) => !HEAD_RE.test(g.label));
   return [
+    ...head.map((g) => ({ key: g.signature, slot: null as string | null, group: g as PartGroup | null })),
     ...slots.map((s) => ({ key: `slot:${s}`, slot: s, group: null as PartGroup | null })),
-    ...groups
-      .filter((g) => !g.slot)
-      .map((g) => ({ key: g.signature, slot: null, group: g as PartGroup | null })),
+    ...rest.map((g) => ({ key: g.signature, slot: null as string | null, group: g as PartGroup | null })),
   ];
 });
 

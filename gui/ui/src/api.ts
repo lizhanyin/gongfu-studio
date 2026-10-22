@@ -36,6 +36,8 @@ export const api = {
     invoke<string>("export_fskel_glb", { path, outPath }),
   // 资源浏览
   listResDir: (dir: string) => invoke<ResEntry[]>("list_res_dir", { dir }),
+  /** 目录配套的默认骨架（轻量，只列 act 目录）：整体预览装配前先换骨架用 */
+  dirDefaultFskel: (dir: string) => invoke<string | null>("dir_default_fskel", { dir }),
   // 资源导出 / 导入（src 支持磁盘与 cpk: 包内路径；导入目标仅磁盘目录）
   exportFile: (src: string, dest: string) => invoke<void>("export_file", { src, dest }),
   /** 模型导出（fskin/fsm/fak）：原样复制模型 + 材质关联纹理一并导出到同目录 */

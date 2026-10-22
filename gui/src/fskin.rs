@@ -529,6 +529,12 @@ pub struct ModelSet {
     pub textures: Vec<TexInfo>,
     /// 纹理切换槽（脸部纹理 / 饰品等），无对应资源时为空
     pub tex_slots: Vec<TexSlot>,
+    /// 目录配套的默认骨架（act\ 下按目录名关键词选，如 AvatarBoy →
+    /// act\boy.FSKEL）；前端整体预览据此同步骨架——部件 boneIndex 按
+    /// 各自骨架编号，模型目录必须与配套骨架一起加载（AvatarBoy 配
+    /// girl.FSKEL 会蒙皮错位渲染成女体）。无 act 目录时为 None
+    #[serde(default)]
+    pub default_fskel: Option<String>,
 }
 
 /// (path 是否为 root 的直接子文件, 相对目录)。path 由 vfs 以 root 为前缀拼出，
@@ -553,6 +559,25 @@ fn detect_slot(name_lower: &str) -> Option<&'static str> {
         .into_iter()
         .find(|(kw, _)| name_lower.contains(kw))
         .map(|(_, slot)| slot)
+}
+
+/// 目录配套的默认骨架：`act\` 下按目录名关键词（含 girl/boy）选取，
+/// 规则见 fskel::default_fskel_of。scan_model_set 与前端整体预览
+/// （dir_default_fskel 命令）共用；无 act 目录返回 None
+pub fn default_fskel_for_dir(dir: &str) -> Option<String> {
+    let lower_dir = dir
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let keyword = if lower_dir.contains("girl") {
+        "girl"
+    } else if lower_dir.contains("boy") {
+        "boy"
+    } else {
+        lower_dir.as_str()
+    };
+    crate::fskel::default_fskel_of(&vfs::join_vpath(dir, "act"), keyword)
 }
 
 /// 文件名去扩展名
@@ -712,6 +737,10 @@ pub fn scan_model_set(dir: &str) -> Result<ModelSet, String> {
         }
     }
 
+    // 配套默认骨架：act\ 下按目录名关键词选取（AvatarGirl → girl.FSKEL、
+    // AvatarBoy → boy.FSKEL；见 default_fskel_for_dir）
+    let default_fskel = default_fskel_for_dir(dir);
+
     Ok(ModelSet {
         root_dir: dir.to_string(),
         groups,
@@ -720,6 +749,7 @@ pub fn scan_model_set(dir: &str) -> Result<ModelSet, String> {
             .map(|(stem, path)| TexInfo { stem, path })
             .collect(),
         tex_slots,
+        default_fskel,
     })
 }
 
@@ -2297,6 +2327,23 @@ mod tests {
         assert!(m.materials.is_empty());
         let out = serialize_fskin(&m).unwrap();
         assert_eq!(bytes, out, "往返不一致");
+    }
+
+    /// scan_model_set 的配套默认骨架：AvatarGirl（act\girl.FSKEL，无数字且
+    /// 含 girl 关键词优先于带数字动作）；无 act 目录时为 None
+    #[test]
+    fn scan_model_set_default_fskel() {
+        let set = scan_model_set(ROOT).unwrap();
+        let fskel = set.default_fskel.expect("AvatarGirl 应有默认骨架");
+        assert!(
+            fskel.to_lowercase().ends_with("avatargirl\\act\\girl.fskel"),
+            "实际: {fskel}"
+        );
+        // 无 act 目录（Weapon/Jian）→ None
+        let weapon = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/system/Weapon/Jian");
+        if vfs::exists(weapon) {
+            assert!(scan_model_set(weapon).unwrap().default_fskel.is_none());
+        }
     }
 
     /// boneLocalPos 与顶点世界坐标应为同一刚体映射下的像（间距保持不变）。

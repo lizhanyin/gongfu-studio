@@ -228,7 +228,7 @@ async function rerenderViewport() {
     act.currentAction = action;
     return;
   }
-  skin.scan();
+  await scanWithSkeleton(skin.rootDir);
 }
 
 // ---------------- 预览路由 ----------------
@@ -277,7 +277,8 @@ async function previewEntry(e: ResEntry) {
       dress.close();
       fak.closeFak();
       fsm.closeFsm();
-      await skin.soloPreview(e.path);
+      // 单文件预览：骨架按其父目录配套选取
+      await scanWithSkeleton(e.path.replace(/[\\/][^\\/]*$/, ""), e.path);
       break;
     case "fskel":
       texPreview.value = null;
@@ -351,6 +352,26 @@ watch(
   }
 );
 
+/** skin.scan 装配与配套骨架切换，与装扮模式 loadBase 同时序：
+ *  卸旧部件 → 换配套骨架 → 装配新部件。顺序关键：部件 boneIndex 按各自
+ *  骨架编号（AvatarBoy 125 骨 ≠ AvatarGirl 135 骨），「新部件×旧骨架」的
+ *  中间态即使被 holdRender 冻结不可见，链锚定等检测也会拟合到错误数据上
+ *  并残留（曾致 AvatarBoy→AvatarGirl 后女体上身渲染异常）。全程 holdRender，
+ *  装配完成后一次性呈现 */
+async function scanWithSkeleton(dir: string, onlyPath?: string) {
+  viewer.value?.holdRender(true);
+  try {
+    const skel = await api.dirDefaultFskel(dir);
+    if (skel && (act.actMeta?.path ?? "").toLowerCase() !== skel.toLowerCase()) {
+      skin.unloadParts(); // 场景清空后换骨架（检测在空场景空转，不产生错拟合）
+      await act.openActFile(skel);
+    }
+    await skin.scan(dir, onlyPath);
+  } finally {
+    viewer.value?.holdRender(false);
+  }
+}
+
 /** 整体模型预览：含 .fak（怪物）或 .fsm（武器）的目录走对应网格，其余走 fskin 装配 */
 async function previewModelDir(dir: string) {
   texPreview.value = null;
@@ -372,7 +393,7 @@ async function previewModelDir(dir: string) {
   fak.closeFak();
   fsm.closeFsm();
   dress.close();
-  skin.scan(dir);
+  await scanWithSkeleton(dir);
 }
 
 /** fskin 叠加到当前场景并选中（不重建模型集） */
@@ -387,8 +408,8 @@ async function overlayAdd(e: ResEntry) {
 onMounted(async () => {
   // 视口实例与拾取接线由 ViewerHost 的 ready 回调负责
   res.init();
-  // 开箱默认进入角色装扮（资源根含 AvatarGirl/装备目录时），失败回落原整体预览
+  // 开箱默认进入角色装扮（资源根含 AvatarGirl/装备目录时），失败回落整体预览
   const ok = await dress.open(res.rootDir);
-  if (!ok) skin.scan();
+  if (!ok) await scanWithSkeleton(skin.rootDir);
 });
 </script>

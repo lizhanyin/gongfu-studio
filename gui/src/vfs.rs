@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -365,27 +365,113 @@ pub fn collect_tree(vroot: &str) -> Result<Vec<(String, String)>, String> {
 
 enum ReaderInner {
     File(fs::File),
-    Mem(Cursor<Vec<u8>>),
+    Cpk(CpkPrefixReader),
+}
+
+/// CPK 条目懒前缀读取器：读到哪解压到哪。
+/// 压缩块首次读取后缓存（跨前缀增长复用，不重复磁盘读），前缀解压
+/// 用 cpk::filter::decompress_prefix——轻量解析只取头部/子网格区时不再
+/// 整条目解压（NPC 下数百个 2MB 的 FAK 列举曾因此逐条解压 700MB 级数据）。
+struct CpkPrefixReader {
+    handle: Arc<PackHandle>,
+    /// entries 下标（读取压缩块时需要）
+    index: usize,
+    origin_len: usize,
+    /// 惰性读入的压缩块与过滤器编号
+    packed: Option<Vec<u8>>,
+    filter: u32,
+    /// 已解压前缀
+    decoded: Vec<u8>,
+    pos: usize,
+    /// 前缀无法再增长（流实际输出短于 origin_size），后续按 EOF 处理
+    exhausted: bool,
+}
+
+impl Read for CpkPrefixReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.exhausted || self.pos >= self.origin_len {
+            return Ok(0);
+        }
+        let need_end = (self.pos + buf.len()).min(self.origin_len);
+        if self.decoded.len() < need_end {
+            // 增长目标取"所需长度"与"现有两倍"的较大者：一次性大读不浪费，
+            // 逐段小读也只重解 O(总长)（倍增摊还）
+            let target = need_end
+                .max((self.decoded.len() * 2).min(self.origin_len))
+                .min(self.origin_len);
+            if self.packed.is_none() {
+                let entry = &self.handle.entries[self.index];
+                let (packed, filter) = self
+                    .handle
+                    .pack
+                    .lock()
+                    .unwrap()
+                    .read_packed(entry)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                self.packed = Some(packed);
+                self.filter = filter;
+            }
+            let grown = cpk::filter::decompress_prefix(
+                self.filter,
+                self.packed.as_deref().unwrap_or_default(),
+                self.origin_len as u32,
+                target,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            if grown.len() <= self.decoded.len() {
+                self.exhausted = true; // 解不出更长前缀：流已到头
+            } else {
+                self.decoded = grown;
+            }
+        }
+        let n = buf.len().min(self.decoded.len().saturating_sub(self.pos));
+        buf[..n].copy_from_slice(&self.decoded[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 /// 两种模式统一的顺序读取器：轻量解析只读头部、避免整读大文件；
-/// CPK 条目解压后整段驻留内存（资源文件普遍在百 KB 量级）。
+/// 磁盘模式直读文件，CPK 模式按需解压前缀（见 CpkPrefixReader）。
 pub struct VfsReader(ReaderInner);
 
 impl Read for VfsReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match &mut self.0 {
             ReaderInner::File(f) => f.read(buf),
-            ReaderInner::Mem(c) => c.read(buf),
+            ReaderInner::Cpk(r) => r.read(buf),
         }
     }
 }
 
 pub fn open_reader(vpath: &str) -> Result<VfsReader, String> {
     match split_cpk(vpath) {
-        Some((cpk_path, inner)) => Ok(VfsReader(ReaderInner::Mem(Cursor::new(read_cpk_entry(
-            &cpk_path, &inner,
-        )?)))),
+        Some((cpk_path, inner)) => {
+            let h = open_cpk(&cpk_path)?;
+            let key = inner.to_lowercase();
+            let index = h
+                .by_lower
+                .get(&key)
+                .copied()
+                .ok_or_else(|| format!("CPK 内文件不存在: {inner}"))?;
+            let origin_len = {
+                let entry = &h.entries[index];
+                if entry.is_dir {
+                    return Err(format!("CPK 内文件不存在: {inner}"));
+                }
+                entry.origin_size as usize
+            };
+            Ok(VfsReader(ReaderInner::Cpk(CpkPrefixReader {
+                handle: h,
+                index,
+                origin_len,
+                packed: None,
+                filter: cpk::filter::FILTER_CHANGELESS,
+                decoded: Vec::new(),
+                pos: 0,
+                exhausted: false,
+            })))
+        }
         None => {
             let f = fs::File::open(vpath).map_err(|e| format!("打开失败: {e}"))?;
             Ok(VfsReader(ReaderInner::File(f)))
@@ -488,7 +574,7 @@ mod tests {
         let from_cpk = read_file(&join_vpath(&root, rel)).unwrap();
         let from_disk = fs::read(format!("{RES}/system/{rel}")).unwrap();
         assert_eq!(from_cpk, from_disk);
-        // 前缀读取（reader 走 Cursor）
+        // 前缀读取（CPK 走懒前缀读取器）
         let mut r = open_reader(&join_vpath(&root, rel)).unwrap();
         let mut head = vec![0u8; 0x118];
         r.read_exact(&mut head).unwrap();
@@ -498,6 +584,46 @@ mod tests {
         assert_eq!(read_file(&upper).unwrap().len(), from_disk.len());
         assert!(exists(&join_vpath(&root, rel)));
         assert!(!exists(&join_vpath(&root, "AvatarGirl\\no_such.bin")));
+        let _ = fs::remove_dir_all(cpk_path.parent().unwrap());
+    }
+
+    /// CPK 懒前缀读取器：各种读取模式（一次大读 / 头+余段两段读 /
+    /// 逐字节读）结果都与 read_file 全量一致
+    #[test]
+    fn cpk_lazy_reader_matches_read_file() {
+        let cpk_path = build_system_cpk("lazy");
+        let root = vroot(&cpk_path);
+        let rel = "Monster\\G080\\G080.FAK";
+        let full = read_file(&join_vpath(&root, rel)).unwrap();
+        assert!(full.len() > 0x1000);
+
+        // 头部 + 余段两段读（light_stats 的 fak/fsm 模式）
+        let mut r = open_reader(&join_vpath(&root, rel)).unwrap();
+        let mut buf = vec![0u8; full.len()];
+        r.read_exact(&mut buf[..0x3C]).unwrap();
+        r.read_exact(&mut buf[0x3C..]).unwrap();
+        assert_eq!(buf, full, "两段读不一致");
+
+        // 逐字节读（倍增增长路径）
+        let mut r = open_reader(&join_vpath(&root, rel)).unwrap();
+        let mut byte_at_a_time = Vec::new();
+        let mut one = [0u8; 1];
+        for _ in 0..0x500 {
+            match r.read(&mut one).unwrap() {
+                0 => break,
+                _ => byte_at_a_time.push(one[0]),
+            }
+        }
+        assert_eq!(byte_at_a_time, full[..0x500.min(full.len())], "逐字节读不一致");
+
+        // 读越条目末尾：EOF 且不报错
+        let mut r = open_reader(&join_vpath(&root, rel)).unwrap();
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all, full, "read_to_end 不一致");
+
+        // 失败条目（不存在）报错口径不变
+        assert!(open_reader(&join_vpath(&root, "Monster\\G080\\no_such.bin")).is_err());
         let _ = fs::remove_dir_all(cpk_path.parent().unwrap());
     }
 

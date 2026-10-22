@@ -23,6 +23,7 @@ pub mod crc;
 pub mod error;
 pub mod filter;
 pub mod format;
+pub mod lzo;
 pub mod lzss;
 pub mod names;
 pub mod package;
@@ -108,6 +109,63 @@ mod tests {
         assert_eq!(removed, 1);
         let mut cpk = Cpk::open(&cpk_path).unwrap();
         assert!(cpk.entries().iter().all(|e| e.full_path != "rand.bin"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 前缀读取：read_file_prefix 各长度与 read_file 前缀一致；
+    /// read_packed 缓存压缩块 + filter::decompress_prefix 多次解前缀同样一致。
+    #[test]
+    fn read_file_prefix_matches_full() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join("cpk_prefix_test");
+        let _ = fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+
+        // 可压缩（LZO 有效）与不可压缩（大概率 Changeless/低压缩比）两种样本
+        let text = b"prefix reading, prefix reading, prefix reading! ".repeat(500);
+        let mut x = 0x2468ACE0u32;
+        let rand: Vec<u8> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        fs::write(src.join("text.bin"), &text).unwrap();
+        fs::write(src.join("rand.bin"), &rand).unwrap();
+
+        let cpk_path = dir.join("test.cpk");
+        let mut cpk = Cpk::create(&cpk_path, 64).unwrap();
+        cpk.add_path(&src, &AddOpts::default(), &mut |_, _, _| {})
+            .unwrap();
+        let mut cpk = Cpk::open(&cpk_path).unwrap();
+
+        for e in cpk.entries().iter().filter(|e| !e.is_dir) {
+            let full = cpk.read_file(e).unwrap();
+            assert_eq!(full.len(), e.origin_size as usize);
+            for k in [0usize, 1, 0x3C, 100, full.len() / 2, full.len().saturating_sub(1), full.len()] {
+                if k > full.len() {
+                    continue;
+                }
+                let pre = cpk.read_file_prefix(e, k).unwrap();
+                assert_eq!(pre.len(), k, "{} 前缀长度 {k}", e.full_path);
+                assert_eq!(pre, &full[..k], "{} 前缀内容 {k}", e.full_path);
+                // max_len 超过条目大小：钳到条目大小
+                let clamped = cpk.read_file_prefix(e, full.len() + 12345).unwrap();
+                assert_eq!(clamped, full, "{} 超长钳制", e.full_path);
+            }
+            // read_packed + decompress_prefix 组合（缓存压缩块多次解）
+            let (packed, filter) = cpk.read_packed(e).unwrap();
+            for k in [0x3Cusize, full.len()] {
+                let want = k.min(full.len());
+                let pre = filter::decompress_prefix(filter, &packed, e.origin_size, want).unwrap();
+                assert_eq!(pre, &full[..want], "{} packed 组合前缀 {want}", e.full_path);
+            }
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

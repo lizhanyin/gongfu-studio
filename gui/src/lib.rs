@@ -190,6 +190,14 @@ async fn list_res_dir(dir: String) -> Result<Vec<res::ResEntry>, String> {
     run_blocking(move || res::list_dir(&dir)).await
 }
 
+/// 目录配套的默认骨架（轻量：只列 act 目录，不做全量模型扫描）。
+/// 供前端整体预览在装配部件前先换骨架——部件装配与骨架必须配套，
+/// 且须先卸旧部件再换（检测状态随部件拟合，顺序见装扮模式 loadBase）
+#[tauri::command]
+async fn dir_default_fskel(dir: String) -> Result<Option<String>, String> {
+    run_blocking(move || Ok(fskin::default_fskel_for_dir(&dir))).await
+}
+
 // ---------------- 资源导出 / 导入 ----------------
 
 /// 导出单个资源文件到磁盘目标路径（CPK 包内文件同样可导出）
@@ -299,6 +307,7 @@ pub fn run() {
             load_fsm,
             save_fsm,
             list_res_dir,
+            dir_default_fskel,
             export_file,
             export_model,
             export_dir,

@@ -481,6 +481,31 @@ pub fn scan_dir(dir: &str) -> Result<Vec<FskelBrief>, String> {
     Ok(out)
 }
 
+/// act 目录的默认骨架：优先名称含基础模型关键词（girl/boy）且无数字的
+/// （girl.FSKEL / boy.FSKEL），其次无数字者，再按名称最短。
+/// 皮肤模式整体预览与装扮模式换基础模型共用（部件 boneIndex 按各自骨架
+/// 编号，模型目录与其配套骨架必须一起换）。
+pub fn default_fskel_of(act_dir: &str, keyword: &str) -> Option<String> {
+    let files = vfs::walk_files(act_dir, &["fskel"]);
+    files
+        .into_iter()
+        .min_by_key(|f| {
+            let stem = f
+                .name
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or(&f.name)
+                .to_lowercase();
+            let has_digit = stem.bytes().any(|b| b.is_ascii_digit());
+            (
+                !(stem.contains(keyword) && !has_digit),
+                has_digit,
+                stem.len(),
+            )
+        })
+        .map(|f| f.path)
+}
+
 // ---------------------------------------------------------------- 四元数工具
 
 fn quat_normalize(q: [f32; 4]) -> [f32; 4] {

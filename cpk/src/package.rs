@@ -13,7 +13,7 @@ use md5::{Digest, Md5};
 
 use crate::crc::{crc32, crc_of_path};
 use crate::error::{Error, Result};
-use crate::filter;
+use crate::filter::{self, FILTER_CHANGELESS};
 use crate::format::{
     filter_id, is_live, make_flag, COMPRESS_SIZE, CPK_LABEL, CPK_VERSION, EXTRA_INFO_SIZE,
     FileExtraInfo, Header, HEADER_SIZE, LEN_OF_STRING_END, TABLE_ADD, TABLE_ENTRY_SIZE, FLAG_DIR,
@@ -391,6 +391,51 @@ impl Cpk {
         }
         let te = self.table[e.index];
         self.read_entry_data(&te)
+    }
+
+    /// 读出条目前 `max_len` 字节（自动钳到条目原始大小）。
+    /// 未压缩条目（Changeless / 大文件标志）只读所需长度，磁盘 I/O 同步省下；
+    /// 压缩条目读整个压缩块后只解压前缀（LZO/LZSS 均为流式编码，
+    /// 见 filter::decompress_prefix）。供只取文件头的轻量解析使用。
+    pub fn read_file_prefix(&mut self, e: &Entry, max_len: usize) -> Result<Vec<u8>> {
+        if e.is_dir {
+            return Ok(Vec::new());
+        }
+        let te = self.table[e.index];
+        let want = max_len.min(te.origin_size as usize);
+        if te.flag & FLAG_LARGE != 0 || filter_id(te.flag) == FILTER_CHANGELESS {
+            let mut raw = vec![0u8; want];
+            if want > 0 {
+                self.read_exact_at(te.start_pos as u64, &mut raw)?;
+            }
+            return Ok(raw);
+        }
+        let (packed, filter) = self.read_packed_entry(&te)?;
+        filter::decompress_prefix(filter, &packed, te.origin_size, want)
+    }
+
+    /// 读出条目的压缩数据块与过滤器编号（大文件标志视为 Changeless 直通，
+    /// 返回的编号统一可直接喂给 filter::decompress / decompress_prefix）。
+    /// 供调用方缓存压缩块、多次解不同长度前缀，避免重复磁盘读。
+    pub fn read_packed(&mut self, e: &Entry) -> Result<(Vec<u8>, u32)> {
+        if e.is_dir {
+            return Ok((Vec::new(), FILTER_CHANGELESS));
+        }
+        let te = self.table[e.index];
+        self.read_packed_entry(&te)
+    }
+
+    fn read_packed_entry(&mut self, e: &TableEntry) -> Result<(Vec<u8>, u32)> {
+        let mut raw = vec![0u8; e.packed_size as usize];
+        if e.packed_size > 0 {
+            self.read_exact_at(e.start_pos as u64, &mut raw)?;
+        }
+        let filter = if e.flag & FLAG_LARGE != 0 {
+            FILTER_CHANGELESS
+        } else {
+            filter_id(e.flag)
+        };
+        Ok((raw, filter))
     }
 
     fn read_entry_data(&mut self, e: &TableEntry) -> Result<Vec<u8>> {

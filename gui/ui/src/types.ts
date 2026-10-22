@@ -110,6 +110,10 @@ export interface ModelSet {
   textures: TexInfo[];
   /** 纹理切换槽（脸部纹理 / 饰品等） */
   texSlots: TexSlot[];
+  /** 目录配套的默认骨架（act\ 下按目录名关键词选，如 AvatarBoy →
+   *  act\boy.FSKEL）；整体预览据此同步骨架（部件 boneIndex 按各自骨架
+   *  编号，配错骨架会蒙皮错位），无 act 目录为 null */
+  defaultFskel: string | null;
 }
 
 // ---------------- 角色装扮 ----------------
