@@ -21,7 +21,8 @@ interface CloneVert {
 interface PartObj {
   mesh: THREE.Mesh;
   geom: THREE.BufferGeometry;
-  mat: THREE.MeshStandardMaterial;
+  /** 每子网格一个材质（几何按 groups 划分；单网格部件长度为 1） */
+  mats: THREE.MeshStandardMaterial[];
   model: FskinModel;
   /** 跨缝拆分产生的副本顶点，编辑顶点时需同步 */
   clones: CloneVert[];
@@ -448,7 +449,12 @@ export class Viewer {
     return t;
   }
 
-  addPart(path: string, model: FskinModel, tex: TexData | null, texFile: string | null) {
+  addPart(
+    path: string,
+    model: FskinModel,
+    texes: (TexData | null)[],
+    texFiles: (string | null)[]
+  ) {
     if (this.parts.has(path)) this.removePart(path);
 
     const n = model.vertices.length;
@@ -498,7 +504,14 @@ export class Viewer {
 
     // 跨缝拆分：手臂等条带 UV 环绕 u=0/1 接缝（引擎用重复寻址）。
     // 三角形两端的顶点分处缝两侧时插值会横穿整张纹理，需复制顶点把 UV 归一到同侧。
-    const tri = model.triangles.slice();
+    // 多子网格：各节三角形按序拼接为一个索引流，groups 记录每节的区间给材质分组。
+    const tri: number[] = [];
+    const groupRanges: Array<[number, number]> = [];
+    for (const s of model.submeshes) {
+      const start = tri.length;
+      for (const t of s.triangles) tri.push(t);
+      if (tri.length > start) groupRanges.push([start, tri.length - start]);
+    }
     for (let k = 0; k < tri.length; k += 3) {
       const ia = tri[k], ib = tri[k + 1], ic = tri[k + 2];
       const us = [uv[ia * 2], uv[ib * 2], uv[ic * 2]];
@@ -533,27 +546,42 @@ export class Viewer {
     geom.setAttribute("color2", new THREE.BufferAttribute(Float32Array.from(uvCol), 3));
     geom.setIndex(tri);
 
-    const mat = new THREE.MeshStandardMaterial({
-      side: THREE.DoubleSide,
-      roughness: 0.75,
-      metalness: 0.0,
-      vertexColors: false,
+    // 每子网格一个材质（护甲类多节网格各有贴图），groups 对应拼接区间
+    const mats: THREE.MeshStandardMaterial[] = model.submeshes.map((_s, k) => {
+      const mat = new THREE.MeshStandardMaterial({
+        side: THREE.DoubleSide,
+        roughness: 0.75,
+        metalness: 0.0,
+        vertexColors: false,
+      });
+      const tex = texes[k] ?? null;
+      const texFile = texFiles[k] ?? null;
+      if (tex && texFile) {
+        mat.map = this.getTexture(texFile, tex);
+        (mat as any).customColorAttribute = "color";
+      }
+      const md = model.materials[k];
+      if (md) {
+        mat.color.setRGB(md.diffuse[0], md.diffuse[1], md.diffuse[2]);
+        mat.emissive.setRGB(md.emissive[0], md.emissive[1], md.emissive[2]);
+      }
+      return mat;
     });
-    if (tex && texFile) {
-      mat.map = this.getTexture(texFile, tex);
-      const anyMat = mat as any;
-      anyMat.customColorAttribute = "color";
+    if (!mats.length) {
+      // 理论上不出现（无节网格）：给个空材质兜底
+      mats.push(new THREE.MeshStandardMaterial({ side: THREE.DoubleSide }));
     }
-    const m = model.material;
-    mat.color.setRGB(m.diffuse[0], m.diffuse[1], m.diffuse[2]);
-    mat.emissive.setRGB(m.emissive[0], m.emissive[1], m.emissive[2]);
+    for (let k = 0; k < groupRanges.length; k++) {
+      const [start, count] = groupRanges[k];
+      geom.addGroup(start, count, Math.min(k, mats.length - 1));
+    }
 
-    const mesh = new THREE.Mesh(geom, mat);
+    const mesh = new THREE.Mesh(geom, mats);
     mesh.userData.path = path;
     mesh.frustumCulled = false; // CPU 蒙皮逐帧变形，静态包围球不可靠
     this.modelRoot.add(mesh);
     const part: PartObj = {
-      mesh, geom, mat, model, clones, overlayMesh: null, overlayMat: null,
+      mesh, geom, mats, model, clones, overlayMesh: null, overlayMat: null,
       inflOf, srcNrm: Float32Array.from(srcNrm),
       skinned: this.skelBones.length > 0,
     };
@@ -579,7 +607,7 @@ export class Viewer {
     this.removeOverlay(p);
     this.modelRoot.remove(p.mesh);
     p.geom.dispose();
-    p.mat.dispose();
+    for (const m of p.mats) m.dispose();
     this.parts.delete(path);
     if (this.skelBones.length) {
       this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
@@ -603,26 +631,32 @@ export class Viewer {
 
   private applyMode(mode: RenderMode) {
     for (const p of this.parts.values()) {
-      if (mode === "shaded") {
-        p.mat.vertexColors = false;
-        const m = p.model.material;
-        p.mat.color.setRGB(m.diffuse[0], m.diffuse[1], m.diffuse[2]);
-        p.mat.emissive.setRGB(m.emissive[0], m.emissive[1], m.emissive[2]);
-      } else {
-        p.mat.vertexColors = true;
+      p.mats.forEach((mat, k) => {
+        const md = p.model.materials[k];
+        if (mode === "shaded") {
+          mat.vertexColors = false;
+          if (md) {
+            mat.color.setRGB(md.diffuse[0], md.diffuse[1], md.diffuse[2]);
+            mat.emissive.setRGB(md.emissive[0], md.emissive[1], md.emissive[2]);
+          }
+        } else {
+          mat.vertexColors = true;
+          mat.color.setRGB(1, 1, 1);
+          mat.emissive.setRGB(0, 0, 0);
+        }
+        mat.needsUpdate = true;
+      });
+      if (mode !== "shaded") {
         p.geom.setAttribute(
           "color",
           p.geom.getAttribute(mode === "bones" ? "color" : "color2")
         );
-        p.mat.color.setRGB(1, 1, 1);
-        p.mat.emissive.setRGB(0, 0, 0);
       }
-      p.mat.needsUpdate = true;
     }
   }
 
   setWireframe(on: boolean) {
-    for (const p of this.parts.values()) p.mat.wireframe = on;
+    for (const p of this.parts.values()) for (const m of p.mats) m.wireframe = on;
     for (const m of this.fakMats) m.wireframe = on;
     for (const m of this.fsmMats) m.wireframe = on;
   }
@@ -631,9 +665,12 @@ export class Viewer {
   highlight(path: string | null) {
     for (const [k, p] of this.parts) {
       const sel = path === null || k === path;
-      p.mat.transparent = !sel;
-      p.mat.opacity = sel ? 1.0 : 0.28;
-      p.mat.depthWrite = true;
+      for (const m of p.mats) {
+        m.transparent = !sel;
+        m.opacity = sel ? 1.0 : 0.28;
+        m.depthWrite = true;
+        m.needsUpdate = true;
+      }
       if (p.overlayMat) {
         p.overlayMat.opacity = sel ? 1.0 : 0.28;
         p.overlayMat.needsUpdate = true;
@@ -644,12 +681,15 @@ export class Viewer {
   applyMaterial(path: string) {
     const p = this.parts.get(path);
     if (!p) return;
-    const m = p.model.material;
-    if (this.mode === "shaded") {
-      p.mat.color.setRGB(m.diffuse[0], m.diffuse[1], m.diffuse[2]);
-      p.mat.emissive.setRGB(m.emissive[0], m.emissive[1], m.emissive[2]);
-    }
-    p.mat.roughness = Math.max(0.05, Math.min(1, 1 - m.specPower / 60));
+    p.mats.forEach((mat, k) => {
+      const md = p.model.materials[k];
+      if (!md) return;
+      if (this.mode === "shaded") {
+        mat.color.setRGB(md.diffuse[0], md.diffuse[1], md.diffuse[2]);
+        mat.emissive.setRGB(md.emissive[0], md.emissive[1], md.emissive[2]);
+      }
+      mat.roughness = Math.max(0.05, Math.min(1, 1 - md.specPower / 60));
+    });
   }
 
   /** 顶点编辑后同步几何（含跨缝拆分的副本顶点） */
@@ -681,18 +721,21 @@ export class Viewer {
     if (p.skinned) this.skinPart(p);
   }
 
+  /** 换主贴图：多子网格时替换首槽（配色族切换语义针对主材质） */
   refreshTexture(path: string, tex: TexData, texFile: string) {
     const p = this.parts.get(path);
-    if (!p) return;
-    p.mat.map = this.getTexture(texFile, tex);
-    p.mat.needsUpdate = true;
+    if (!p || !p.mats.length) return;
+    p.mats[0].map = this.getTexture(texFile, tex);
+    p.mats[0].needsUpdate = true;
   }
 
   clearTexture(path: string) {
     const p = this.parts.get(path);
     if (!p) return;
-    p.mat.map = null;
-    p.mat.needsUpdate = true;
+    for (const m of p.mats) {
+      m.map = null;
+      m.needsUpdate = true;
+    }
   }
 
   // ---------------- FSKEL 骨架 ----------------
@@ -2910,13 +2953,15 @@ export class Viewer {
       uv[i * 2 + 1] = model.vertices[b + 7];
     }
 
-    model.submeshes.forEach((s, i) => {
+    model.submeshes.forEach((s) => {
       const geom = new THREE.BufferGeometry();
       geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
       geom.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
       geom.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
       geom.setIndex(s.triangles);
-      const fm = model.materials[Math.min(i, model.materials.length - 1)];
+      // 材质按记录自带序号（c30 两节共用材质 0；序号即材质下标）
+      const matIdx = Math.min(s.index, model.materials.length - 1);
+      const fm = model.materials[matIdx];
       const mat = new THREE.MeshStandardMaterial({
         side: THREE.DoubleSide,
         roughness: 0.75,
@@ -2927,7 +2972,7 @@ export class Viewer {
         mat.emissive.setRGB(fm.emissive[0], fm.emissive[1], fm.emissive[2]);
         mat.roughness = Math.max(0.05, Math.min(1, 1 - fm.specPower / 60));
       }
-      const m = mats[i];
+      const m = mats[matIdx];
       if (m?.tex && m.file) mat.map = this.getTexture(m.file, m.tex);
       const mesh = new THREE.Mesh(geom, mat);
       this.modelRoot.add(mesh);
@@ -3058,7 +3103,7 @@ export class Viewer {
     this.ro.disconnect();
     for (const p of this.parts.values()) {
       p.geom.dispose();
-      p.mat.dispose();
+      for (const m of p.mats) m.dispose();
     }
     for (const t of this.texCache.values()) t.dispose();
     this.controls.dispose();

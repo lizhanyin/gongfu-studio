@@ -2,6 +2,7 @@ import { computed, reactive, ref, watch, type ShallowRef } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { FskinModel, ModelSet, PartGroup, PartInfo, TexSlot, TexVariant } from "../types";
+import { trianglesOf } from "../types";
 import { texDataFromDto } from "../tex";
 import type { TexData, Viewer } from "../viewer";
 import { message } from "../message";
@@ -77,7 +78,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   const texPreviewUrl = computed(() => {
     const m = selectedModel.value;
     if (!m) return null;
-    const file = resolveTexture(m.material.texturePath);
+    const file = resolveTexture(m.materials[0]?.texturePath ?? "");
     if (!file) return null;
     const d = texCache.get(file);
     if (!d) return null;
@@ -94,7 +95,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   const texInfoText = computed(() => {
     const m = selectedModel.value;
     if (!m) return "";
-    const file = resolveTexture(m.material.texturePath);
+    const file = resolveTexture(m.materials[0]?.texturePath ?? "");
     const d = file ? texCache.get(file) : null;
     return d ? `${d.width}×${d.height} · ${shortName(file!)}` : file ? `${shortName(file)} (未加载)` : "目录中未找到匹配贴图";
   });
@@ -104,7 +105,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     const v = viewer.value;
     if (!m || !v) return;
     afterEdit();
-    const file = resolveTexture(m.material.texturePath);
+    const file = resolveTexture(m.materials[0]?.texturePath ?? "");
     if (file) {
       const d = await ensureTexture(file);
       if (d) v.refreshTexture(m.path, d, file);
@@ -146,8 +147,9 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     }
     v.refreshTexture(slot.part, tex, path);
     const m = loaded.get(slot.part);
-    if (m) {
-      m.material.texturePath = gameTexPath(path);
+    const md = m?.materials[0];
+    if (m && md) {
+      md.texturePath = gameTexPath(path);
       afterEdit();
       v.applyMaterial(slot.part);
     }
@@ -158,7 +160,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     const m = selectedModel.value;
     const set = modelSet.value;
     if (!m || !set) return [];
-    const file = resolveTexture(m.material.texturePath);
+    const file = resolveTexture(m.materials[0]?.texturePath ?? "");
     if (!file) return [];
     const stem = (file.split(/[\\/]/).pop() ?? "").replace(/\.[^.]*$/, "").toLowerCase();
     const i = stem.lastIndexOf("_");
@@ -174,14 +176,14 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   const partTexCurrent = computed<string | null>(() => {
     const m = selectedModel.value;
     if (!m || !partTexVariants.value.length) return null;
-    const file = resolveTexture(m.material.texturePath);
+    const file = resolveTexture(m.materials[0]?.texturePath ?? "");
     if (!file) return null;
     const stem = (file.split(/[\\/]/).pop() ?? "").replace(/\.[^.]*$/, "").toLowerCase();
     const i = stem.lastIndexOf("_");
     return i > 0 ? stem.slice(i + 1) : null;
   });
 
-  /** 应用部件配色（发型颜色等）：替换材质贴图 */
+  /** 应用部件配色（发型颜色等）：替换主材质贴图 */
   async function applyPartTexture(path: string) {
     const m = selectedModel.value;
     const v = viewer.value;
@@ -189,7 +191,8 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     const tex = await ensureTexture(path);
     if (!tex) return;
     v.refreshTexture(m.path, tex, path);
-    m.material.texturePath = gameTexPath(path);
+    const md = m.materials[0];
+    if (md) md.texturePath = gameTexPath(path);
     afterEdit();
     v.applyMaterial(m.path);
   }
@@ -212,9 +215,15 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     if (!v || v.has(path)) return;
     const m = await ensureLoaded(path);
     if (!m) return;
-    const file = m.material.texturePath ? resolveTexture(m.material.texturePath) : null;
-    const tex = file ? await ensureTexture(file) : null;
-    v.addPart(path, m, tex, file);
+    // 每材质槽各自解析贴图（护甲类多子网格各有贴图；特效网格无材质）
+    const texes: (TexData | null)[] = [];
+    const files: (string | null)[] = [];
+    for (const md of m.materials) {
+      const file = md.texturePath ? resolveTexture(md.texturePath) : null;
+      files.push(file);
+      texes.push(file ? await ensureTexture(file) : null);
+    }
+    v.addPart(path, m, texes, files);
   }
 
   function toggleGroup(g: PartGroup, on: boolean) {
@@ -471,7 +480,10 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   });
   const statTris = computed(() => {
     let n = 0;
-    for (const p of visiblePaths.value) n += (loaded.get(p)?.triangles.length ?? 0) / 3;
+    for (const p of visiblePaths.value) {
+      const m = loaded.get(p);
+      if (m) n += trianglesOf(m).length / 3;
+    }
     return n;
   });
 

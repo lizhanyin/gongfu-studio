@@ -1,5 +1,5 @@
-import { reactive, ref } from "vue";
-import { open } from "@tauri-apps/plugin-dialog";
+import { computed, reactive, ref } from "vue";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { ResEntry } from "../types";
 import { message } from "../message";
@@ -104,6 +104,48 @@ export function useResourceTree() {
     return list.filter((e) => e.isDir).map(toNode);
   }
 
+  // ---------- 导出 / 导入（树与网格右键共用） ----------
+
+  /** 是否 CPK 包浏览模式（包内目录只读，不支持导入） */
+  const isCpk = computed(() => rootDir.value.startsWith("cpk:"));
+
+  /** 导出单个资源文件（CPK 包内文件同样可导出） */
+  async function exportFile(path: string, name: string) {
+    const dest = await save({ defaultPath: name });
+    if (!dest) return;
+    try {
+      await api.exportFile(path, dest);
+      message.success(`已导出: ${name}`);
+    } catch (e) {
+      message.error(`导出失败: ${e}`);
+    }
+  }
+
+  /** 递归导出目录（磁盘目录 / CPK 包内子树）到选择的位置 */
+  async function exportDir(path: string) {
+    const dest = await open({ directory: true, title: "选择导出位置" });
+    if (!dest) return;
+    try {
+      const out = await api.exportDir(path, dest);
+      message.success(out);
+    } catch (e) {
+      message.error(`导出失败: ${e}`);
+    }
+  }
+
+  /** 导入磁盘文件到目录（同名覆盖）；导入的是当前浏览目录时刷新网格 */
+  async function importToDir(dir: string) {
+    const src = await open({ multiple: false, title: "选择要导入的文件" });
+    if (!src) return;
+    try {
+      const dest = await api.importFile(src, dir);
+      message.success(`已导入: ${shortName(dest)}`);
+      if (currentDir.value === dir) await selectDir(dir);
+    } catch (e) {
+      message.error(`导入失败: ${e}`);
+    }
+  }
+
   return reactive({
     rootDir,
     treeData,
@@ -118,6 +160,10 @@ export function useResourceTree() {
     refreshRoot: init,
     selectDir,
     loadChildren,
+    isCpk,
+    exportFile,
+    exportDir,
+    importToDir,
   });
 }
 

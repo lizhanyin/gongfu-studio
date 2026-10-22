@@ -55,7 +55,7 @@ fn light_stats(e: &vfs::VfsEntry, kind: &str) -> (Option<u32>, Option<u32>, Opti
         "fskin" => match vfs::read_file(&e.path).ok().and_then(|b| fskin::parse_fskin(&e.path, &b).ok()) {
             Some(m) => (
                 Some(m.vertices.len() as u32),
-                Some((m.triangles.len() / 3) as u32),
+                Some(m.triangle_count() as u32),
                 None,
                 None,
             ),

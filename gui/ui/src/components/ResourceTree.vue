@@ -29,9 +29,10 @@
 
 <script setup lang="ts">
 import { computed, h, nextTick, ref } from "vue";
-import type { TreeOption } from "naive-ui";
+import type { DropdownOption, TreeOption } from "naive-ui";
 import type { ResourceTreeStore } from "../composables/useResourceTree";
 import { message } from "../message";
+import { copyText, shortName } from "../utils";
 
 const props = defineProps<{ tree: ResourceTreeStore }>();
 const emit = defineEmits<{ (e: "previewModel", path: string): void }>();
@@ -59,11 +60,14 @@ const menuX = ref(0);
 const menuY = ref(0);
 const menuNode = ref<TreeOption | null>(null);
 
-const menuOptions = computed(() => {
+const menuOptions = computed<DropdownOption[]>(() => {
   const o = menuNode.value;
   if (!o) return [];
-  const opts: { key: string; label: string }[] = [{ key: "show", label: "在下方显示内容" }];
+  const opts: DropdownOption[] = [{ key: "show", label: "在下方显示内容" }];
   if (o.isModel) opts.unshift({ key: "model", label: "整体预览模型" });
+  opts.push({ type: "divider" }, { key: "export", label: "导出文件" });
+  if (!props.tree.isCpk) opts.push({ key: "import", label: "导入文件" });
+  opts.push({ key: "copyname", label: "复制文件名" });
   return opts;
 });
 
@@ -82,12 +86,20 @@ function nodeProps({ option }: { option: TreeOption }) {
   };
 }
 
-function onMenuSelect(key: string | number) {
+async function onMenuSelect(key: string | number) {
   const p = String(menuNode.value?.key ?? "");
   menuShow.value = false;
   if (!p) return;
   if (key === "model") emit("previewModel", p);
   else if (key === "show") props.tree.selectDir(p);
+  else if (key === "export") props.tree.exportDir(p);
+  else if (key === "import") props.tree.importToDir(p);
+  else if (key === "copyname") {
+    const name = shortName(p); // 根节点 label 带 "📦 …（CPK）" 装饰，取路径最后一段
+    (await copyText(name))
+      ? message.success(`已复制: ${name}`)
+      : message.error("复制失败");
+  }
 }
 
 /** 模型目录徽标 */

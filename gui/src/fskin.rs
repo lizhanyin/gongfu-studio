@@ -10,12 +10,24 @@
 //!   法线/uv 为加载时静态拷贝（蒙皮循环只写位置三分量）。
 //!
 //!   0x00 "SKIN" | 0x04 版本 | 0x08 顶点数 | 0x0C 顶点偏移(恒0x138)
-//!   0x10 1 | 0x14 索引区偏移 | 0x18 1 | 0x1C 材质区偏移
+//!   0x10 索引节数 | 0x14 索引区偏移 | 0x18 材质数 | 0x1C 材质区偏移
 //!   0x20 bbox max/min 各3个f32 | 0x38..0x138 保留256字节
 //!   顶点记录(变长): [pos3][normal3][uv2][影响数n][n×(骨骼u32+权重f32+骨骼局部坐标3f32)]
-//!   索引区: 小头 + 三角形数 + u16索引×3n + 填充
-//!   材质区: f32头 + diffuse/ambient/emissive/specular 各4f32 + 高光强度
-//!           + 3字节前缀 + 纹理路径 + 尾部填充
+//!
+//! 多子网格（2026-10 对 system.cpk 全量 578 个 fskin 实测归纳，护甲类
+//! Armonr 98/126 为多节，节数 1..8）：
+//!   索引区 = 索引节数 × 节。节 k:
+//!     [节号k<<16 u32][0 u16][顶点数 u16][24B 附加数据][三角形数 u32]
+//!     + 三角形数×3 × u16 索引 + 固定 20B 零填充
+//!   （附加数据 24B 在 girl 系列为 pad/hash 全零，FS01 节0 含 0xa0，
+//!    其余节可见浮点/索引状数据，语义未定，按原样保留；FK55 类特效
+//!    网格节头为 0xffff0000/-1，同为原样保留）
+//!   材质区 = 材质数 × 0x46C(1132)B 固定槽。槽 k:
+//!     [槽号k u32][diffuse/ambient/emissive/specular 各4f32][高光强度f32]
+//!     [3字节前缀][纹理路径\0][零填充至槽尾]
+//!   文件总长 = 材质区偏移 + 材质数 × 0x46C（材质数可为 0，如 FK55
+//!   Bip01 Footsteps01 特效网格：9 顶点 0 影响，索引区直接终结于文件尾）。
+//!   顶点影响数实测上限 15（解析上限放宽到 32 防损坏数据）。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,6 +35,12 @@ use std::collections::BTreeMap;
 use crate::vfs;
 
 pub const VERTEX_OFFSET: usize = 0x138;
+/// 顶点影响数解析上限（全量实测最大 15，防损坏数据走飞）
+pub const INFLUENCE_MAX: u32 = 32;
+/// 索引节尾部固定零填充
+pub const SECTION_PAD: usize = 20;
+/// 材质槽固定长度
+pub const MATERIAL_SLOT: usize = 0x46C;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -44,7 +62,8 @@ pub struct Vertex {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Material {
-    pub lead: f32,
+    /// 材质槽序号（多材质时 = 槽下标；单材质文件为 0）
+    pub lead: u32,
     pub diffuse: [f32; 4],
     pub ambient: [f32; 4],
     pub emissive: [f32; 4],
@@ -52,22 +71,22 @@ pub struct Material {
     pub spec_power: f32,
     pub pre: [u8; 3],
     pub texture_path: String,
+    /// 槽内路径终止符之后的填充（原样保留保证往返一致）
     pub tail: Vec<u8>,
 }
 
-/// 索引区里语义未定的字段，按原样保留保证往返一致
+/// 一个索引节 = 一个子网格。节头除三角形数外的字段语义未定，按原样保留。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct IndexMeta {
+pub struct FskinSubmesh {
+    /// 节号<<16（FK55 类无材质特效网格为 0xffff0000）
     pub zero1: u32,
     pub zero2: u16,
     pub vertex_count2: u16,
-    pub pad4: [u16; 4],
-    pub hash1: u32,
-    pub hash2: u32,
-    pub one1: u32,
-    pub one2: u32,
-    pub pad_tail: Vec<u8>,
+    /// 24B 附加数据（旧版解析器的 pad4/hash1/hash2/one1/one2 视角）
+    pub misc: [u32; 6],
+    /// 扁平 u16 索引，每 3 个为一个三角形
+    pub triangles: Vec<u16>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -79,10 +98,25 @@ pub struct FskinModel {
     pub bbox_min: [f32; 3],
     pub reserved256: Vec<u8>,
     pub vertices: Vec<Vertex>,
-    /// 扁平 u16 索引，每 3 个为一个三角形
-    pub triangles: Vec<u16>,
-    pub index_meta: IndexMeta,
-    pub material: Material,
+    /// 索引节（子网格），与 materials 逐槽对应
+    pub submeshes: Vec<FskinSubmesh>,
+    /// 材质槽（可为空，如 FK55 特效网格）
+    pub materials: Vec<Material>,
+}
+
+impl FskinModel {
+    /// 全部子网格三角形拼接（渲染 / 导出用的合并视图）
+    pub fn triangles_merged(&self) -> Vec<u16> {
+        self.submeshes
+            .iter()
+            .flat_map(|s| s.triangles.iter().copied())
+            .collect()
+    }
+
+    /// 三角形总数
+    pub fn triangle_count(&self) -> usize {
+        self.submeshes.iter().map(|s| s.triangles.len() / 3).sum()
+    }
 }
 
 struct Reader<'a> {
@@ -130,9 +164,9 @@ pub fn parse_fskin(path: &str, bytes: &[u8]) -> Result<FskinModel, String> {
     let version = rh.u32()?;
     let vertex_count = rh.u32()? as usize;
     let vertex_off = rh.u32()? as usize;
-    rh.skip(4)?; // 索引区数量 = 1
+    let index_count = rh.u32()? as usize;
     let index_off = rh.u32()? as usize;
-    rh.skip(4)?; // 材质数量 = 1
+    let material_count = rh.u32()? as usize;
     let material_off = rh.u32()? as usize;
     let mut bbox_max = [0f32; 3];
     let mut bbox_min = [0f32; 3];
@@ -144,6 +178,9 @@ pub fn parse_fskin(path: &str, bytes: &[u8]) -> Result<FskinModel, String> {
     }
     if vertex_off != VERTEX_OFFSET {
         return Err(format!("异常的顶点偏移 0x{vertex_off:x}"));
+    }
+    if material_off < index_off || material_off > bytes.len() {
+        return Err(format!("异常的材质区偏移 0x{material_off:x}"));
     }
     let reserved256 = bytes[0x38..VERTEX_OFFSET].to_vec();
 
@@ -159,7 +196,7 @@ pub fn parse_fskin(path: &str, bytes: &[u8]) -> Result<FskinModel, String> {
             *v = r.f32()?;
         }
         let n = r.u32()?;
-        if n > 8 {
+        if n > INFLUENCE_MAX {
             return Err(format!("非法影响骨骼数 {} @0x{:x}", n, r.pos - 4));
         }
         let mut influences = Vec::with_capacity(n as usize);
@@ -187,71 +224,80 @@ pub fn parse_fskin(path: &str, bytes: &[u8]) -> Result<FskinModel, String> {
         return Err("顶点区长度与索引区偏移不吻合".into());
     }
 
-    // ---- 索引区 ----
-    let zero1 = r.u32()?;
-    let zero2 = r.u16()?;
-    let vertex_count2 = r.u16()?;
-    let mut pad4 = [0u16; 4];
-    for v in &mut pad4 {
-        *v = r.u16()?;
-    }
-    let hash1 = r.u32()?;
-    let hash2 = r.u32()?;
-    let one1 = r.u32()?;
-    let one2 = r.u32()?;
-    let tri_count = r.u32()? as usize;
-    let mut triangles = Vec::with_capacity(tri_count * 3);
-    for _ in 0..tri_count * 3 {
-        triangles.push(r.u16()?);
-    }
-    let pad_tail = bytes[r.pos..material_off].to_vec();
-
-    // ---- 材质区 ----
-    r.pos = material_off;
-    let lead = r.f32()?;
-    let read4 = |r: &mut Reader| -> Result<[f32; 4], String> {
-        let mut a = [0f32; 4];
-        for v in a.iter_mut() {
-            *v = r.f32()?;
+    // ---- 索引区：index_count 个节（子网格），每节 36B 头 + 索引 + 20B 零填充 ----
+    let mut submeshes = Vec::with_capacity(index_count);
+    for k in 0..index_count {
+        if r.pos + 36 > material_off {
+            return Err(format!("索引节 {k} 头越界 @0x{:x}", r.pos));
         }
-        Ok(a)
-    };
-    let diffuse = read4(&mut r)?;
-    let ambient = read4(&mut r)?;
-    let emissive = read4(&mut r)?;
-    let specular = read4(&mut r)?;
-    let spec_power = r.f32()?;
-    let pre: [u8; 3] = [r.take(1)?[0], r.take(1)?[0], r.take(1)?[0]];
-    let p_start = r.pos;
-    let p_end = bytes[p_start..]
-        .iter()
-        .position(|&c| c == 0)
-        .ok_or("纹理路径未终止")?
-        + p_start;
-    let texture_path = String::from_utf8_lossy(&bytes[p_start..p_end]).into_owned();
-    r.pos = p_end + 1;
-    let tail = bytes[r.pos..].to_vec();
-
-    Ok(FskinModel {
-        path: path.to_string(),
-        version,
-        bbox_max,
-        bbox_min,
-        reserved256,
-        vertices,
-        triangles,
-        index_meta: IndexMeta {
+        let zero1 = r.u32()?;
+        let zero2 = r.u16()?;
+        let vertex_count2 = r.u16()?;
+        let mut misc = [0u32; 6];
+        for v in &mut misc {
+            *v = r.u32()?;
+        }
+        let tri_count = r.u32()? as usize;
+        if r.pos + tri_count * 6 + SECTION_PAD > material_off {
+            return Err(format!(
+                "索引节 {k} 数据越界: {tri_count} 三角形 @0x{:x}",
+                r.pos - 4
+            ));
+        }
+        let mut triangles = Vec::with_capacity(tri_count * 3);
+        for _ in 0..tri_count * 3 {
+            triangles.push(r.u16()?);
+        }
+        let _pad = r.take(SECTION_PAD)?;
+        submeshes.push(FskinSubmesh {
             zero1,
             zero2,
             vertex_count2,
-            pad4,
-            hash1,
-            hash2,
-            one1,
-            one2,
-            pad_tail,
-        },
-        material: Material {
+            misc,
+            triangles,
+        });
+    }
+    if r.pos != material_off {
+        return Err("索引区长度与材质区偏移不吻合".into());
+    }
+
+    // ---- 材质区：material_count 个 0x46C 固定槽，文件总长须精确吻合 ----
+    let slot_end = material_off.checked_add(material_count * MATERIAL_SLOT).ok_or("材质槽数溢出")?;
+    if bytes.len() != slot_end {
+        return Err(format!(
+            "文件长度 {:#x} 与材质槽不吻合（期望 {slot_end:#x}，材质数 {material_count}）",
+            bytes.len()
+        ));
+    }
+    let mut materials = Vec::with_capacity(material_count);
+    for _ in 0..material_count {
+        let slot_start = r.pos;
+        let slot_limit = slot_start + MATERIAL_SLOT;
+        let lead = r.u32()?;
+        let read4 = |r: &mut Reader| -> Result<[f32; 4], String> {
+            let mut a = [0f32; 4];
+            for v in a.iter_mut() {
+                *v = r.f32()?;
+            }
+            Ok(a)
+        };
+        let diffuse = read4(&mut r)?;
+        let ambient = read4(&mut r)?;
+        let emissive = read4(&mut r)?;
+        let specular = read4(&mut r)?;
+        let spec_power = r.f32()?;
+        let pre: [u8; 3] = [r.take(1)?[0], r.take(1)?[0], r.take(1)?[0]];
+        let p_start = r.pos;
+        let p_end = bytes[p_start..slot_limit]
+            .iter()
+            .position(|&c| c == 0)
+            .ok_or("纹理路径未终止")?
+            + p_start;
+        let texture_path = decode_path(&bytes[p_start..p_end]);
+        r.pos = p_end + 1;
+        let tail = bytes[r.pos..slot_limit].to_vec();
+        r.pos = slot_limit;
+        materials.push(Material {
             lead,
             diffuse,
             ambient,
@@ -261,7 +307,18 @@ pub fn parse_fskin(path: &str, bytes: &[u8]) -> Result<FskinModel, String> {
             pre,
             texture_path,
             tail,
-        },
+        });
+    }
+
+    Ok(FskinModel {
+        path: path.to_string(),
+        version,
+        bbox_max,
+        bbox_min,
+        reserved256,
+        vertices,
+        submeshes,
+        materials,
     })
 }
 
@@ -273,6 +330,27 @@ fn push_u16(out: &mut Vec<u8>, v: u16) {
 }
 fn push_f32(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+/// 纹理路径按 GBK 解码（游戏资源含中文路径，如 袖256.tga）；
+/// ASCII 路径不受影响；GBK 亦无法解码的乱码字节退化为 UTF-8 有损替换。
+pub(crate) fn decode_path(bytes: &[u8]) -> String {
+    let (s, _, err) = encoding_rs::GBK.decode(bytes);
+    if err {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        s.into_owned()
+    }
+}
+
+/// decode_path 的逆：字符串编码回 GBK 字节；无法映射的字符退化为 UTF-8 字节
+pub(crate) fn encode_path(s: &str) -> Vec<u8> {
+    let (b, _, err) = encoding_rs::GBK.encode(s);
+    if err {
+        s.as_bytes().to_vec()
+    } else {
+        b.into_owned()
+    }
 }
 
 /// 重新序列化。未修改的模型可字节级还原原文件（见 roundtrip 测试）。
@@ -300,47 +378,52 @@ pub fn serialize_fskin(m: &FskinModel) -> Result<Vec<u8>, String> {
         return Err("顶点区过大".into());
     }
 
-    // 索引区
-    let im = &m.index_meta;
-    if m.triangles.len() % 3 != 0 {
-        return Err("三角形索引数不是 3 的倍数".into());
-    }
+    // 索引区：每节 36B 头 + 索引 + 20B 零填充
     let mut ibuf = Vec::new();
-    push_u32(&mut ibuf, im.zero1);
-    push_u16(&mut ibuf, im.zero2);
-    push_u16(&mut ibuf, m.vertices.len().min(u16::MAX as usize) as u16);
-    for v in im.pad4.iter() {
-        push_u16(&mut ibuf, *v);
+    for s in &m.submeshes {
+        if s.triangles.len() % 3 != 0 {
+            return Err("三角形索引数不是 3 的倍数".into());
+        }
+        push_u32(&mut ibuf, s.zero1);
+        push_u16(&mut ibuf, s.zero2);
+        push_u16(&mut ibuf, m.vertices.len().min(u16::MAX as usize) as u16);
+        for v in s.misc.iter() {
+            push_u32(&mut ibuf, *v);
+        }
+        push_u32(&mut ibuf, (s.triangles.len() / 3) as u32);
+        for t in &s.triangles {
+            push_u16(&mut ibuf, *t);
+        }
+        ibuf.extend_from_slice(&[0u8; SECTION_PAD]);
     }
-    push_u32(&mut ibuf, im.hash1);
-    push_u32(&mut ibuf, im.hash2);
-    push_u32(&mut ibuf, im.one1);
-    push_u32(&mut ibuf, im.one2);
-    push_u32(&mut ibuf, (m.triangles.len() / 3) as u32);
-    for t in &m.triangles {
-        push_u16(&mut ibuf, *t);
-    }
-    ibuf.extend_from_slice(&im.pad_tail);
     let material_off = index_off + ibuf.len();
 
-    // 材质区
-    let mat = &m.material;
+    // 材质区：每材质一个 0x46C 固定槽
     let mut mbuf = Vec::new();
-    push_f32(&mut mbuf, mat.lead);
-    for arr in [mat.diffuse, mat.ambient, mat.emissive, mat.specular] {
-        for x in arr {
-            push_f32(&mut mbuf, x);
+    for mat in &m.materials {
+        let slot_start = mbuf.len();
+        push_u32(&mut mbuf, mat.lead);
+        for arr in [mat.diffuse, mat.ambient, mat.emissive, mat.specular] {
+            for x in arr {
+                push_f32(&mut mbuf, x);
+            }
+        }
+        push_f32(&mut mbuf, mat.spec_power);
+        mbuf.extend_from_slice(&mat.pre);
+        let path_bytes = encode_path(&mat.texture_path);
+        if path_bytes.contains(&0u8) {
+            return Err("纹理路径含非法字符".into());
+        }
+        mbuf.extend_from_slice(&path_bytes);
+        mbuf.push(0);
+        mbuf.extend_from_slice(&mat.tail);
+        let written = mbuf.len() - slot_start;
+        if written != MATERIAL_SLOT {
+            return Err(format!(
+                "材质槽长度异常: 实际 {written} 字节（应为 {MATERIAL_SLOT}），纹理路径或尾部填充被改动"
+            ));
         }
     }
-    push_f32(&mut mbuf, mat.spec_power);
-    mbuf.extend_from_slice(&mat.pre);
-    let path_bytes = mat.texture_path.as_bytes();
-    if path_bytes.contains(&0u8) {
-        return Err("纹理路径含非法字符".into());
-    }
-    mbuf.extend_from_slice(path_bytes);
-    mbuf.push(0);
-    mbuf.extend_from_slice(&mat.tail);
 
     // 头部
     let mut out = Vec::with_capacity(material_off + mbuf.len());
@@ -348,9 +431,9 @@ pub fn serialize_fskin(m: &FskinModel) -> Result<Vec<u8>, String> {
     push_u32(&mut out, m.version);
     push_u32(&mut out, m.vertices.len() as u32);
     push_u32(&mut out, VERTEX_OFFSET as u32);
-    push_u32(&mut out, 1);
+    push_u32(&mut out, m.submeshes.len() as u32);
     push_u32(&mut out, index_off as u32);
-    push_u32(&mut out, 1);
+    push_u32(&mut out, m.materials.len() as u32);
     push_u32(&mut out, material_off as u32);
     for x in m.bbox_max.iter() {
         push_f32(&mut out, *x);
@@ -497,12 +580,15 @@ pub fn scan_model_set(dir: &str) -> Result<ModelSet, String> {
     let mut sigs = Vec::new();
     for f in &files {
         let bytes = vfs::read_file(&f.path).map_err(|e| format!("读取 {}: {e}", f.path))?;
-        let m = parse_fskin(&f.path, &bytes)?;
-        // 几何签名: 顶点数 + 索引区偏移（变长顶点记录总长），相同即为同一网格的换装变体
-        sigs.push(format!("{}_{}", m.vertices.len(), m.triangles.len()));
-        let tex_file = m
-            .material
-            .texture_path
+        let m = parse_fskin(&f.path, &bytes).map_err(|e| format!("{}: {e}", f.name))?;
+        // 几何签名: 顶点数 + 三角形总数（变长顶点记录总长），相同即为同一网格的换装变体
+        sigs.push(format!("{}_{}", m.vertices.len(), m.triangle_count()));
+        let texture_path = m
+            .materials
+            .first()
+            .map(|s| s.texture_path.clone())
+            .unwrap_or_default();
+        let tex_file = texture_path
             .rsplit(['\\', '/'])
             .next()
             .and_then(|base| base.rsplit_once('.').map(|(stem, _)| stem.to_lowercase()))
@@ -521,10 +607,10 @@ pub fn scan_model_set(dir: &str) -> Result<ModelSet, String> {
             rel_dir,
             in_root,
             vertex_count: m.vertices.len(),
-            triangle_count: m.triangles.len() / 3,
+            triangle_count: m.triangle_count(),
             bbox_min: m.bbox_min,
             bbox_max: m.bbox_max,
-            texture_path: m.material.texture_path.clone(),
+            texture_path,
             texture_file: tex_file,
             bones,
         });
@@ -1291,7 +1377,7 @@ mod tests {
             let sy = |y: f32| ((mxy - y) / (mxy - mny) * (h as f32 - 1.0)).round() as usize;
             for (m, pts, ch, center) in layers {
                 let _ = center;
-                let idx = &m.triangles;
+                let idx = m.triangles_merged();
                 for t in idx.chunks(3) {
                     let (a, b, c) = (pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]);
                     // 重心采样填充
@@ -2140,12 +2226,77 @@ mod tests {
         };
         let m = parse_fskin(&p, &bytes).unwrap();
         assert_eq!(m.vertices.len(), 198);
-        assert_eq!(m.triangles.len(), 864);
-        assert_eq!(m.material.texture_path, r"system\avatargirl\NvZhuJue_Boot.tga");
+        assert_eq!(m.triangles_merged().len(), 864);
+        assert_eq!(m.materials[0].texture_path, r"system\avatargirl\NvZhuJue_Boot.tga");
         for v in &m.vertices {
             let w: f32 = v.influences.iter().map(|i| i.weight).sum();
             assert!((w - 1.0).abs() < 0.01, "权重和异常 {w}");
         }
+    }
+
+    /// 多子网格护甲（Armonr）：多索引节 + 多材质槽 + 高影响数顶点。
+    /// FS36 含 9..13 影响的顶点——旧版 n>8 上限曾把这类文件整个目录扫描卡死
+    /// （报错不带文件名，难定位）。FS61 为 6 节 6 材质且含 GBK 中文纹理路径
+    /// （袖256.tga，from_utf8_lossy 会破坏往返）。均须字节级往返。
+    #[test]
+    fn multi_section_roundtrip() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/system/Armonr");
+        // (文件, 节数, 材质数, 最大影响数下限)
+        let cases = [
+            ("FS01_Upper.fskin", 2usize, 2usize, 4usize),
+            ("FS36_Upper.fskin", 2, 2, 13),
+            ("FS61_Upper.fskin", 6, 6, 1),
+        ];
+        for (name, secs, mats, infl) in cases {
+            let p = format!("{dir}\\{name}");
+            let Ok(bytes) = fs::read(&p) else {
+                eprintln!("跳过: {p} 不存在");
+                return;
+            };
+            let m = parse_fskin(&p, &bytes).unwrap();
+            assert_eq!(m.submeshes.len(), secs, "{name} 节数");
+            assert_eq!(m.materials.len(), mats, "{name} 材质数");
+            let nmax = m.vertices.iter().map(|v| v.influences.len()).max().unwrap();
+            assert!(nmax >= infl, "{name} 最大影响数 {nmax} 应 >= {infl}");
+            for (k, s) in m.submeshes.iter().enumerate() {
+                assert_eq!(s.zero1 >> 16, k as u32, "{name} 节{k} 节号");
+                assert_eq!(s.vertex_count2 as usize, m.vertices.len(), "{name} 节{k} 顶点数");
+            }
+            // 材质槽序号与纹理路径非空
+            for (k, mat) in m.materials.iter().enumerate() {
+                assert_eq!(mat.lead, k as u32, "{name} 材质{k} 槽号");
+                assert!(!mat.texture_path.is_empty(), "{name} 材质{k} 路径");
+            }
+            if name.starts_with("FS61") {
+                // GBK 中文路径解码后应为 Unicode 文本
+                assert!(m.materials[5].texture_path.contains("袖"), "GBK 路径解码异常");
+            }
+            let out = serialize_fskin(&m).unwrap();
+            assert_eq!(bytes, out, "{name} 往返不一致");
+        }
+    }
+
+    /// 零材质特效网格（FK55 Bip01 Footsteps01）：全部顶点 0 影响、无材质槽，
+    /// 索引区直接终结于文件尾，节头为 0xffff0000 标记。
+    #[test]
+    fn zero_material_mesh() {
+        let p = format!(
+            "{}\\..\\res\\system\\Lower\\FK55_Bip01 Footsteps01.fskin",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let Ok(bytes) = fs::read(&p) else {
+            eprintln!("跳过: {p} 不存在");
+            return;
+        };
+        let m = parse_fskin(&p, &bytes).unwrap();
+        assert_eq!(m.vertices.len(), 9);
+        assert!(m.vertices.iter().all(|v| v.influences.is_empty()));
+        assert_eq!(m.submeshes.len(), 1);
+        assert_eq!(m.submeshes[0].zero1, 0xffff_0000);
+        assert_eq!(m.submeshes[0].triangles.len(), 8 * 3);
+        assert!(m.materials.is_empty());
+        let out = serialize_fskin(&m).unwrap();
+        assert_eq!(bytes, out, "往返不一致");
     }
 
     /// boneLocalPos 与顶点世界坐标应为同一刚体映射下的像（间距保持不变）。

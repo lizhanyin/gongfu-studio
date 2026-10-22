@@ -12,6 +12,7 @@ export interface Vertex {
 }
 
 export interface Material {
+  /** 材质槽序号（多材质 = 槽下标） */
   lead: number;
   diffuse: number[];
   ambient: number[];
@@ -23,16 +24,16 @@ export interface Material {
   tail: number[];
 }
 
-export interface IndexMeta {
+/** 索引节 = 子网格，与 materials 槽一一对应 */
+export interface FskinSubmesh {
+  /** 节号<<16（零材质特效网格为 0xffff0000） */
   zero1: number;
   zero2: number;
   vertexCount2: number;
-  pad4: number[];
-  hash1: number;
-  hash2: number;
-  one1: number;
-  one2: number;
-  padTail: number[];
+  /** 24B 附加数据（语义未定，原样保留） */
+  misc: number[];
+  /** 扁平索引，每 3 个一个三角形 */
+  triangles: number[];
 }
 
 export interface FskinModel {
@@ -42,9 +43,21 @@ export interface FskinModel {
   bboxMin: number[];
   reserved256: number[];
   vertices: Vertex[];
-  triangles: number[];
-  indexMeta: IndexMeta;
-  material: Material;
+  submeshes: FskinSubmesh[];
+  /** 材质槽（可为空，如特效网格） */
+  materials: Material[];
+}
+
+/** 合并视图：全部子网格三角形拼接 */
+export function trianglesOf(m: FskinModel): number[] {
+  const out: number[] = [];
+  for (const s of m.submeshes) out.push(...s.triangles);
+  return out;
+}
+
+/** 主材质：多材质取首槽，无材质返回 null */
+export function primaryMaterial(m: FskinModel): Material | null {
+  return m.materials[0] ?? null;
 }
 
 export interface PartInfo {
@@ -196,8 +209,23 @@ export interface FakModel {
 }
 
 /** FSM 子网格/材质记录与 FAK 逐字节同构（见 gui/src/fsm.rs） */
-export type FsmSubmesh = FakSubmesh;
 export type FsmMaterial = FakMaterial;
+
+/** FSM 子网格：头字段为 [基地址][序号][?][顶点数]；triangles 已是共享池全局索引 */
+export interface FsmSubmesh {
+  index: number;
+  /** 该节顶点段在共享池中的起始下标（文件内索引的基地址） */
+  baseVertex: number;
+  /** 语义未定的 u16 0 */
+  pad: number;
+  /** 该节顶点数（共享池子集） */
+  vertexCount: number;
+  bboxMax: number[];
+  bboxMin: number[];
+  /** 扁平 u16 索引，每 3 个一个三角形 */
+  triangles: number[];
+  tail: number[];
+}
 
 export interface FsmDummy {
   /** 定长 4 字节名（GE2/GE1/F02/F01） */

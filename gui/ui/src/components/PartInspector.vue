@@ -11,63 +11,71 @@
     </div>
     <n-tabs type="line" size="small" default-value="material">
       <n-tab-pane name="material" tab="材质">
-        <div class="form-row">
-          <label>漫反射</label>
-          <n-color-picker
-            style="flex: 1"
-            :modes="['rgb']"
-            :show-alpha="true"
-            :value="rgbaStr(model.material.diffuse)"
-            @update:value="(v: string) => skin.setColor(model!.material.diffuse, v)"
-          />
-        </div>
-        <div class="form-row">
-          <label>环境光</label>
-          <n-color-picker
-            style="flex: 1"
-            :modes="['rgb']"
-            :show-alpha="true"
-            :value="rgbaStr(model.material.ambient)"
-            @update:value="(v: string) => skin.setColor(model!.material.ambient, v)"
-          />
-        </div>
-        <div class="form-row">
-          <label>自发光</label>
-          <n-color-picker
-            style="flex: 1"
-            :modes="['rgb']"
-            :show-alpha="true"
-            :value="rgbaStr(model.material.emissive)"
-            @update:value="(v: string) => skin.setColor(model!.material.emissive, v)"
-          />
-        </div>
-        <div class="form-row">
-          <label>高光色</label>
-          <n-color-picker
-            style="flex: 1"
-            :modes="['rgb']"
-            :show-alpha="true"
-            :value="rgbaStr(model.material.specular)"
-            @update:value="(v: string) => skin.setColor(model!.material.specular, v)"
-          />
-        </div>
-        <div class="form-row">
-          <label>高光强度</label>
-          <n-input-number
-            size="small"
-            style="flex: 1"
-            :value="model.material.specPower"
-            @update:value="(v: number | null) => { model!.material.specPower = v ?? 0; skin.afterEdit(); }"
-          />
-        </div>
-        <div class="form-row">
-          <label>纹理路径</label>
-          <n-input
-            size="small"
-            style="flex: 1"
-            :value="model.material.texturePath"
-            @update:value="(v: string) => { model!.material.texturePath = v; }"
-          />
+        <template v-if="!model.materials.length">
+          <div class="kv">本网格无材质槽（特效网格）。</div>
+        </template>
+        <div v-for="(mat, mi) in model.materials" :key="mi" class="mat-block">
+          <div v-if="model.materials.length > 1" class="kv" style="margin-bottom: 4px">
+            <b>子网格 {{ mi }}</b> · {{ mat.texturePath }}
+          </div>
+          <div class="form-row">
+            <label>漫反射</label>
+            <n-color-picker
+              style="flex: 1"
+              :modes="['rgb']"
+              :show-alpha="true"
+              :value="rgbaStr(mat.diffuse)"
+              @update:value="(v: string) => skin.setColor(mat.diffuse, v)"
+            />
+          </div>
+          <div class="form-row">
+            <label>环境光</label>
+            <n-color-picker
+              style="flex: 1"
+              :modes="['rgb']"
+              :show-alpha="true"
+              :value="rgbaStr(mat.ambient)"
+              @update:value="(v: string) => skin.setColor(mat.ambient, v)"
+            />
+          </div>
+          <div class="form-row">
+            <label>自发光</label>
+            <n-color-picker
+              style="flex: 1"
+              :modes="['rgb']"
+              :show-alpha="true"
+              :value="rgbaStr(mat.emissive)"
+              @update:value="(v: string) => skin.setColor(mat.emissive, v)"
+            />
+          </div>
+          <div class="form-row">
+            <label>高光色</label>
+            <n-color-picker
+              style="flex: 1"
+              :modes="['rgb']"
+              :show-alpha="true"
+              :value="rgbaStr(mat.specular)"
+              @update:value="(v: string) => skin.setColor(mat.specular, v)"
+            />
+          </div>
+          <div class="form-row">
+            <label>高光强度</label>
+            <n-input-number
+              size="small"
+              style="flex: 1"
+              :value="mat.specPower"
+              @update:value="(v: number | null) => { mat.specPower = v ?? 0; skin.afterEdit(); }"
+            />
+          </div>
+          <div class="form-row">
+            <label>纹理路径</label>
+            <n-input
+              size="small"
+              style="flex: 1"
+              :value="mat.texturePath"
+              @update:value="(v: string) => { mat.texturePath = v; }"
+            />
+          </div>
         </div>
         <n-button size="small" @click="skin.applyTexture" style="margin-bottom: 10px">
           应用纹理（按文件名匹配目录内贴图）
@@ -96,11 +104,12 @@
           <b>路径:</b> {{ model.path }}<br />
           <b>版本:</b> 0x{{ model.version.toString(16) }}<br />
           <b>顶点:</b> {{ model.vertices.length }} ·
-          <b>三角形:</b> {{ model.triangles.length / 3 }}<br />
+          <b>三角形:</b> {{ triCount }}（{{ model.submeshes.length }} 子网格）<br />
           <b>包围盒 max:</b> {{ fmt3(model.bboxMax) }}<br />
           <b>包围盒 min:</b> {{ fmt3(model.bboxMin) }}<br />
-          <b>哈希1:</b> 0x{{ (model.indexMeta.hash1 >>> 0).toString(16) }} ·
-          <b>哈希2:</b> 0x{{ (model.indexMeta.hash2 >>> 0).toString(16) }}
+          <template v-if="model.submeshes[0]">
+            <b>节0附加:</b> {{ model.submeshes[0].misc.map((v: number) => (v >>> 0).toString(16)).join(" ") }}
+          </template>
         </div>
         <n-space style="margin-top: 10px">
           <n-button size="small" @click="skin.recomputeBbox">按顶点重算包围盒</n-button>
@@ -121,6 +130,10 @@ import { shortName } from "../utils";
 const props = defineProps<{ skin: SkinStore }>();
 
 const model = computed(() => props.skin.selectedModel);
+
+const triCount = computed(() =>
+  model.value ? model.value.submeshes.reduce((s, x) => s + x.triangles.length / 3, 0) : 0
+);
 
 const fmt3 = (a: number[]) => a.map((v) => v.toFixed(1)).join(", ");
 
@@ -170,3 +183,11 @@ const vertexColumns = [
   },
 ];
 </script>
+
+<style scoped>
+.mat-block + .mat-block {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(128, 128, 128, 0.35);
+}
+</style>

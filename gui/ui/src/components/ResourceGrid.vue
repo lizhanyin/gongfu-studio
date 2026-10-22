@@ -54,6 +54,8 @@ import { computed, nextTick, ref } from "vue";
 import type { DropdownOption } from "naive-ui";
 import type { ResourceTreeStore } from "../composables/useResourceTree";
 import type { ResEntry } from "../types";
+import { copyText } from "../utils";
+import { message } from "../message";
 
 const props = defineProps<{ tree: ResourceTreeStore }>();
 const emit = defineEmits<{
@@ -133,10 +135,14 @@ const menuOptions = computed<DropdownOption[]>(() => {
   if (e.isDir) {
     if (e.isModel) opts.push({ key: "model", label: "整体预览模型" });
     opts.push({ key: "enter", label: "进入目录" });
+    opts.push({ type: "divider" }, { key: "export", label: "导出文件" });
+    if (!props.tree.isCpk) opts.push({ key: "import", label: "导入文件" });
   } else {
     opts.push({ key: "preview", label: "预览" });
     if (e.kind === "fskin") opts.push({ key: "add", label: "叠加到当前场景" });
+    opts.push({ type: "divider" }, { key: "export", label: "导出文件" });
   }
+  opts.push({ key: "copyname", label: "复制文件名" });
   return opts;
 });
 
@@ -151,7 +157,7 @@ function onCtx(ev: MouseEvent, e: ResEntry) {
   });
 }
 
-function onMenuSelect(key: string | number) {
+async function onMenuSelect(key: string | number) {
   const e = menuEntry.value;
   menuShow.value = false;
   if (!e) return;
@@ -159,5 +165,14 @@ function onMenuSelect(key: string | number) {
   else if (key === "enter") emit("openDir", e.path);
   else if (key === "preview") emit("preview", e);
   else if (key === "add") emit("overlayAdd", e);
+  else if (key === "export") {
+    if (e.isDir) props.tree.exportDir(e.path);
+    else props.tree.exportFile(e.path, e.name);
+  } else if (key === "import") props.tree.importToDir(e.path);
+  else if (key === "copyname") {
+    (await copyText(e.name))
+      ? message.success(`已复制: ${e.name}`)
+      : message.error("复制失败");
+  }
 }
 </script>

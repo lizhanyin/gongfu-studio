@@ -8,9 +8,13 @@
 //!   顶点区 ×N×32B: [pos3][normal3][uv2]，法线未归一化（0.86~1.68）
 //!   子网格区 ×N: 与 FAK 完全同款 [u16 0][u16 序号][u16 0][u16 顶点数]
 //!                [bbox max3][bbox min3][u32 三角形数][u16 索引×3n][20字节0填充]
-//!   材质区 ×N: 等分至挂点区，每条: [u32 序号][diffuse/ambient/emissive/specular
+//!                （顶点数 = 该节使用的共享池子集，多节武器如 MM20/c30
+//!                 各节小于全池，单节文件等于全池）
+//!   材质区 ×N: 等分至挂点区（全量 531 样本实测恒 0x46C/条，与 FSKIN 材质
+//!            槽同宽），每条: [u32 序号][diffuse/ambient/emissive/specular
 //!            各4f32][f32 高光强度][3字节前缀][NUL结尾路径][0填充]
 //!   挂点区: [u32 数量][记录×36B]: [名4B NUL结尾][f32×7][00 CC CC CC 尾]
+//!           数量可为 0（帽类 FM01 等 233/532 样本），此时区域仅剩数量字段
 //!   挂点 f32×7 前 3 个为位置（J01: GE2(0,-20,0)柄尾 / F02(0,11.06,0)护手 /
 //!   F01(0,104.3,0)近剑尖 / GE1(0,150,0)超出剑尖的特效点），后 4 个疑似
 //!   四元数，但 GE1 第 4 分量为 30 不合法，语义待游戏内验证
@@ -31,13 +35,20 @@ const HEADER_LEN: usize = 0x44;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct FsmSubmesh {
-    /// 记录头 [u16 0][u16 序号] 中的序号
+    /// 记录头 [u16 基地址][u16 序号][u16 ?0][u16 顶点数] 中的序号，
+    /// 通常逐节递增且等于材质序号；c30 等多节共材质文件两节同为 0
     pub index: u16,
-    /// 记录头里语义未定的两个 u16 0，按原样保留保证往返一致
-    pub pad: [u16; 2],
+    /// 该节顶点段在共享池中的起始下标（文件内三角形索引的基地址，
+    /// c30 节1 为 33；单节文件为 0）
+    pub base_vertex: u16,
+    /// 记录头里语义未定的 u16 0，按原样保留保证往返一致
+    pub pad: u16,
+    /// 该节顶点数：共享池的子集（单节文件等于全池）
+    pub vertex_count: u16,
     pub bbox_max: [f32; 3],
     pub bbox_min: [f32; 3],
-    /// 扁平 u16 索引，每 3 个为一个三角形，引用共享顶点池
+    /// 扁平 u16 索引，每 3 个为一个三角形。文件内为节内局部索引，
+    /// 解析时已加 baseVertex 转为共享池全局索引；序列化时减回
     pub triangles: Vec<u16>,
     /// 记录尾填充（原样保留）
     pub tail: Vec<u8>,
@@ -180,19 +191,18 @@ pub fn parse_fsm(path: &str, bytes: &[u8]) -> Result<FsmModel, String> {
         vertices.push(v);
     }
 
-    // ---- 子网格区：与 FAK 同款记录 ----
+    // ---- 子网格区：与 FAK 同款记录，但头 4×u16 为
+    // [基地址][序号][?0][该节顶点数]，索引为节内局部（加基地址成全局）
     let mut submeshes = Vec::with_capacity(submesh_count);
     for i in 0..submesh_count {
-        let pad_a = r.u16()?;
+        let base_vertex = r.u16()?;
         let index = r.u16()?;
-        let pad_b = r.u16()?;
+        let pad = r.u16()?;
         let vc = r.u16()?;
-        if index != i as u16 {
-            return Err(format!("子网格序号跳变: 期望 {i} 实际 {index} @0x{:x}", r.pos - 6));
-        }
-        if vc as u32 != vertex_count {
+        if base_vertex as u32 + vc as u32 > vertex_count {
             return Err(format!(
-                "子网格顶点数 {vc} 与头部 {vertex_count} 不符 @0x{:x}",
+                "子网格 {i} 顶点段 [{base_vertex}, {}) 超出共享池 {vertex_count} @0x{:x}",
+                base_vertex as u32 + vc as u32,
                 r.pos - 2
             ));
         }
@@ -207,16 +217,21 @@ pub fn parse_fsm(path: &str, bytes: &[u8]) -> Result<FsmModel, String> {
         let tri_count = r.u32()? as usize;
         let mut triangles = Vec::with_capacity(tri_count * 3);
         for _ in 0..tri_count * 3 {
-            let idx = r.u16()?;
-            if idx as u32 >= vertex_count {
-                return Err(format!("子网格 {i} 索引 {idx} 越界（顶点数 {vertex_count}）"));
+            let local = r.u16()? as u32;
+            let global = base_vertex as u32 + local;
+            if global >= vertex_count {
+                return Err(format!(
+                    "子网格 {i} 局部索引 {local}+{base_vertex} 越界（顶点池 {vertex_count}）"
+                ));
             }
-            triangles.push(idx);
+            triangles.push(global as u16);
         }
         let tail = r.take(SUBMESH_TAIL)?.to_vec();
         submeshes.push(FsmSubmesh {
             index,
-            pad: [pad_a, pad_b],
+            base_vertex,
+            pad,
+            vertex_count: vc,
             bbox_max,
             bbox_min,
             triangles,
@@ -268,7 +283,7 @@ pub fn parse_fsm(path: &str, bytes: &[u8]) -> Result<FsmModel, String> {
             .position(|&c| c == 0)
             .map(|p| r.pos + p)
             .ok_or("纹理路径未终止")?;
-        let texture_path = String::from_utf8_lossy(&bytes[r.pos..p_end]).into_owned();
+        let texture_path = crate::fskin::decode_path(&bytes[r.pos..p_end]);
         r.pos = p_end + 1;
         let tail = bytes[r.pos..rec_end].to_vec();
         // 对齐到记录末尾（等长记录的固定填充）
@@ -292,7 +307,8 @@ pub fn parse_fsm(path: &str, bytes: &[u8]) -> Result<FsmModel, String> {
         ));
     }
 
-    // ---- 挂点区：[u32 数量][记录 ×N] ----
+    // ---- 挂点区：[u32 数量][记录 ×N]。数量可为 0（帽类等 44% 样本），
+    // 此时区域仅剩数量字段本身，无任何记录。
     let cnt = r.u32()?;
     if cnt as usize != dummy_count {
         return Err(format!(
@@ -301,12 +317,20 @@ pub fn parse_fsm(path: &str, bytes: &[u8]) -> Result<FsmModel, String> {
         ));
     }
     let rest = bytes.len() - r.pos;
-    if rest % dummy_count != 0 || rest / dummy_count < 32 {
+    if dummy_count == 0 {
+        if rest != 0 {
+            return Err(format!("挂点数为 0 但挂点区残留 {rest} 字节"));
+        }
+    } else if rest % dummy_count != 0 || rest / dummy_count < 32 {
         return Err(format!(
             "挂点区 {rest} 字节不能被 {dummy_count} 条合法记录整除（最少 32B/条）"
         ));
     }
-    let drec = rest / dummy_count;
+    let drec = if dummy_count == 0 {
+        32
+    } else {
+        rest / dummy_count
+    };
     let mut dummies = Vec::with_capacity(dummy_count);
     for _ in 0..dummy_count {
         let name_raw = r.take(4)?;
@@ -366,16 +390,20 @@ pub fn serialize_fsm(m: &FsmModel) -> Result<Vec<u8>, String> {
         if s.tail.len() != SUBMESH_TAIL {
             return Err("子网格尾部填充长度异常".into());
         }
-        push_u16(&mut sbuf, s.pad[0]);
+        push_u16(&mut sbuf, s.base_vertex);
         push_u16(&mut sbuf, s.index);
-        push_u16(&mut sbuf, s.pad[1]);
-        push_u16(&mut sbuf, m.vertex_count.min(u16::MAX as u32) as u16);
+        push_u16(&mut sbuf, s.pad);
+        push_u16(&mut sbuf, s.vertex_count);
         for x in s.bbox_max.iter().chain(s.bbox_min.iter()) {
             push_f32(&mut sbuf, *x);
         }
         push_u32(&mut sbuf, (s.triangles.len() / 3) as u32);
         for t in &s.triangles {
-            push_u16(&mut sbuf, *t);
+            // 全局索引减回基地址还原为节内局部索引
+            let local = t.checked_sub(s.base_vertex).ok_or_else(|| {
+                format!("索引 {t} 低于子网格基地址 {}，无法还原局部索引", s.base_vertex)
+            })?;
+            push_u16(&mut sbuf, local);
         }
         sbuf.extend_from_slice(&s.tail);
     }
@@ -392,20 +420,17 @@ pub fn serialize_fsm(m: &FsmModel) -> Result<Vec<u8>, String> {
         }
         push_f32(&mut mbuf, mat.spec_power);
         mbuf.extend_from_slice(&mat.pre);
-        let path_bytes = mat.texture_path.as_bytes();
+        let path_bytes = crate::fskin::encode_path(&mat.texture_path);
         if path_bytes.contains(&0u8) {
             return Err("纹理路径含非法字符".into());
         }
-        mbuf.extend_from_slice(path_bytes);
+        mbuf.extend_from_slice(&path_bytes);
         mbuf.push(0);
         mbuf.extend_from_slice(&mat.tail);
     }
     let dummy_off = material_off + mbuf.len();
 
-    // 挂点区
-    if m.dummies.is_empty() {
-        return Err("挂点数为 0（挂点区至少应有数量字段，布局未在样本中验证）".into());
-    }
+    // 挂点区：空挂点（帽类等）只写数量字段 0
     let mut dbuf = Vec::new();
     push_u32(&mut dbuf, m.dummies.len() as u32);
     for d in &m.dummies {
@@ -609,5 +634,76 @@ mod tests {
             return;
         };
         assert_eq!(meta, (154, 112));
+    }
+
+    /// 零挂点帽类网格（Hat/FM01）：挂点区仅剩 u32 数量字段 0。
+    /// 全量 532 个游戏 FSM 中 233 个为此形态——旧版在挂点数为 0 时
+    /// `rest % dummy_count` 直接 panic（除零）。
+    #[test]
+    fn zero_dummy_roundtrip() {
+        let p = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../res/system/Hat/FM01.FSM"
+        );
+        let Ok(bytes) = fs::read(p) else {
+            eprintln!("跳过: 测试文件不存在");
+            return;
+        };
+        let m = parse_fsm("FM01.FSM", &bytes).unwrap();
+        assert_eq!(m.vertex_count, 276);
+        assert_eq!(m.submeshes.len(), 2);
+        assert_eq!(m.materials.len(), 2);
+        assert_eq!(m.materials[1].texture_path, r"system\hat\FM_01.tga");
+        assert!(m.dummies.is_empty(), "FM01 应无挂点");
+        let out = serialize_fsm(&m).unwrap();
+        assert_eq!(bytes, out, "往返不一致");
+    }
+
+    /// 多节分段顶点池武器（Weapon/Chui/c30 锤）：92 顶点池拆成节0[0,33)+
+    /// 节1[33,92)，文件内索引为节内局部——解析后应转为全局，且两节序号
+    /// 同为 0（共用唯一材质）。子网格 bbox 与按全局索引计算的几何范围
+    /// 逐分量吻合（局部解释误差 0.00 / 全局解释误差 108，见逆向记录）。
+    #[test]
+    fn c30_segmented_pool() {
+        let p = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../res/system/Weapon/Chui/c30.FSM"
+        );
+        let Ok(bytes) = fs::read(p) else {
+            eprintln!("跳过: 测试文件不存在");
+            return;
+        };
+        let m = parse_fsm("c30.FSM", &bytes).unwrap();
+        assert_eq!(m.vertex_count, 92);
+        assert_eq!(m.submeshes.len(), 2);
+        assert_eq!(m.materials.len(), 1);
+        let s0 = &m.submeshes[0];
+        let s1 = &m.submeshes[1];
+        assert_eq!((s0.base_vertex, s0.vertex_count), (0, 33));
+        assert_eq!((s1.base_vertex, s1.vertex_count), (33, 59));
+        assert_eq!((s0.index, s1.index), (0, 0), "两节应共用材质 0");
+        // 全局索引范围应落在各自顶点段内
+        assert_eq!(*s0.triangles.iter().max().unwrap() as u32, 32);
+        assert_eq!(*s1.triangles.iter().max().unwrap() as u32, 91);
+        // 每节 bbox 与其全局索引引用的顶点范围一致
+        for s in [&m.submeshes[0], &m.submeshes[1]] {
+            let mut mn = [f32::MAX; 3];
+            let mut mx = [f32::MIN; 3];
+            for &t in &s.triangles {
+                for d in 0..3 {
+                    let v = m.vertices[t as usize * 8 + d];
+                    mn[d] = mn[d].min(v);
+                    mx[d] = mx[d].max(v);
+                }
+            }
+            for d in 0..3 {
+                assert!(
+                    (mn[d] - s.bbox_min[d]).abs() < 1e-3 && (mx[d] - s.bbox_max[d]).abs() < 1e-3,
+                    "子网格 bbox 与几何范围不符"
+                );
+            }
+        }
+        let out = serialize_fsm(&m).unwrap();
+        assert_eq!(bytes, out, "往返不一致");
     }
 }

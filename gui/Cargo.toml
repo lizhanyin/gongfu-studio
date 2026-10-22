@@ -18,6 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.23"
 cpk = { path = "../cpk" }
+# 纹理路径为 GBK 编码（如 system\armonr\袖256.tga），需按 GBK 解码/写回
+encoding_rs = "0.8"
 
 # dev 模式开关：tauri 的 custom-protocol feature 决定 cfg(dev)。
 # 默认（run.bat / 纯 cargo build）= 嵌入 ui/dist，无视 devUrl；

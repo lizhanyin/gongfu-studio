@@ -173,6 +173,64 @@ async fn list_res_dir(dir: String) -> Result<Vec<res::ResEntry>, String> {
     run_blocking(move || res::list_dir(&dir)).await
 }
 
+// ---------------- 资源导出 / 导入 ----------------
+
+/// 导出单个资源文件到磁盘目标路径（CPK 包内文件同样可导出）
+#[tauri::command]
+async fn export_file(src: String, dest: String) -> Result<(), String> {
+    run_blocking(move || {
+        let bytes = vfs::read_file(&src)?;
+        if let Some(p) = std::path::Path::new(&dest).parent() {
+            std::fs::create_dir_all(p).map_err(|e| format!("创建目录失败: {e}"))?;
+        }
+        std::fs::write(&dest, bytes).map_err(|e| format!("写入失败: {e}"))
+    })
+    .await
+}
+
+/// 递归导出目录（磁盘目录或 CPK 包内子树）到目标目录下（以源目录名单独建子目录）
+#[tauri::command]
+async fn export_dir(src: String, dest_dir: String) -> Result<String, String> {
+    run_blocking(move || {
+        let files = vfs::collect_tree(&src)?;
+        // 目标子目录名 = 源目录最后一段（CPK 包根去掉 .cpk 扩展名）
+        let base = src.trim_end_matches(['\\', '/']);
+        let mut name = base.rsplit(['\\', '/']).next().unwrap_or("export").to_string();
+        if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".cpk") {
+            // 按扩展名字节宽度截断（名称主体可能含非 ASCII，长度不能按字面算）
+            name.truncate(name.len() - 4);
+        }
+        let root = std::path::Path::new(&dest_dir).join(&name);
+        std::fs::create_dir_all(&root).map_err(|e| format!("创建目录失败: {e}"))?;
+        for (rel, vpath) in &files {
+            let out = root.join(rel);
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p).map_err(|e| format!("创建目录失败: {e}"))?;
+            }
+            let bytes = vfs::read_file(vpath)?;
+            std::fs::write(&out, bytes).map_err(|e| format!("写入失败: {e}"))?;
+        }
+        Ok(format!("已导出 {} 个文件到 {}", files.len(), root.display()))
+    })
+    .await
+}
+
+/// 导入磁盘文件到资源目录（同名覆盖；CPK 包内目录不支持写入）
+#[tauri::command]
+async fn import_file(src: String, dest_dir: String) -> Result<String, String> {
+    run_blocking(move || {
+        reject_cpk_write(&dest_dir)?;
+        let name = std::path::Path::new(&src)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .ok_or_else(|| "源文件路径无效".to_string())?;
+        let dest = std::path::Path::new(&dest_dir).join(&name);
+        std::fs::copy(&src, &dest).map_err(|e| format!("复制失败: {e}"))?;
+        Ok(dest.to_string_lossy().into_owned())
+    })
+    .await
+}
+
 /// 把阻塞计算移出主线程执行（任务 panic 时转为错误字符串）
 async fn run_blocking<T, F>(f: F) -> Result<T, String>
 where
@@ -215,7 +273,10 @@ pub fn run() {
             save_fak,
             load_fsm,
             save_fsm,
-            list_res_dir
+            list_res_dir,
+            export_file,
+            export_dir,
+            import_file
         ])
         .run(tauri::generate_context!())
         .expect("运行 Tauri 失败");

@@ -31,6 +31,10 @@ export const api = {
     invoke<string>("export_fskel_glb", { path, outPath }),
   // 资源浏览
   listResDir: (dir: string) => invoke<ResEntry[]>("list_res_dir", { dir }),
+  // 资源导出 / 导入（src 支持磁盘与 cpk: 包内路径；导入目标仅磁盘目录）
+  exportFile: (src: string, dest: string) => invoke<void>("export_file", { src, dest }),
+  exportDir: (src: string, destDir: string) => invoke<string>("export_dir", { src, destDir }),
+  importFile: (src: string, destDir: string) => invoke<string>("import_file", { src, destDir }),
   // FAK 顶点动画模型（含全部帧顶点数据）
   loadFak: (path: string) => invoke<FakModel>("load_fak", { path }),
   saveFak: (path: string, model: FakModel) =>

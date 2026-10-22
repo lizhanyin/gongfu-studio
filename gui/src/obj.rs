@@ -35,6 +35,7 @@ pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<St
     for p in paths {
         let bytes = vfs::read_file(p).map_err(|e| format!("读取 {p}: {e}"))?;
         let m = parse_fskin(p, &bytes)?;
+        let triangles = m.triangles_merged();
         let name = Path::new(p)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -42,25 +43,33 @@ pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<St
         let mat_name = format!("mat_{name}");
         obj.push_str(&format!("o {name}\ng {name}\n"));
 
-        // 材质
-        let (r, g, b) = (
-            m.material.diffuse[0],
-            m.material.diffuse[1],
-            m.material.diffuse[2],
-        );
+        // 材质（多子网格取首槽；无材质特效网格用中性色）
+        let (diffuse, ambient, specular, spec_power, texture_path) = match m.materials.first() {
+            Some(a) => (
+                a.diffuse,
+                a.ambient,
+                a.specular,
+                a.spec_power,
+                Some(&a.texture_path),
+            ),
+            None => (
+                [1.0, 1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0],
+                10.0,
+                None,
+            ),
+        };
         mtl.push_str(&format!(
-            "newmtl {mat_name}\nKd {r:.4} {g:.4} {b:.4}\nKa {:.4} {:.4} {:.4}\nKs {:.4} {:.4} {:.4}\nNs {:.1}\n",
-            m.material.ambient[0], m.material.ambient[1], m.material.ambient[2],
-            m.material.specular[0], m.material.specular[1], m.material.specular[2],
-            m.material.spec_power,
+            "newmtl {mat_name}\nKd {:.4} {:.4} {:.4}\nKa {:.4} {:.4} {:.4}\nKs {:.4} {:.4} {:.4}\nNs {:.1}\n",
+            diffuse[0], diffuse[1], diffuse[2],
+            ambient[0], ambient[1], ambient[2],
+            specular[0], specular[1], specular[2],
+            spec_power,
         ));
         // 纹理: 复制到输出目录
-        if let Some(src) = m
-            .material
-            .texture_path
-            .rsplit(['\\', '/'])
-            .next()
-            .map(|b| b.to_string())
+        if let Some(src) = texture_path
+            .and_then(|t| t.rsplit(['\\', '/']).next().map(|b| b.to_string()))
         {
             let stem = src.rsplit_once('.').map(|(s, _)| s).unwrap_or(&src);
             // 在部件同目录树（模型根目录）中查找同名 dds/tga
@@ -100,8 +109,8 @@ pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<St
         // 跨缝面：手臂等条带 UV 环绕 u=0/1 接缝（引擎用重复寻址），
         // 为这些面的角点追加 ±1 调整后的 vt，否则插值横穿整张纹理
         let mut extra_vt: Vec<(f32, f32)> = Vec::new();
-        let mut face_vt: Vec<Option<[usize; 3]>> = vec![None; m.triangles.len() / 3];
-        for (fi, tri3) in m.triangles.chunks_exact(3).enumerate() {
+        let mut face_vt: Vec<Option<[usize; 3]>> = vec![None; triangles.len() / 3];
+        for (fi, tri3) in triangles.chunks_exact(3).enumerate() {
             let corners = [tri3[0] as usize, tri3[1] as usize, tri3[2] as usize];
             let us = corners.map(|i| m.vertices[i].uv[0]);
             let vs = corners.map(|i| m.vertices[i].uv[1]);
@@ -145,7 +154,7 @@ pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<St
                 v.normal[0], v.normal[1], v.normal[2]
             ));
         }
-        let t = &m.triangles;
+        let t = &triangles;
         for (fi, tri3) in t.chunks_exact(3).enumerate() {
             let corners = [tri3[0] as usize, tri3[1] as usize, tri3[2] as usize];
             let vts = face_vt[fi].unwrap_or(corners);

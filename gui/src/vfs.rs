@@ -342,6 +342,25 @@ pub fn walk_files(vroot: &str, exts: &[&str]) -> Vec<VfsEntry> {
     }
 }
 
+/// 递归收集子树全部文件：(相对源根路径，'\' 分隔不含源根段, 完整虚拟路径)。
+/// 供目录整体导出：两种模式统一走 list_dir，CPK 目录条目缺失时同样能由子项推导。
+pub fn collect_tree(vroot: &str) -> Result<Vec<(String, String)>, String> {
+    let base = vroot.trim_end_matches(['\\', '/']).to_string();
+    fn rec(dir: &str, base_len: usize, out: &mut Vec<(String, String)>) -> Result<(), String> {
+        for e in list_dir(dir)? {
+            if e.is_dir {
+                rec(&e.path, base_len, out)?;
+            } else if e.path.len() > base_len + 1 {
+                // e.path 必为 base + '\' + 子路径（list_dir 两种模式拼接规则一致）
+                out.push((e.path[base_len + 1..].to_string(), e.path));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    rec(&base, base.len(), &mut out).map(|_| out)
+}
+
 // ---------------- 顺序读取器 ----------------
 
 enum ReaderInner {
@@ -496,6 +515,22 @@ mod tests {
         }
         let act = walk_files(&join_vpath(&root, "AvatarGirl\\act"), &["fskel"]);
         assert!(act.len() >= 18, "act 下 FSKEL 应有 18+，实际 {}", act.len());
+        let _ = fs::remove_dir_all(cpk_path.parent().unwrap());
+    }
+
+    #[test]
+    fn collect_tree_matches_fs() {
+        let cpk_path = build_system_cpk("collect");
+        let root = vroot(&cpk_path);
+        let girl = collect_tree(&join_vpath(&root, "AvatarGirl")).unwrap();
+        let disk = collect_tree(&format!("{RES}/system/AvatarGirl")).unwrap();
+        assert_eq!(girl.len(), disk.len(), "CPK 与磁盘收集的文件数应一致");
+        for (rel, p) in &girl {
+            assert!(!rel.is_empty(), "相对路径不应为空");
+            assert!(!rel.contains("cpk:"), "相对路径不应残留前缀: {rel}");
+            assert!(p.ends_with(rel.as_str()), "完整路径应以相对路径结尾: {p}");
+            assert!(read_file(p).is_ok(), "收集的文件应可读: {p}");
+        }
         let _ = fs::remove_dir_all(cpk_path.parent().unwrap());
     }
 
