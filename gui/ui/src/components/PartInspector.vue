@@ -77,9 +77,10 @@
             />
           </div>
         </div>
-        <n-button size="small" @click="skin.applyTexture" style="margin-bottom: 10px">
-          应用纹理（按文件名匹配目录内贴图）
-        </n-button>
+        <div class="apply-row">
+          <n-button size="small" @click="skin.applyTexture">应用纹理</n-button>
+          <span class="apply-hint">按文件名匹配目录内贴图</span>
+        </div>
         <div v-if="skin.texPreviewUrl" style="margin-top: 6px">
           <img class="tex-preview" :src="skin.texPreviewUrl" style="width: 100%" />
           <div class="kv" style="margin-top: 4px">

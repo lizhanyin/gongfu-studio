@@ -142,28 +142,6 @@ export function useDressMode(
 
   /** 被装扮隐藏的基础槽（只还原自己隐藏的，不动用户手动关掉的） */
   const hiddenByDress = reactive(new Set<string>());
-  let fashionHidHead = false;
-
-  /** 头部独立组（材质贴图 stem 以 wf 开头的部件所在组） */
-  function headGroupSig(): string | null {
-    const set = skin.modelSet;
-    if (!set) return null;
-    for (const g of set.groups) {
-      if (
-        g.parts.some((p) =>
-          stemOf(p.textureFile ?? p.texturePath).startsWith("wf")
-        )
-      ) {
-        return g.signature;
-      }
-    }
-    return null;
-  }
-
-  /** 部件组是否为头部组（时装穿上时置灰标注） */
-  function isHeadGroup(sig: string): boolean {
-    return headGroupSig() === sig;
-  }
 
   /** 被装扮替换的基础槽 → 替换来源标签（"护甲"/"下装"/"时装"…），供部件卡置灰 */
   const replacedBaseSlots = computed<Record<string, string>>(() => {
@@ -201,23 +179,8 @@ export function useDressMode(
         if (!skin.slotVisible(slot)) skin.toggleSlot(slot, true);
       }
     }
-    // 头部组：时装含头网格，穿上时隐藏基础头（发型保留）
-    const headSig = headGroupSig();
-    if (headSig) {
-      const g = skin.modelSet?.groups.find((x) => x.signature === headSig);
-      const visible = skin.modelSet
-        ? skin.groupVis.get(headSig) ?? false
-        : false;
-      if (g) {
-        if (fashionOn.value && !fashionHidHead && visible) {
-          skin.toggleGroup(g, false);
-          fashionHidHead = true;
-        } else if (!fashionOn.value && fashionHidHead) {
-          skin.toggleGroup(g, true);
-          fashionHidHead = false;
-        }
-      }
-    }
+    // 基础头部（girl_head，脸贴图 wf01）不随时装隐藏：时装模型无脸贴图槽，
+    // 脸由基础头提供，保持显示与可编辑（换脸型 / 换头型变体）
   }
 
   // ---------- 时装脸型联动 ----------
@@ -452,17 +415,21 @@ export function useDressMode(
 
   // ---------- 基础模型 ----------
 
-  /** 基础模型目录装配：skin.scan 装配基础部件与目录内变体，随后装默认骨架 */
+  /** 基础模型目录装配：卸旧部件 → 换骨架 → skin.scan 装配新基础部件。
+   *  顺序关键：部件 boneIndex 按各自骨架编号，任何「旧部件×新骨架 /
+   *  新部件×旧骨架」中间态都会在蒙皮/链检测中越界（切性别报错根源）。 */
   async function loadBase() {
     const b = base.value;
     if (!b) return;
-    // skin.scan 只清理 skin.loaded 内的部件，先卸下全部装扮件
+    // 先卸下全部装扮件与旧基础部件（旧部件×旧骨架，合法）
     removeAllDressParts();
     hiddenByDress.clear();
-    fashionHidHead = false;
-    await skin.scan(b.dir);
+    skin.unloadParts();
+    // 换骨架（此时场景无部件，setFskel 的全量重蒙皮空转，安全）
     if (b.defaultFskel) await act.openActFile(b.defaultFskel);
     else act.closeAct();
+    // 装配新基础部件（新部件×新骨架，配套）
+    await skin.scan(b.dir);
   }
 
   function removeAllDressParts() {
@@ -491,7 +458,8 @@ export function useDressMode(
     syncBaseSlots();
   }
 
-  /** 换基础模型（性别）：装备/时装按 槽位+款式号 迁移，找不到则卸下 */
+  /** 换基础模型（性别）：装备/时装按 槽位+款式号 迁移，找不到则卸下。
+   *  全程冻结渲染，迁移完成后一次性呈现。 */
   async function switchBase(key: string) {
     if (!catalog.value || key === baseKey.value) return;
     const nums = new Map<string, number | null>();
@@ -502,40 +470,51 @@ export function useDressMode(
       );
     }
     const fashionNum = fashionOn.value ? currentFashion.value?.number ?? null : null;
-    baseKey.value = key;
-    await loadBase();
-    for (const s of catalog.value.slots) {
-      const n = nums.get(s.key);
-      const item =
-        n === null || n === undefined
-          ? null
-          : slotItems(s.key).find((i) => i.number === n) ?? null;
-      if (item) await setEquip(s.key, item.path);
-      else if (equipPath.get(s.key)) unequipSlot(s.key);
+    viewer.value?.holdRender(true);
+    try {
+      baseKey.value = key;
+      await loadBase();
+      for (const s of catalog.value.slots) {
+        const n = nums.get(s.key);
+        const item =
+          n === null || n === undefined
+            ? null
+            : slotItems(s.key).find((i) => i.number === n) ?? null;
+        if (item) await setEquip(s.key, item.path);
+        else if (equipPath.get(s.key)) unequipSlot(s.key);
+      }
+      if (fashionNum !== null && fashionNum !== undefined) {
+        const f =
+          fashionItems.value.find((i) => i.number === fashionNum) ?? null;
+        if (f) await setFashion(f.path);
+        else if (fashionPath.value) await setFashion(null);
+      }
+      message.info(`已切换基础模型: ${base.value?.label ?? key}`);
+    } finally {
+      viewer.value?.holdRender(false);
     }
-    if (fashionNum !== null && fashionNum !== undefined) {
-      const f =
-        fashionItems.value.find((i) => i.number === fashionNum) ?? null;
-      if (f) await setFashion(f.path);
-      else if (fashionPath.value) await setFashion(null);
-    }
-    message.info(`已切换基础模型: ${base.value?.label ?? key}`);
   }
 
   // ---------- 打开 / 关闭 ----------
 
-  /** 扫描角色资源根并进入装扮模式 */
+  /** 扫描角色资源根并进入装扮模式（重复调用 = 换资源根后重扫，状态重置）。
+   *  全程冻结渲染，资源加载完成后一次性呈现，避免逐件装配的中间态。 */
   async function open(root?: string): Promise<boolean> {
     scanning.value = true;
+    viewer.value?.holdRender(true);
     try {
       const c = await api.scanCharacter(root ?? "");
       catalog.value = c;
+      // 重扫时保留当前基础模型（资源里仍有时），首次默认女体
       baseKey.value =
-        (c.bases.find((b) => b.key === "avatargirl") ?? c.bases[0])?.key ?? "";
+        c.bases.find((b) => b.key === baseKey.value)?.key ??
+        (c.bases.find((b) => b.key === "avatargirl") ?? c.bases[0])?.key ??
+        "";
       equipOn.clear();
       equipPath.clear();
       fashionOn.value = false;
       fashionPath.value = null;
+      hiddenByDress.clear();
       await loadBase();
       message.success(
         `角色装扮: ${c.bases.length} 基础模型 · ${c.slots
@@ -544,18 +523,26 @@ export function useDressMode(
       );
       return true;
     } catch (e) {
+      // 扫描失败清掉旧目录，避免面板停留在已失效的资源上
+      catalog.value = null;
       message.error(`角色装扮扫描失败: ${e}`);
       return false;
     } finally {
+      viewer.value?.holdRender(false);
       scanning.value = false;
     }
   }
 
-  /** 视口重建（HMR）后重放：重扫当前基础模型并恢复装扮 */
+  /** 视口重建（HMR）后重放：重扫当前基础模型并恢复装扮（冻结渲染一次呈现） */
   async function replay() {
     if (!catalog.value) return;
-    await loadBase();
-    await replayEquips();
+    viewer.value?.holdRender(true);
+    try {
+      await loadBase();
+      await replayEquips();
+    } finally {
+      viewer.value?.holdRender(false);
+    }
   }
 
   /** 退出装扮模式（切换到 FAK/FSM/单文件预览时调用） */
@@ -569,7 +556,6 @@ export function useDressMode(
     fashionOn.value = false;
     fashionPath.value = null;
     hiddenByDress.clear();
-    fashionHidHead = false;
   }
 
   // ---------- 联动监听 ----------
@@ -614,7 +600,6 @@ export function useDressMode(
     setNumbers,
     setCurrent,
     replacedBaseSlots,
-    isHeadGroup,
     setEquip,
     toggleEquip,
     stepEquip,

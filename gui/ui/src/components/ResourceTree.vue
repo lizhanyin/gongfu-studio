@@ -11,6 +11,7 @@
       label-field="label"
       :on-load="handleLoad"
       :node-props="nodeProps"
+      :render-prefix="renderPrefix"
       :render-suffix="renderSuffix"
       @update:selected-keys="onSelect"
     />
@@ -107,9 +108,15 @@ async function onMenuSelect(key: string | number) {
   }
 }
 
-/** 模型 / 角色目录徽标 */
+/** 目录前缀图标（树内全部为目录，文件在下方网格浏览） */
+function renderPrefix() {
+  return h("span", { class: "entry-ico" }, "📁");
+}
+
+/** 模型目录徽标（角色根不打标签，右键菜单仍可进入角色装扮） */
 function renderSuffix({ option }: { option: TreeOption }) {
-  if (option.isCharacter) return h("span", { class: "model-badge" }, "角色");
-  return option.isModel ? h("span", { class: "model-badge" }, "模型") : null;
+  return option.isModel && !option.isCharacter
+    ? h("span", { class: "model-badge" }, "模型")
+    : null;
 }
 </script>

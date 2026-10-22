@@ -3,7 +3,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { FskinModel, ModelSet, PartGroup, PartInfo, TexSlot, TexVariant } from "../types";
 import { trianglesOf } from "../types";
-import { texDataFromDto } from "../tex";
+import { texDataFromDto, b64ToBytes, decodeTga } from "../tex";
 import type { TexData, Viewer } from "../viewer";
 import { message } from "../message";
 import { shortName } from "../utils";
@@ -65,8 +65,16 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   async function ensureTexture(file: string): Promise<TexData | null> {
     if (texCache.has(file)) return texCache.get(file)!;
     try {
-      const dto = await api.loadTexture(file);
-      const d = texDataFromDto(dto);
+      // DDS 走后端解码；TGA 前端解码（与装扮模式同一套）；失败不缓存，便于修复后重试
+      let d: TexData | null = null;
+      if (/\.dds$/i.test(file)) {
+        d = texDataFromDto(await api.loadTexture(file));
+      } else if (/\.tga$/i.test(file)) {
+        d = decodeTga(b64ToBytes(await api.readFileB64(file)));
+      } else {
+        message.warning(`暂不支持解码该格式贴图: ${shortName(file)}`);
+        return null;
+      }
       texCache.set(file, d);
       return d;
     } catch (e) {
@@ -100,19 +108,27 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     return d ? `${d.width}×${d.height} · ${shortName(file!)}` : file ? `${shortName(file)} (未加载)` : "目录中未找到匹配贴图";
   });
 
+  /** 按文件名匹配目录内贴图，应用到部件的全部材质槽（护甲类多子网格各有贴图）；
+   *  可反复调用，每次按当前纹理路径重新解析 */
   async function applyTexture() {
     const m = selectedModel.value;
     const v = viewer.value;
     if (!m || !v) return;
     afterEdit();
-    const file = resolveTexture(m.materials[0]?.texturePath ?? "");
-    if (file) {
-      const d = await ensureTexture(file);
-      if (d) v.refreshTexture(m.path, d, file);
-    } else {
-      v.clearTexture(m.path);
+    let applied = 0;
+    for (let i = 0; i < m.materials.length; i++) {
+      const md = m.materials[i];
+      const file = md.texturePath ? resolveTexture(md.texturePath) : null;
+      const d = file ? await ensureTexture(file) : null;
+      if (d && file) {
+        v.refreshTexture(m.path, d, file, i);
+        applied++;
+      } else {
+        v.clearTexture(m.path, i);
+      }
     }
     v.applyMaterial(m.path);
+    if (!applied) message.error("目录中未找到匹配贴图");
   }
 
   // ---------- 纹理切换槽（脸部纹理 / 饰品）与部件配色 ----------
@@ -444,6 +460,15 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     viewer.value?.highlight(null);
   }
 
+  /** 只卸下场景中的全部部件（保留模型集与面板状态）：
+   *  换骨架等部件必须与骨架严格配套的时序用，之后 scan 重新装配 */
+  function unloadParts() {
+    for (const p of [...loaded.keys()]) viewer.value?.removePart(p);
+    loaded.clear();
+    selectedPart.value = null;
+    viewer.value?.highlight(null);
+  }
+
   /** 单文件预览：扫描父目录（贴图/变体信息照常可用）但只装配该部件 */
   async function soloPreview(path: string) {
     const dir = path.replace(/[\\/][^\\/]*$/, "");
@@ -603,6 +628,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     touchVertex,
     scan,
     clearScene,
+    unloadParts,
     pickDir,
     saveSelected,
     saveAs,

@@ -2,12 +2,14 @@
 //!
 //! 游戏资源布局：AvatarGirl / AvatarBoy 为男女基础模型目录；system 下
 //! Hat / Armonr / Lower / Glove / Boot 为装备模型目录（帽子为 .fsm 静态
-//! 网格，其余为 .fskin 蒙皮网格）；shizhuang 为时装（单文件全身模型，
-//! 脸型贴图在基础模型目录）。
+//! 网格，其余为 .fskin 蒙皮网格）；shizhuang / TransformFashion 为时装
+//! （单文件全身模型，脸型贴图在基础模型目录）。
 //!
-//! 装备文件名前缀区分性别：fs* 女性、ms* 男性（如 Armonr/FS01_Upper.fskin），
-//! 其余前缀（如 Hat/FM01.FSM）视为通用；前缀字母后紧跟的数字为款式号，
-//! 同号跨槽组成套装。无材质槽的 fskin（FK55 类特效网格）不参与换装，剔除。
+//! 装备文件名前缀区分性别：两字母前缀首字母 f=女体、m=男体，第二字母为
+//! 部件类型 —— Armonr FS/MS、Boot FX/MX、Glove FW/MW、Hat FM/MW、
+//! Lower FK/MW（男体除上装 MS、鞋 MX 外统一 MW 系）。其余前缀视为通用；
+//! 前缀字母后紧跟的数字为款式号，同号跨槽组成套装。无材质槽的 fskin
+//! （FK55 类特效网格）不参与换装，剔除。
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +18,7 @@ use crate::{fsm, fskin, vfs};
 
 /// 基础模型目录（目录名小写, 标签, 性别）
 const BASE_DIRS: [(&str, &str, &str); 2] = [
-    ("avatargirl", "女性 AvatarGirl", "f"),
+    ("avatargirl", "女体 AvatarGirl", "f"),
     ("avatarboy", "男性 AvatarBoy", "m"),
 ];
 
@@ -29,8 +31,8 @@ const SLOT_DIRS: [(&str, &str, &str); 5] = [
     ("boot", "鞋子", "fskin"),
 ];
 
-/// 时装目录名（小写）
-const FASHION_DIR: &str = "shizhuang";
+/// 时装目录名（小写；shizhuang = 常规时装，transformfashion = 变身时装）
+const FASHION_DIRS: [&str; 2] = ["shizhuang", "transformfashion"];
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -86,8 +88,9 @@ pub struct CharacterCatalog {
     pub textures: Vec<fskin::TexInfo>,
 }
 
-/// 文件名 → (性别, 款式号)：开头字母前缀 fs→f、ms→m、其余→u；
-/// 紧随前缀的数字为款式号（FS01_Upper → (f, 1)，FM01 → (u, 1)）。
+/// 文件名 → (性别, 款式号)：两字母字母前缀首字母定性别 f→女体、m→男体
+/// （FS/MS=护甲、FX/MX=鞋、FW/MW=手套、FM/MW=帽、FK/MW=下装），其余前缀
+/// 视为通用；紧随前缀的数字为款式号（FS01_Upper → (f, 1)，FM01 → (f, 1)）。
 pub fn parse_gender_number(name: &str) -> (String, Option<u32>) {
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
     let lower = stem.to_lowercase();
@@ -95,8 +98,8 @@ pub fn parse_gender_number(name: &str) -> (String, Option<u32>) {
     let rest = &lower[letters.len()..];
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     let gender = match letters.as_str() {
-        "fs" => "f",
-        "ms" => "m",
+        l if l.len() == 2 && l.starts_with('f') => "f",
+        l if l.len() == 2 && l.starts_with('m') => "m",
         _ => "u",
     }
     .to_string();
@@ -119,10 +122,11 @@ fn child_dir_set(dir: &str) -> BTreeSet<String> {
 }
 
 /// 已知角色子目录名（小写）：基础模型 / 时装 / 装备
-const KNOWN_CHILD_DIRS: [&str; 8] = [
+const KNOWN_CHILD_DIRS: [&str; 9] = [
     "avatargirl",
     "avatarboy",
     "shizhuang",
+    "transformfashion",
     "hat",
     "armonr",
     "lower",
@@ -291,12 +295,13 @@ pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
         });
     }
 
-    let fashion_dir = vfs::join_vpath(&root, FASHION_DIR);
-    let fashions = if vfs::exists(&fashion_dir) {
-        scan_equip_dir(&fashion_dir, "fskin", &tex_index)
-    } else {
-        Vec::new()
-    };
+    let mut fashions = Vec::new();
+    for dir_name in FASHION_DIRS {
+        let dir = vfs::join_vpath(&root, dir_name);
+        if vfs::exists(&dir) {
+            fashions.extend(scan_equip_dir(&dir, "fskin", &tex_index));
+        }
+    }
 
     if bases.is_empty()
         && slots.iter().all(|s| s.items.is_empty())
@@ -335,11 +340,20 @@ mod tests {
             parse_gender_number("MS36_Upper.fskin"),
             ("m".into(), Some(36))
         );
-        assert_eq!(parse_gender_number("FM01.FSM"), ("u".into(), Some(1)));
-        // 特效网格 / 基础部件：无前缀数字
+        // 各槽两字母前缀：首字母即性别（Armonr FS/MS、Boot FX/MX、Glove FW/MW、
+        // Hat FM/MW、Lower FK/MW）
+        assert_eq!(parse_gender_number("FX12_Boot.fskin"), ("f".into(), Some(12)));
+        assert_eq!(parse_gender_number("MX12_Boot.fskin"), ("m".into(), Some(12)));
+        assert_eq!(parse_gender_number("FW03.fskin"), ("f".into(), Some(3)));
+        assert_eq!(parse_gender_number("MW03.fskin"), ("m".into(), Some(3)));
+        assert_eq!(parse_gender_number("FM01.FSM"), ("f".into(), Some(1)));
+        assert_eq!(parse_gender_number("MW01.FSM"), ("m".into(), Some(1)));
+        assert_eq!(parse_gender_number("FK07_Lower.fskin"), ("f".into(), Some(7)));
+        assert_eq!(parse_gender_number("MW07_Lower.fskin"), ("m".into(), Some(7)));
+        // 特效网格 FK55 也是 f 前缀（无材质槽会被 scan_equip_dir 剔除，无影响）
         assert_eq!(
             parse_gender_number("FK55_Bip01 Footsteps01.fskin"),
-            ("u".into(), Some(55))
+            ("f".into(), Some(55))
         );
         assert_eq!(parse_gender_number("girl_Upper.fskin"), ("u".into(), None));
         assert_eq!(parse_gender_number("G080.fak"), ("u".into(), Some(80)));
@@ -407,7 +421,7 @@ mod tests {
         let first_m = genders.iter().position(|g| *g == "m");
         let last_f = genders.iter().rposition(|g| *g == "f");
         if let (Some(fm), Some(lf)) = (first_m, last_f) {
-            assert!(lf < fm, "女性款应排在男性款前: {genders:?}");
+            assert!(lf < fm, "女体款应排在男性款前: {genders:?}");
         }
     }
 }

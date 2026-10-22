@@ -16,10 +16,11 @@
       </header>
 
       <div class="app-main">
-        <!-- 左：资源树（res 为根，全高） -->
-        <aside class="tree-panel">
+        <!-- 左：资源树（res 为根，全高，宽度可拖拽） -->
+        <aside class="tree-panel" :style="{ width: treeWidth + 'px' }">
           <ResourceTree :tree="res" @preview-model="previewModelDir" @dress="openDressMode" />
         </aside>
+        <div class="drag-handle drag-v" title="拖拽调整宽度" @mousedown="startTreeDrag"></div>
 
         <div class="right-col">
           <!-- 右上：预览/操作 -->
@@ -65,11 +66,12 @@
             <ViewerHost :target="viewportRef" @ready="onViewerReady" />
 
             <!-- 检查器（可折叠）：独立组件，改 InspectorPanel.vue 只重载检查器子树 -->
-            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" :dress="dress" />
+            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" :dress="dress" :res="res" />
           </div>
 
-          <!-- 右下：当前目录资源网格 -->
-          <div class="grid-panel">
+          <!-- 右下：当前目录资源网格（高度可拖拽） -->
+          <div class="drag-handle drag-h" title="拖拽调整高度" @mousedown="startGridDrag"></div>
+          <div class="grid-panel" :style="{ height: gridHeight + 'px' }">
             <ResourceGrid
               :tree="res"
               @preview="previewEntry"
@@ -90,12 +92,17 @@
         <span v-if="fsm.fsmModel">FSM: {{ shortName(fsm.fsmModel.path) }}</span>
         <span>可见部件: {{ skin.visiblePaths.map(shortName).join(" + ") || "无" }}</span>
       </footer>
+
+      <!-- 拖拽调整面板大小时的跟随提示 -->
+      <div v-if="dragTip" class="drag-tip" :style="{ left: dragTip.x + 14 + 'px', top: dragTip.y + 14 + 'px' }">
+        {{ dragTip.text }}
+      </div>
     </div>
   </n-config-provider>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, ref, watch } from "vue";
 import { darkTheme, zhCN, type GlobalThemeOverrides } from "naive-ui";
 import { useViewer } from "./composables/useViewer";
 import { useSkinMode } from "./composables/useSkinMode";
@@ -124,6 +131,59 @@ const themeOverrides: GlobalThemeOverrides = {
 const viewportRef = ref<HTMLElement | null>(null);
 /** 视口内的 2D 贴图预览（选 3D 内容时关闭） */
 const texPreview = ref<{ url: string; name: string } | null>(null);
+
+// ---------------- 面板拖拽调整（宽度/高度跟随光标，提示浮标显示当前尺寸） ----------------
+
+const treeWidth = ref(clampPanel(localStorage.getItem("panel.treeW"), 260, 160, 560));
+const gridHeight = ref(clampPanel(localStorage.getItem("panel.gridH"), 250, 120, 720));
+const dragTip = ref<{ x: number; y: number; text: string } | null>(null);
+
+function clampPanel(saved: string | null, dft: number, min: number, max: number): number {
+  const n = Number(saved);
+  return Number.isFinite(n) && n !== 0 ? Math.min(max, Math.max(min, n)) : dft;
+}
+
+/** 通用面板拖拽：apply 把光标位移换算成尺寸并刷新提示；松手后持久化 */
+function startPanelDrag(
+  ev: MouseEvent,
+  storageKey: string,
+  apply: (dx: number, dy: number) => { value: number; text: string }
+) {
+  ev.preventDefault();
+  const x0 = ev.clientX;
+  const y0 = ev.clientY;
+  let last = { value: 0, text: "" };
+  const onMove = (e: MouseEvent) => {
+    last = apply(e.clientX - x0, e.clientY - y0);
+    dragTip.value = { x: e.clientX, y: e.clientY, text: `${last.text} ${last.value}px` };
+  };
+  const onUp = () => {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+    dragTip.value = null;
+    document.body.classList.remove("panel-dragging");
+    localStorage.setItem(storageKey, String(last.value));
+  };
+  document.body.classList.add("panel-dragging");
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+}
+
+function startTreeDrag(ev: MouseEvent) {
+  const v0 = treeWidth.value;
+  startPanelDrag(ev, "panel.treeW", (dx) => {
+    treeWidth.value = Math.min(560, Math.max(160, v0 + dx));
+    return { value: treeWidth.value, text: "资源目录" };
+  });
+}
+
+function startGridDrag(ev: MouseEvent) {
+  const v0 = gridHeight.value;
+  startPanelDrag(ev, "panel.gridH", (_dx, dy) => {
+    gridHeight.value = Math.min(720, Math.max(120, v0 - dy));
+    return { value: gridHeight.value, text: "资源面板" };
+  });
+}
 
 const { viewer, adopt } = useViewer();
 const skin = useSkinMode(viewer);
@@ -272,6 +332,24 @@ async function openDressMode(root?: string) {
   fsm.closeFsm();
   await dress.open(root ?? res.rootDir);
 }
+
+// 资源根实际切换（输入框回车 / 打开目录 / 加载 system.cpk）后：
+// 装扮模式开启时按新根重扫（套装/装备/时装/基础模型随之刷新），
+// 新根无角色资源则退出装扮回落整体预览
+watch(
+  () => res.treeData[0]?.key as string | undefined,
+  async (root, prev) => {
+    if (!root || root === prev || !dress.catalog) return;
+    texPreview.value = null;
+    fak.closeFak();
+    fsm.closeFsm();
+    const ok = await dress.open(root);
+    if (!ok) {
+      dress.close();
+      skin.scan(root);
+    }
+  }
+);
 
 /** 整体模型预览：含 .fak（怪物）或 .fsm（武器）的目录走对应网格，其余走 fskin 装配 */
 async function previewModelDir(dir: string) {

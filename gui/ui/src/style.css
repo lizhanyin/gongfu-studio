@@ -35,6 +35,47 @@ body {
   color: #e8e8ec;
 }
 
+/* ---- 全局滚动条：细圆条 + 悬停加深（WebView2/Chromium 生效于全部滚动容器；
+   naive-ui 自绘滚条的容器自带 display:none 覆盖，不受影响） ---- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: #3d3d4a; border-radius: 5px;
+  border: 2px solid #131318; background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #55555f; }
+::-webkit-scrollbar-thumb:active { background: #63636f; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+
+/* ---- 面板拖拽调整 ---- */
+/* 把手：面板夹缝中的细条，悬停/拖拽高亮 */
+.drag-handle { flex-shrink: 0; position: relative; z-index: 6; }
+.drag-v { width: 7px; margin: 0 -3px; cursor: col-resize; }
+.drag-h { height: 7px; margin: -3px 0; cursor: row-resize; }
+.drag-handle::after {
+  content: ""; position: absolute; border-radius: 2px;
+  background: transparent; transition: background .12s;
+}
+.drag-v::after { left: 2px; top: 0; bottom: 0; width: 3px; }
+.drag-h::after { top: 2px; left: 0; right: 0; height: 3px; }
+.drag-handle:hover::after { background: #4a4a5a; }
+/* 检查器左缘把手：贴在面板外沿 */
+.inspector .drag-handle.left-edge {
+  position: absolute; left: -3px; top: 0; bottom: 0; width: 7px; margin: 0;
+}
+/* 拖拽期间：全局光标 + 禁文本选择 + 视口不吃事件 */
+body.panel-dragging { user-select: none; }
+body.panel-dragging .drag-handle::after { background: #ffb86c; }
+body.panel-dragging .viewport canvas { pointer-events: none; }
+.inspector.dragging .drag-handle::after { background: #ffb86c; }
+/* 跟随光标的尺寸提示浮标 */
+.drag-tip {
+  position: fixed; z-index: 1000; pointer-events: none;
+  background: #ffb86c; color: #101014; font-size: 12px; font-weight: 600;
+  padding: 3px 10px; border-radius: 6px;
+  box-shadow: 0 2px 10px rgba(0,0,0,.5); white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .app { display: flex; flex-direction: column; height: 100%; }
 .app-header {
   display: flex; align-items: center; gap: 8px;
@@ -55,9 +96,9 @@ body {
 .menu-tick { display: inline-flex; justify-content: center; width: 100%; color: #63e2b7; }
 .app-main { flex: 1; display: flex; min-height: 0; }
 
-/* ---- 左：资源树（全高） ---- */
+/* ---- 左：资源树（全高，宽度由 App 拖拽控制） ---- */
 .tree-panel {
-  width: 260px; flex-shrink: 0; border-right: 1px solid #2a2a32;
+  flex-shrink: 0; border-right: 1px solid #2a2a32;
   overflow-y: auto; padding: 8px; background: #131318;
 }
 .model-badge {
@@ -84,18 +125,22 @@ body {
   pointer-events: none;
 }
 
-/* ---- 检查器（可折叠） ---- */
+/* ---- 检查器（可折叠，宽度由左缘把手拖拽控制） ---- */
 .inspector {
-  width: 320px; flex-shrink: 0; border-left: 1px solid #2a2a32;
+  flex-shrink: 0; border-left: 1px solid #2a2a32;
   background: #131318; display: flex; flex-direction: column;
-  min-height: 0; transition: width .18s ease;
+  min-height: 0; position: relative;
 }
 .inspector.collapsed { width: 34px; }
+/* 拖拽中禁用宽度过渡，避免跟手发粘 */
+.inspector:not(.dragging):not(.collapsed) { transition: width .18s ease; }
 .inspector-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 6px 6px 6px 10px; border-bottom: 1px solid #2a2a32;
   font-size: 12px; color: #99a; letter-spacing: 1px; flex-shrink: 0;
 }
+/* 浏览时装目录时头部的 女体/男体 快捷切换 */
+.inspector-head .head-base-switch { margin-left: auto; margin-right: 6px; letter-spacing: 0; }
 .inspector-body { flex: 1; overflow-y: auto; padding: 8px; min-height: 0; }
 .inspector-empty { color: #556; font-size: 12px; padding: 20px 8px; text-align: center; }
 /* 检查器内分区块折叠：标题与面板风格一致，内容收紧行距 */
@@ -109,9 +154,9 @@ body {
   color: #778;
 }
 
-/* ---- 右下：资源网格 ---- */
+/* ---- 右下：资源网格（高度由上方把手拖拽控制） ---- */
 .grid-panel {
-  height: 250px; flex-shrink: 0; border-top: 1px solid #2a2a32;
+  flex-shrink: 0; border-top: 1px solid #2a2a32;
   background: #131318; display: flex; flex-direction: column; min-height: 0;
 }
 /* 组件根节点：把 grid-panel 的高度约束传递到 grid-head / grid-body */
@@ -122,19 +167,12 @@ body {
   display: flex; align-items: center; gap: 10px; padding: 6px 10px;
   border-bottom: 1px solid #202028; flex-shrink: 0;
 }
-/* 滚动容器（虚拟滚动）：只装 spacer，实际行由组件按可视区渲染 */
+/* 滚动容器（虚拟滚动）：只装 spacer，实际行由组件按可视区渲染。
+   滚动条外观走全局 ::-webkit-scrollbar 规则 */
 .grid-body {
   flex: 1; overflow-y: auto; padding: 8px; min-height: 0;
   scrollbar-gutter: stable;
-  scrollbar-width: thin;
-  scrollbar-color: #4a4a5a transparent;
 }
-.grid-body::-webkit-scrollbar { width: 8px; }
-.grid-body::-webkit-scrollbar-thumb {
-  background: #4a4a5a; border-radius: 4px; border: 2px solid #131318;
-}
-.grid-body::-webkit-scrollbar-thumb:hover { background: #5a5a6a; }
-.grid-body::-webkit-scrollbar-track { background: transparent; }
 .grid-spacer { position: relative; }
 .grid-row { position: absolute; left: 0; right: 0; display: grid; gap: 8px; }
 .grid-empty { color: #556; font-size: 12px; text-align: center; padding: 24px 0; }
@@ -145,13 +183,14 @@ body {
   height: 82px; overflow: hidden;
 }
 .res-card:hover { border-color: #4a4a5a; }
-.res-card .card-top { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.res-card .card-top { display: flex; align-items: center; justify-content: flex-start; gap: 6px; }
+/* 目录 / 文件图标（字体渲染的 emoji，资源网格与资源树共用） */
+.entry-ico { font-size: 13px; line-height: 1; flex-shrink: 0; }
 .res-card .card-name {
   font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap;
 }
 .res-card .card-meta { font-size: 11px; color: #889; }
-.res-card .whole-btn { flex-shrink: 0; }
 .kind {
   font-size: 10px; line-height: 16px; padding: 0 5px; border-radius: 4px;
   color: #101014; font-weight: 600; flex-shrink: 0;
@@ -161,7 +200,6 @@ body {
 .kind.fskel { background: #569cd6; color: #101014; }
 .kind.dds, .kind.tga, .kind.png { background: #c586c0; color: #101014; }
 .kind.dir { background: #556; color: #dde; }
-.kind.character { background: #ffb86c; color: #101014; }
 .kind.csv, .kind.fsm, .kind.fak { background: #3a4a6a; color: #bcd; }
 
 /* ---- 贴图 2D 预览浮层 ---- */
@@ -199,10 +237,6 @@ body {
 .dress-panel { margin-bottom: 6px; }
 .dress-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
 .dress-label { font-size: 12px; color: #99a; flex-shrink: 0; min-width: 40px; }
-.dress-set-cur {
-  min-width: 52px; text-align: center; font-size: 12px; color: #dde;
-  font-variant-numeric: tabular-nums;
-}
 .dress-select { flex: 1; min-width: 0; }
 .dress-slot.covered { opacity: 0.45; }
 .dress-slot .covered-note { color: #c586c0; }
@@ -224,6 +258,9 @@ body {
 
 .form-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .form-row label { width: 72px; font-size: 12px; color: #99a; flex-shrink: 0; }
+/* 应用纹理按钮 + 跟随其后的操作性提示 */
+.apply-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
+.apply-hint { font-size: 11px; color: #778; }
 .tex-preview { max-width: 100%; border-radius: 6px; border: 1px solid #2a2a32; image-rendering: pixelated; }
 .section-title { font-size: 12px; color: #778; margin: 10px 0 6px; letter-spacing: 1px; }
 .kv { font-size: 12px; line-height: 2; color: #bbc; }

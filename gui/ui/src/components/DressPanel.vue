@@ -18,20 +18,21 @@
       </n-button-group>
     </div>
 
-    <!-- 整套款式（跨槽同号一键切换 / 翻页浏览） -->
+    <!-- 整套款式（跨槽同号一键切换，下拉直达 / 翻页浏览） -->
     <div class="dress-row">
       <span class="dress-label">套装</span>
-      <n-button
-        size="tiny"
-        :type="dress.setCurrent === null ? 'primary' : 'default'"
-        @click="dress.selectSet(null)"
-      >
-        默认
-      </n-button>
       <n-button size="tiny" quaternary :disabled="!dress.setNumbers.length" @click="dress.stepSet(-1)">
         ‹
       </n-button>
-      <span class="dress-set-cur" :title="setCurrentTitle">{{ setCurrentText }}</span>
+      <n-select
+        size="tiny"
+        class="dress-select"
+        :value="setCurrentValue"
+        :options="setOptions"
+        :disabled="!dress.setNumbers.length"
+        placeholder="混搭"
+        @update:value="(v: number) => dress.selectSet(v === 0 ? null : v)"
+      />
       <n-button size="tiny" quaternary :disabled="!dress.setNumbers.length" @click="dress.stepSet(1)">
         ›
       </n-button>
@@ -177,17 +178,14 @@ function texText(item: EquipItem): string {
   return missing ? `${names || "—"} (缺 ${item.textureFiles.length - files.length})` : names || "—";
 }
 
-const setCurrentText = computed(() => {
+/** 套装下拉：0 = 默认（全卸），款式号直选；-1 混搭时无匹配值显示占位 */
+const setOptions = computed(() => [
+  { label: "默认", value: 0 },
+  ...props.dress.setNumbers.map((n) => ({ label: `款式 ${n}`, value: n })),
+]);
+const setCurrentValue = computed(() => {
   const n = props.dress.setCurrent;
-  return n === null ? "默认" : n === -1 ? "混搭" : `款式 ${n}`;
-});
-const setCurrentTitle = computed(() => {
-  const n = props.dress.setCurrent;
-  return n === null
-    ? "全部卸下，显示基础模型"
-    : n === -1
-      ? "各槽款式不一致"
-      : `款式 ${n}`;
+  return n === null || n === -1 ? undefined : n;
 });
 
 const boneOptions = computed(() => [

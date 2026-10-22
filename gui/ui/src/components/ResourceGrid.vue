@@ -2,8 +2,8 @@
   <div class="res-grid">
     <div class="grid-head">
       <n-breadcrumb>
-        <n-breadcrumb-item v-for="(c, i) in crumbs" :key="c.path" @click="emit('openDir', c.path)">
-          {{ i === crumbs.length - 1 ? c.name : c.name + " /" }}
+        <n-breadcrumb-item v-for="c in crumbs" :key="c.path" @click="emit('openDir', c.path)">
+          {{ c.name }}
         </n-breadcrumb-item>
       </n-breadcrumb>
       <n-button size="tiny" :disabled="!canUp" @click="goUp">↑ 上级</n-button>
@@ -30,18 +30,14 @@
             :class="{ dir: e.isDir, model: e.isModel }"
             :title="e.path"
             @click="onClick(e)"
+            @dblclick="onDblClick(e)"
             @contextmenu="onCtx($event, e)"
           >
             <div class="card-top">
-              <span class="kind" :class="e.isDir ? (e.isCharacter ? 'character' : e.isModel ? 'model' : 'dir') : e.kind">
+              <span class="entry-ico">{{ e.isDir ? "📁" : "📄" }}</span>
+              <span class="kind" :class="e.isDir ? (e.isModel ? 'model' : 'dir') : e.kind">
                 {{ kindTag(e) }}
               </span>
-              <n-button
-                v-if="e.isDir && (e.isModel || e.isCharacter)"
-                size="tiny"
-                class="whole-btn"
-                @click.stop="e.isCharacter ? emit('dress', e.path) : emit('previewModel', e.path)"
-              >{{ e.isCharacter ? "角色装扮" : "整体预览" }}</n-button>
             </div>
             <div class="card-name">{{ e.name }}</div>
             <div class="card-meta">{{ metaText(e) }}</div>
@@ -103,7 +99,7 @@ function goUp() {
 
 // ---------- 卡片 ----------
 function kindTag(e: ResEntry): string {
-  if (e.isDir) return e.isCharacter ? "角色" : e.isModel ? "模型" : "目录";
+  if (e.isDir) return e.isModel ? "模型" : "目录";
   const map: Record<string, string> = {
     fskin: "皮肤",
     fskel: "动作",
@@ -123,7 +119,7 @@ function fmtSize(n: number): string {
 }
 
 function metaText(e: ResEntry): string {
-  if (e.isDir) return "点击进入";
+  if (e.isDir) return e.isModel ? "单击预览 · 双击进入" : "点击进入";
   if (e.kind === "fskin") return `${e.vertexCount ?? "?"} 顶点 · ${e.triangleCount ?? "?"} 三角`;
   if (e.kind === "fskel") return `${e.frameCount ?? "?"} 帧 · ${e.boneCount ?? "?"} 骨`;
   if (e.kind === "fak")
@@ -131,9 +127,16 @@ function metaText(e: ResEntry): string {
   return fmtSize(e.byteLen);
 }
 
+/** 模型目录点击 = 切换模型（整体预览）；普通目录进入浏览 */
 function onClick(e: ResEntry) {
-  if (e.isDir) emit("openDir", e.path);
+  if (e.isDir && e.isModel) emit("previewModel", e.path);
+  else if (e.isDir) emit("openDir", e.path);
   else emit("preview", e);
+}
+
+/** 模型目录双击 = 进入目录浏览（单击已被模型预览占用） */
+function onDblClick(e: ResEntry) {
+  if (e.isDir && e.isModel) emit("openDir", e.path);
 }
 
 // ---------- 虚拟滚动 ----------

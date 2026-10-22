@@ -145,6 +145,8 @@ export class Viewer {
   private container: HTMLElement;
   private mode: RenderMode = "shaded";
   private raf = 0;
+  /** 渲染冻结开关（holdRender）：true 时渲染循环跳过 draw */
+  private renderHold = false;
   private ro: ResizeObserver;
   private texCache = new Map<string, THREE.DataTexture>();
   private onPick: (path: string) => void = () => {};
@@ -390,9 +392,15 @@ export class Viewer {
     const loop = () => {
       this.raf = requestAnimationFrame(loop);
       this.controls.update();
-      this.renderer.render(this.scene, this.camera);
+      // 批量装配期间冻结渲染（holdRender），完成后再整体呈现，避免逐件加载的中间态
+      if (!this.renderHold) this.renderer.render(this.scene, this.camera);
     };
     loop();
+  }
+
+  /** 冻结/恢复渲染循环：换基础模型等批量装配时按序 true→false 配对使用 */
+  holdRender(on: boolean) {
+    this.renderHold = on;
   }
 
   setPickHandler(fn: (path: string) => void) {
@@ -730,10 +738,12 @@ export class Viewer {
     mat.needsUpdate = true;
   }
 
-  clearTexture(path: string) {
+  /** 清除贴图：matIndex >= 0 只清该材质槽，否则清全部 */
+  clearTexture(path: string, matIndex = -1) {
     const p = this.parts.get(path);
     if (!p) return;
-    for (const m of p.mats) {
+    for (const [k, m] of p.mats.entries()) {
+      if (matIndex >= 0 && k !== matIndex) continue;
       m.map = null;
       m.needsUpdate = true;
     }
@@ -2274,6 +2284,7 @@ export class Viewer {
           if (!v.influences.some((inf) => mem.has(inf.boneIndex))) continue;
           let x = 0, y = 0, z = 0;
           for (const inf of v.influences) {
+            if (inf.boneIndex >= n) continue; // 部件与骨架不配套时的越界防御
             const M = W[inf.boneIndex].elements;
             const lp = inf.boneLocalPos;
             x += inf.weight * (M[0] * lp[0] + M[4] * lp[1] + M[8] * lp[2] + M[12]);

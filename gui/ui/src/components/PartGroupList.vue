@@ -41,7 +41,7 @@
           size="tiny"
           style="width: 140px"
           :value="skin.slotCurrent(row.slot) ?? undefined"
-          :options="skin.slotOptions(row.slot).map((p) => ({ label: variantLabel(p), value: p.path }))"
+          :options="slotSelectOptions(row.slot)"
           @update:value="(v: string) => skin.selectSlotVariant(row.slot, v)"
         />
       </div>
@@ -59,7 +59,6 @@
       class="part-card"
       :class="{
         selected: skin.selectedPart === skin.groupSel.get(row.group!.signature),
-        replaced: headReplaced(row.group!),
       }"
       @click="skin.selectPart(skin.groupSel.get(row.group!.signature) ?? null)"
     >
@@ -69,8 +68,7 @@
           :value="skin.groupVis.get(row.group!.signature) ?? false"
           @update:value="(v: boolean) => skin.toggleGroup(row.group!, v)"
         />
-        <span class="name" :title="row.group!.label">{{ row.group!.label }}</span>
-        <span v-if="headReplaced(row.group!)" class="replaced-note">由时装替换</span>
+        <span class="name" :title="row.group!.label">{{ groupLabel(row.group!) }}</span>
         <span v-if="skin.isDirty(skin.groupSel.get(row.group!.signature))" class="dirty-dot">●</span>
         <n-select
           v-if="row.group!.parts.length > 1"
@@ -103,9 +101,8 @@ const props = defineProps<{ skin: SkinStore; dress?: DressStore }>();
 /** 基础槽被装备/时装替换的来源标签（角色装扮模式） */
 const replacedBy = (slot: string) => props.dress?.replacedBaseSlots[slot] ?? null;
 
-/** 部件组是否为被时装替换的头部组 */
-const headReplaced = (g: PartGroup) =>
-  !!props.dress?.fashionOn && props.dress.isHeadGroup(g.signature);
+/** 独立组显示名：girl_head / boy_head 显示为「头」（保留" (附加)"等后缀） */
+const groupLabel = (g: PartGroup) => g.label.replace(/(?:girl|boy)_head/i, "头");
 
 /** 渲染行：槽卡片在前（每个槽一张），其后独立组（跳过已并入槽的组） */
 const rows = computed(() => {
@@ -137,9 +134,22 @@ function slotInfo(slot: string): PartInfo | null {
   return props.skin.slotOptions(slot).find((p) => p.path === cur) ?? null;
 }
 
-/** 槽选项显示名：根目录成员 = 默认，YiFu 换装取尾部编号（girl_Upper_1 → 款式 1） */
-function variantLabel(p: PartInfo) {
-  if (p.inRoot) return "默认";
+/** 槽选项显示名：根目录成员唯一时 = 默认（基础模型目录语义）；
+ *  多个根目录成员（装备目录单模型预览，FS01_Upper / MS01_Upper）用文件名区分，
+ *  YiFu 换装取尾部编号（girl_Upper_1 → 款式 1） */
+function slotSelectOptions(slot: string): { label: string; value: string }[] {
+  const parts = props.skin.slotOptions(slot);
+  const rootCount = parts.filter((p) => p.inRoot).length;
+  return parts.map((p) => ({
+    label: variantLabel(p, rootCount),
+    value: p.path,
+  }));
+}
+
+function variantLabel(p: PartInfo, rootCount: number): string {
+  if (p.inRoot) {
+    return rootCount > 1 ? p.fileName.replace(/\.fskin$/i, "") : "默认";
+  }
   const m = p.fileName.match(/_(\d+)\.fskin$/i);
   if (m) return `款式 ${Number(m[1])}`;
   return p.fileName.replace(/\.fskin$/i, "").replace(/^girl_/i, "");

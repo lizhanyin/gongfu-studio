@@ -2,9 +2,37 @@
      从 App.vue 挪出为独立组件：改本文件 = 只重载检查器子树（plugin-vue 自接受），
      视口与资源树不受影响；内部折叠状态在重载时重置。 -->
 <template>
-  <aside class="inspector" :class="{ collapsed: inspectorCollapsed }">
+  <aside
+    class="inspector"
+    :class="{ collapsed: inspectorCollapsed, dragging: inspectorDragging }"
+    :style="!inspectorCollapsed ? { width: inspectorWidth + 'px' } : undefined"
+  >
+    <!-- 左缘拖拽调整宽度（折叠时隐藏） -->
+    <div
+      v-if="!inspectorCollapsed"
+      class="drag-handle drag-v left-edge"
+      title="拖拽调整宽度"
+      @mousedown="startInspectorDrag"
+    ></div>
     <div class="inspector-head">
       <span v-if="!inspectorCollapsed">检查器</span>
+      <!-- 浏览时装目录时：顶部常驻基础模型（性别）切换，便于对照男女款 -->
+      <n-button-group
+        v-if="!inspectorCollapsed && fashionBrowsing && dress?.catalog"
+        size="tiny"
+        class="head-base-switch"
+      >
+        <n-button
+          v-for="b in dress.catalog.bases"
+          :key="b.key"
+          size="tiny"
+          :type="dress.baseKey === b.key ? 'primary' : 'default'"
+          :title="`切换基础模型: ${b.label}`"
+          @click="dress.switchBase(b.key)"
+        >
+          {{ b.gender === "f" ? "女体" : "男体" }}
+        </n-button>
+      </n-button-group>
       <n-button
         size="tiny"
         quaternary
@@ -55,6 +83,16 @@
         从资源网格选择文件预览
       </div>
     </div>
+    <!-- 拖拽提示浮标（Teleport 到 body 避免被 overflow 裁剪） -->
+    <Teleport to="body">
+      <div
+        v-if="tip"
+        class="drag-tip"
+        :style="{ left: tip.x + 14 + 'px', top: tip.y + 14 + 'px' }"
+      >
+        检查器 {{ inspectorWidth }}px
+      </div>
+    </Teleport>
   </aside>
 </template>
 
@@ -72,6 +110,7 @@ import ActFileInfo from "./ActFileInfo.vue";
 import FakFileInfo from "./FakFileInfo.vue";
 import FsmFileInfo from "./FsmFileInfo.vue";
 import PartInspector from "./PartInspector.vue";
+import type { ResourceTreeStore } from "../composables/useResourceTree";
 
 const props = defineProps<{
   skin: SkinStore;
@@ -79,11 +118,53 @@ const props = defineProps<{
   fak: FakStore;
   fsm: FsmStore;
   dress?: DressStore;
+  res: ResourceTreeStore;
 }>();
 
 /** 帽子挂点骨骼候选：当前骨架的骨名 */
 const actSkeletonNames = computed(() => props.act.actMeta?.boneNames ?? []);
 
+/** 正在浏览时装目录（shizhuang / transformfashion，磁盘与 cpk: 路径通用） */
+const fashionBrowsing = computed(() => {
+  const dir = (props.res.currentDir ?? "").toLowerCase();
+  return dir
+    .split(/[\\/]+/)
+    .some((s) => s === "shizhuang" || s === "transformfashion");
+});
+
 const inspectorCollapsed = ref(false);
+
+// ---------------- 宽度拖拽（左缘把手，提示浮标跟随光标，松手持久化） ----------------
+
+const inspectorWidth = ref(
+  (() => {
+    const n = Number(localStorage.getItem("panel.inspectorW"));
+    return Number.isFinite(n) && n > 0 ? Math.min(620, Math.max(220, n)) : 320;
+  })()
+);
+const inspectorDragging = ref(false);
+const tip = ref<{ x: number; y: number } | null>(null);
+
+function startInspectorDrag(ev: MouseEvent) {
+  ev.preventDefault();
+  const x0 = ev.clientX;
+  const w0 = inspectorWidth.value;
+  inspectorDragging.value = true;
+  const onMove = (e: MouseEvent) => {
+    inspectorWidth.value = Math.min(620, Math.max(220, w0 - (e.clientX - x0)));
+    tip.value = { x: e.clientX, y: e.clientY };
+  };
+  const onUp = () => {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+    inspectorDragging.value = false;
+    tip.value = null;
+    document.body.classList.remove("panel-dragging");
+    localStorage.setItem("panel.inspectorW", String(inspectorWidth.value));
+  };
+  document.body.classList.add("panel-dragging");
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+}
 </script>
 
