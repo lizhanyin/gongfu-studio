@@ -1,17 +1,28 @@
 //! .fak (AKK v1.0) 顶点动画模型解析与序列化
 //!
-//! 布局（2026-10 对 res/system/Monster/G080/G080.FAK 全字节逆向验证）:
+//! 布局（2026-10 对 res/system/Monster/G080/G080.FAK 全字节逆向验证；
+//! 2026-10 对 system.cpk 全量 696 个 FAK 归纳修正）:
 //!   0x00 "AKK\0" | 0x04 版本 | 0x08 顶点数 | 0x0C 子网格数
 //!   0x10 子网格区偏移(恒0x13C) | 0x14 材质数 | 0x18 材质区偏移
 //!   0x1C 帧数 | 0x20 帧区偏移 | 0x24 bbox max/min 各3个f32
 //!   0x3C..0x13C 保留256字节
-//!   子网格区 ×N: [u16 0][u16 序号][u16 0][u16 顶点数][bbox 6f32][u32 三角形数]
-//!                [u16 索引×3n][20字节0填充]
-//!   帧区 ×N: 首帧直接开始，其后每帧前有 [u32 0] 分隔符，区末 [u32 0] 终止:
-//!            [动作名4B][f32 帧时长][u32 顶点数][顶点记录 32B ×N]
-//!            顶点记录: [pos3][normal3][uv2]，法线未归一化（长度2.1~3.0）
-//!   材质区 ×N: 等分至文件尾，每条: [u32 序号][diffuse/ambient/emissive/specular
+//!   子网格区 ×N: 与 FSM 同款记录 [u16 基地址][u16 序号][u16 ?0][u16 该节
+//!                顶点数][bbox 6f32][u32 三角形数][u16 索引×3n][20字节0填充]
+//!                序号多为材质序号且可共用（G09BDW022 节8-13 同为 8）；
+//!                顶点数为共享池子集，索引为节内局部（加基地址成全局，
+//!                bbox 判据：局部误差 0.00 / 全局误差 ~1500）
+//!   帧区 ×N: [动作名4B][f32 帧时长][u32 顶点数][顶点记录 32B ×N]
+//!            [u32 挂点数][挂点记录 36B ×N]
+//!            每帧之后都恰好一个挂点块标记（G080 恒 0 = 无挂点；bs001
+//!            每帧 4 个 eft1-4 特效挂点，位置/朝向逐帧动画——顶点动画
+//!            无骨架，挂点只能逐帧烘焙）。挂点记录: [名4B][f32×7 前3位置
+//!            后4四元数][4B 尾(多 00 CC CC CC)]，与 FSM 挂点同构
+//!   材质区 ×N: 等分至文件尾（全量实测恒 0x46C/条，与 FSKIN/FSM 材质槽
+//!            同宽），每条: [u32 序号][diffuse/ambient/emissive/specular
 //!            各4f32][f32 高光强度][3字节前缀][NUL结尾路径][0填充]
+//!   变体：N144 类纯挂点定位模型（顶点数 0、帧数据空、每帧挂点块非 0，
+//!         bbox 为 FLT_MAX 空盒）；G036 类损坏样本（区域偏移与计数全 0
+//!         但文件含数据）——按空模型解析，残留字节进 tail 原样保留。
 //!
 //! 帧区为逐帧完整顶点快照（vertex morph，无骨骼）。同名连续帧合并为动作
 //! （G080: atck20/spck28/bek7/std20/walk12/dead46 = 133 帧）。UV 经全部帧
@@ -30,15 +41,33 @@ const HEADER_LEN: usize = 0x3C;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct FakSubmesh {
-    /// 记录头 [u16 0][u16 序号] 中的序号
+    /// 记录头 [u16 基地址][u16 序号][u16 ?0][u16 顶点数] 中的序号，
+    /// 通常为材质序号；多节可共用（G09BDW022 节8-13 同为 8）
     pub index: u16,
-    /// 记录头里语义未定的两个 u16 0，按原样保留保证往返一致
-    pub pad: [u16; 2],
+    /// 该节顶点段在共享池中的起始下标（文件内三角形索引的基地址）
+    pub base_vertex: u16,
+    /// 记录头里语义未定的 u16 0，按原样保留保证往返一致
+    pub pad: u16,
+    /// 该节顶点数：共享池的子集（单节文件等于全池）
+    pub vertex_count: u16,
     pub bbox_max: [f32; 3],
     pub bbox_min: [f32; 3],
-    /// 扁平 u16 索引，每 3 个为一个三角形，引用共享顶点池
+    /// 扁平 u16 索引，每 3 个为一个三角形。文件内为节内局部索引，
+    /// 解析时已加 baseVertex 转为共享池全局索引；序列化时减回
     pub triangles: Vec<u16>,
     /// 记录尾填充（原样保留）
+    pub tail: Vec<u8>,
+}
+
+/// 逐帧挂点记录（与 FSM 挂点同构；顶点动画无骨架，挂点逐帧烘焙）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FakDummy {
+    /// 定长 4 字节字段，去尾部 NUL
+    pub name: String,
+    /// 前 3 个为位置，后 4 个为朝向四元数
+    pub values: [f32; 7],
+    /// 记录尾 4B（多为 00 CC CC CC，按原样保留）
     pub tail: Vec<u8>,
 }
 
@@ -51,6 +80,8 @@ pub struct FakFrame {
     pub frame_dt: f32,
     /// 扁平顶点数据：每顶点 8 个 f32 = [pos3][normal3][uv2]
     pub data: Vec<f32>,
+    /// 该帧之后的挂点块（可为空）
+    pub dummies: Vec<FakDummy>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -90,6 +121,9 @@ pub struct FakModel {
     pub materials: Vec<FakMaterial>,
     /// 同名连续帧合并的动作分段（解析时生成，序列化时重算）
     pub actions: Vec<FakAction>,
+    /// 各区之后的残留字节（G036 类损坏样本区域计数全 0 但含数据；
+    /// 正常文件为空）
+    pub tail: Vec<u8>,
 }
 
 struct Reader<'a> {
@@ -163,13 +197,14 @@ pub fn parse_fak(path: &str, bytes: &[u8]) -> Result<FakModel, String> {
     for v in &mut bbox_min {
         *v = rh.f32()?;
     }
-    if submesh_off != SUBMESH_OFFSET {
+    if submesh_count > 0 && submesh_off != SUBMESH_OFFSET {
         return Err(format!("异常的子网格区偏移 0x{submesh_off:x}"));
     }
     if vertex_count as usize > u16::MAX as usize {
         return Err(format!("顶点数 {vertex_count} 超 u16 索引范围"));
     }
-    if !(submesh_off < frame_off && frame_off <= material_off && material_off <= bytes.len()) {
+    // N144 类纯挂点模型子网格区与帧区同偏移；G036 类损坏样本偏移全 0
+    if !(submesh_off <= frame_off && frame_off <= material_off && material_off <= bytes.len()) {
         return Err(format!(
             "区偏移异常: 子网格 0x{submesh_off:x} 帧 0x{frame_off:x} 材质 0x{material_off:x}"
         ));
@@ -181,16 +216,14 @@ pub fn parse_fak(path: &str, bytes: &[u8]) -> Result<FakModel, String> {
     r.pos = submesh_off;
     let mut submeshes = Vec::with_capacity(submesh_count);
     for i in 0..submesh_count {
-        let pad_a = r.u16()?;
+        let base_vertex = r.u16()?;
         let index = r.u16()?;
-        let pad_b = r.u16()?;
+        let pad = r.u16()?;
         let vc = r.u16()?;
-        if index != i as u16 {
-            return Err(format!("子网格序号跳变: 期望 {i} 实际 {index} @0x{:x}", r.pos - 6));
-        }
-        if vc as u32 != vertex_count {
+        if base_vertex as u32 + vc as u32 > vertex_count {
             return Err(format!(
-                "子网格顶点数 {vc} 与头部 {vertex_count} 不符 @0x{:x}",
+                "子网格 {i} 顶点段 [{base_vertex}, {}) 超出共享池 {vertex_count} @0x{:x}",
+                base_vertex as u32 + vc as u32,
                 r.pos - 2
             ));
         }
@@ -205,38 +238,38 @@ pub fn parse_fak(path: &str, bytes: &[u8]) -> Result<FakModel, String> {
         let tri_count = r.u32()? as usize;
         let mut triangles = Vec::with_capacity(tri_count * 3);
         for _ in 0..tri_count * 3 {
-            let idx = r.u16()?;
-            if idx as u32 >= vertex_count {
-                return Err(format!("子网格 {i} 索引 {idx} 越界（顶点数 {vertex_count}）"));
+            let local = r.u16()? as u32;
+            let global = base_vertex as u32 + local;
+            if global >= vertex_count {
+                return Err(format!(
+                    "子网格 {i} 局部索引 {local}+{base_vertex} 越界（顶点池 {vertex_count}）"
+                ));
             }
-            triangles.push(idx);
+            triangles.push(global as u16);
         }
         let tail = r.take(SUBMESH_TAIL)?.to_vec();
         submeshes.push(FakSubmesh {
             index,
-            pad: [pad_a, pad_b],
+            base_vertex,
+            pad,
+            vertex_count: vc,
             bbox_max,
             bbox_min,
             triangles,
             tail,
         });
     }
-    if r.pos != frame_off {
+    if submesh_count > 0 && r.pos != frame_off {
         return Err(format!(
             "子网格区结束于 0x{:x}，与帧区偏移 0x{frame_off:x} 不吻合（尾部填充长度假设失效）",
             r.pos
         ));
     }
 
-    // ---- 帧区 ----
+    // ---- 帧区：每帧 [名][时长][顶点数][数据] 后跟 [u32 挂点数][挂点 ×N] ----
+    r.pos = frame_off;
     let mut frames = Vec::with_capacity(frame_count);
     for i in 0..frame_count {
-        if i > 0 {
-            let sep = r.u32()?;
-            if sep != 0 {
-                return Err(format!("帧分隔符非 0: {sep} @0x{:x}", r.pos - 4));
-            }
-        }
         let name_raw = r.take(4)?;
         let end = name_raw.iter().position(|&b| b == 0).unwrap_or(name_raw.len());
         let name = String::from_utf8_lossy(&name_raw[..end]).into_owned();
@@ -251,21 +284,35 @@ pub fn parse_fak(path: &str, bytes: &[u8]) -> Result<FakModel, String> {
         let n = vc as usize * 8;
         let mut data = Vec::with_capacity(n);
         for _ in 0..n {
-            let v = r.f32()?;
-            if !v.is_finite() {
-                return Err(format!("帧 {i} 含非有限浮点 @0x{:x}", r.pos - 4));
+            // N149 等资产帧数据含 NaN（导出时未初始化内存，引擎照用），
+            // 按比特原样保留；走位错误由帧数与区偏移落点检查兜底
+            data.push(r.f32()?);
+        }
+        let dc = r.u32()? as usize;
+        if dc > 64 {
+            return Err(format!("帧 {i} 挂点数 {dc} 异常 @0x{:x}", r.pos - 4));
+        }
+        let mut dummies = Vec::with_capacity(dc);
+        for _ in 0..dc {
+            let name_raw = r.take(4)?;
+            let end = name_raw
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_raw.len());
+            let name = String::from_utf8_lossy(&name_raw[..end]).into_owned();
+            let mut values = [0f32; 7];
+            for v in values.iter_mut() {
+                *v = r.f32()?;
             }
-            data.push(v);
+            let tail = r.take(4)?.to_vec();
+            dummies.push(FakDummy { name, values, tail });
         }
         frames.push(FakFrame {
             name,
             frame_dt,
             data,
+            dummies,
         });
-    }
-    let term = r.u32()?;
-    if term != 0 {
-        return Err(format!("帧区终止符非 0: {term}"));
     }
     if r.pos != material_off {
         return Err(format!(
@@ -276,11 +323,7 @@ pub fn parse_fak(path: &str, bytes: &[u8]) -> Result<FakModel, String> {
 
     // ---- 材质区：material_count 条记录等分到文件尾 ----
     let region = bytes.len() - material_off;
-    if material_count == 0 {
-        if region != 0 {
-            return Err("材质数为 0 但材质区非空".into());
-        }
-    } else if region % material_count != 0 {
+    if material_count > 0 && region % material_count != 0 {
         return Err(format!(
             "材质区 {region} 字节不能被 {material_count} 条记录整除"
         ));
@@ -312,7 +355,7 @@ pub fn parse_fak(path: &str, bytes: &[u8]) -> Result<FakModel, String> {
             .position(|&c| c == 0)
             .map(|p| r.pos + p)
             .ok_or("纹理路径未终止")?;
-        let texture_path = String::from_utf8_lossy(&bytes[r.pos..p_end]).into_owned();
+        let texture_path = crate::fskin::decode_path(&bytes[r.pos..p_end]);
         r.pos = p_end + 1;
         let tail = bytes[r.pos..rec_end].to_vec();
         // 对齐到记录末尾（等长记录的固定填充）
@@ -330,6 +373,10 @@ pub fn parse_fak(path: &str, bytes: &[u8]) -> Result<FakModel, String> {
         });
     }
 
+    // 区域之后的残留（G036 类损坏样本；正常文件为空）
+    let content_end = r.pos.max(SUBMESH_OFFSET);
+    let tail = bytes[content_end..].to_vec();
+
     let actions = split_actions(&frames);
     Ok(FakModel {
         path: path.to_string(),
@@ -342,6 +389,7 @@ pub fn parse_fak(path: &str, bytes: &[u8]) -> Result<FakModel, String> {
         frames,
         materials,
         actions,
+        tail,
     })
 }
 
@@ -369,27 +417,28 @@ pub fn serialize_fak(m: &FakModel) -> Result<Vec<u8>, String> {
         if s.tail.len() != SUBMESH_TAIL {
             return Err("子网格尾部填充长度异常".into());
         }
-        push_u16(&mut sbuf, s.pad[0]);
+        push_u16(&mut sbuf, s.base_vertex);
         push_u16(&mut sbuf, s.index);
-        push_u16(&mut sbuf, s.pad[1]);
-        push_u16(&mut sbuf, m.vertex_count.min(u16::MAX as u32) as u16);
+        push_u16(&mut sbuf, s.pad);
+        push_u16(&mut sbuf, s.vertex_count);
         for x in s.bbox_max.iter().chain(s.bbox_min.iter()) {
             push_f32(&mut sbuf, *x);
         }
         push_u32(&mut sbuf, (s.triangles.len() / 3) as u32);
         for t in &s.triangles {
-            push_u16(&mut sbuf, *t);
+            // 全局索引减回基地址还原为节内局部索引
+            let local = t.checked_sub(s.base_vertex).ok_or_else(|| {
+                format!("索引 {t} 低于子网格基地址 {}，无法还原局部索引", s.base_vertex)
+            })?;
+            push_u16(&mut sbuf, local);
         }
         sbuf.extend_from_slice(&s.tail);
     }
     let frame_off = SUBMESH_OFFSET + sbuf.len();
 
-    // 帧区
+    // 帧区：每帧 [名][时长][顶点数][数据][u32 挂点数][挂点记录]
     let mut fbuf = Vec::new();
     for (i, f) in m.frames.iter().enumerate() {
-        if i > 0 {
-            push_u32(&mut fbuf, 0);
-        }
         let name = f.name.as_bytes();
         if name.len() > 4 || name.contains(&0u8) {
             return Err(format!("帧名 {name:?} 超出 4 字节定长字段"));
@@ -405,8 +454,24 @@ pub fn serialize_fak(m: &FakModel) -> Result<Vec<u8>, String> {
         for v in &f.data {
             push_f32(&mut fbuf, *v);
         }
+        push_u32(&mut fbuf, f.dummies.len() as u32);
+        for d in &f.dummies {
+            let name = d.name.as_bytes();
+            if name.len() > 4 || name.contains(&0u8) {
+                return Err(format!("挂点名 {name:?} 超出 4 字节定长字段"));
+            }
+            let mut field = [0u8; 4];
+            field[..name.len()].copy_from_slice(name);
+            fbuf.extend_from_slice(&field);
+            for x in d.values.iter() {
+                push_f32(&mut fbuf, *x);
+            }
+            if d.tail.len() != 4 {
+                return Err("挂点尾部填充长度异常".into());
+            }
+            fbuf.extend_from_slice(&d.tail);
+        }
     }
-    push_u32(&mut fbuf, 0);
     let material_off = frame_off + fbuf.len();
 
     // 材质区
@@ -420,26 +485,35 @@ pub fn serialize_fak(m: &FakModel) -> Result<Vec<u8>, String> {
         }
         push_f32(&mut mbuf, mat.spec_power);
         mbuf.extend_from_slice(&mat.pre);
-        let path_bytes = mat.texture_path.as_bytes();
+        let path_bytes = crate::fskin::encode_path(&mat.texture_path);
         if path_bytes.contains(&0u8) {
             return Err("纹理路径含非法字符".into());
         }
-        mbuf.extend_from_slice(path_bytes);
+        mbuf.extend_from_slice(&path_bytes);
         mbuf.push(0);
         mbuf.extend_from_slice(&mat.tail);
     }
 
+    // G036 类损坏样本：区域全空但带残留 → 保留原始全零偏移
+    let degenerate = m.submeshes.is_empty()
+        && m.frames.is_empty()
+        && m.materials.is_empty()
+        && !m.tail.is_empty();
+
     // 头部
-    let mut out = Vec::with_capacity(material_off + mbuf.len());
+    let mut out = Vec::with_capacity(material_off + mbuf.len() + m.tail.len());
     out.extend_from_slice(b"AKK\0");
     push_u32(&mut out, m.version);
     push_u32(&mut out, m.vertex_count);
     push_u32(&mut out, m.submeshes.len() as u32);
-    push_u32(&mut out, SUBMESH_OFFSET as u32);
+    push_u32(
+        &mut out,
+        if degenerate { 0 } else { SUBMESH_OFFSET as u32 },
+    );
     push_u32(&mut out, m.materials.len() as u32);
-    push_u32(&mut out, material_off as u32);
+    push_u32(&mut out, if degenerate { 0 } else { material_off as u32 });
     push_u32(&mut out, m.frames.len() as u32);
-    push_u32(&mut out, frame_off as u32);
+    push_u32(&mut out, if degenerate { 0 } else { frame_off as u32 });
     for x in m.bbox_max.iter() {
         push_f32(&mut out, *x);
     }
@@ -451,6 +525,7 @@ pub fn serialize_fak(m: &FakModel) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&sbuf);
     out.extend_from_slice(&fbuf);
     out.extend_from_slice(&mbuf);
+    out.extend_from_slice(&m.tail);
     Ok(out)
 }
 
@@ -531,28 +606,68 @@ mod tests {
         fs::read(&p).ok()
     }
 
-    /// 临时诊断：直接解析用户文件
+    /// 临时全量回归已通过（CPK 695 个 FAK 全部解析+字节往返，2026-10），
+    /// 以下为固定样本回归：分段顶点池 / 逐帧动画挂点 / 纯挂点定位模型。
     #[test]
-    fn tmp_parse_user_fak() {
-        let bytes = fs::read(r"E:\Workspace\res\bs001\bs001.fak").unwrap();
-        match parse_fak("bs001.fak", &bytes) {
-            Ok(m) => {
-                eprintln!(
-                    "OK: v={} verts={} submeshes={} frames={} materials={} actions={:?}",
-                    m.version,
-                    m.vertex_count,
-                    m.submeshes.len(),
-                    m.frames.len(),
-                    m.materials.len(),
-                    m.actions
-                        .iter()
-                        .map(|a| format!("{}×{}", a.name, a.frame_count))
-                        .collect::<Vec<_>>()
-                );
-                let out = serialize_fak(&m).unwrap();
-                eprintln!("roundtrip byte-equal: {}", bytes == out);
-            }
-            Err(e) => panic!("解析失败: {e}"),
+    fn segmented_and_dummy_variants() {
+        let base_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/system");
+        // (相对路径, 顶点数, 子网格数, 材质数, 帧数)
+        let cases = [
+            ("Building/g09/G09DW17.FAK", 8u32, 2usize, 1usize, 55usize),
+            ("NPC/N128.FAK", 472, 1, 1, 9),
+            ("NPC/N144.FAK", 0, 0, 0, 9),
+        ];
+        for (rel, vc, sc, mc, fc) in cases {
+            let p = format!("{base_dir}/{rel}");
+            let Ok(bytes) = fs::read(&p) else {
+                eprintln!("跳过: {p} 不存在");
+                continue;
+            };
+            let m = parse_fak(rel, &bytes).unwrap();
+            assert_eq!(m.vertex_count, vc, "{rel}");
+            assert_eq!(m.submeshes.len(), sc, "{rel}");
+            assert_eq!(m.materials.len(), mc, "{rel}");
+            assert_eq!(m.frames.len(), fc, "{rel}");
+            let out = serialize_fak(&m).unwrap();
+            assert_eq!(bytes, out, "{rel} 往返不一致");
+        }
+        // G09DW17：8 顶点池拆成两节 [0,4)+[4,8)，索引为节内局部
+        let p = format!("{base_dir}/Building/g09/G09DW17.FAK");
+        if let Ok(bytes) = fs::read(&p) {
+            let m = parse_fak("G09DW17", &bytes).unwrap();
+            assert_eq!(
+                (m.submeshes[0].base_vertex, m.submeshes[0].vertex_count),
+                (0, 4)
+            );
+            assert_eq!(
+                (m.submeshes[1].base_vertex, m.submeshes[1].vertex_count),
+                (4, 4)
+            );
+            // 全局索引应落在各自顶点段内
+            assert!(m.submeshes[0].triangles.iter().all(|&t| t < 4));
+            assert!(m.submeshes[1].triangles.iter().all(|&t| (4..8).contains(&t)));
+        }
+        // N128：每帧挂点 ride 的位置逐帧变化（顶点动画无骨架，挂点逐帧烘焙）
+        let p = format!("{base_dir}/NPC/N128.FAK");
+        if let Ok(bytes) = fs::read(&p) {
+            let m = parse_fak("N128", &bytes).unwrap();
+            let y0 = m.frames[0].dummies[0].values[1];
+            let y1 = m.frames[1].dummies[0].values[1];
+            assert_eq!(m.frames[0].dummies[0].name, "ride");
+            assert!((y0 - 249.4).abs() < 0.1 && (y1 - 254.1).abs() < 0.1);
+            assert!((y1 - y0).abs() > 1.0, "挂点位置应逐帧变化");
+        }
+        // N144：0 顶点纯挂点定位模型，每帧 2 个挂点（ride + eft1）
+        let p = format!("{base_dir}/NPC/N144.FAK");
+        if let Ok(bytes) = fs::read(&p) {
+            let m = parse_fak("N144", &bytes).unwrap();
+            assert!(m.frames.iter().all(|f| f.data.is_empty()));
+            assert!(m
+                .frames
+                .iter()
+                .all(|f| f.dummies.len() == 2
+                    && f.dummies[0].name == "ride"
+                    && f.dummies[1].name == "eft1"));
         }
     }
 

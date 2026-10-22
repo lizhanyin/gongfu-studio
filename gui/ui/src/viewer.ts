@@ -2811,7 +2811,7 @@ export class Viewer {
   /**
    * 构建顶点动画模型：每个子网格一个 Mesh，几何引用同一份共享顶点池属性
    * （position/normal 逐帧更新，UV 经全帧验证恒定作静态属性）。
-   * mats[i] 为子网格 i 的贴图（按材质记录序号一一对应）。
+   * mats[k] 为材质 k 的贴图；子网格按记录自带序号选用材质。
    */
   setFak(model: FakModel, mats: { tex: TexData | null; file: string | null }[]) {
     this.clearFak();
@@ -2831,13 +2831,15 @@ export class Viewer {
     this.fakPos.setUsage(THREE.DynamicDrawUsage);
     this.fakNrm.setUsage(THREE.DynamicDrawUsage);
 
-    model.submeshes.forEach((s, i) => {
+    model.submeshes.forEach((s) => {
       const geom = new THREE.BufferGeometry();
       geom.setAttribute("position", this.fakPos!);
       geom.setAttribute("normal", this.fakNrm!);
       geom.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
       geom.setIndex(s.triangles);
-      const fm = model.materials[Math.min(i, model.materials.length - 1)];
+      // 材质按记录自带序号（多节可共用同一材质）
+      const matIdx = Math.min(s.index, model.materials.length - 1);
+      const fm = model.materials[matIdx];
       const mat = new THREE.MeshStandardMaterial({
         side: THREE.DoubleSide,
         roughness: 0.75,
@@ -2848,7 +2850,7 @@ export class Viewer {
         mat.emissive.setRGB(fm.emissive[0], fm.emissive[1], fm.emissive[2]);
         mat.roughness = Math.max(0.05, Math.min(1, 1 - fm.specPower / 60));
       }
-      const m = mats[i];
+      const m = mats[matIdx];
       if (m?.tex && m.file) mat.map = this.getTexture(m.file, m.tex);
       const mesh = new THREE.Mesh(geom, mat);
       mesh.frustumCulled = false; // 顶点动画变形后静态包围球不再可靠

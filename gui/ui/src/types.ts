@@ -159,13 +159,27 @@ export interface FskelMeta {
 
 // ---------------- FAK 顶点动画 ----------------
 
+/** FAK 子网格：头字段为 [基地址][序号][?][顶点数]；triangles 已是共享池全局索引 */
 export interface FakSubmesh {
   index: number;
-  pad: number[];
+  /** 该节顶点段在共享池中的起始下标（文件内索引的基地址） */
+  baseVertex: number;
+  /** 语义未定的 u16 0 */
+  pad: number;
+  /** 该节顶点数（共享池子集） */
+  vertexCount: number;
   bboxMax: number[];
   bboxMin: number[];
-  /** 扁平 u16 索引，每 3 个为一个三角形，引用共享顶点池 */
+  /** 扁平 u16 索引，每 3 个一个三角形 */
   triangles: number[];
+  tail: number[];
+}
+
+/** 逐帧挂点（顶点动画无骨架，挂点逐帧烘焙；与 FSM 挂点同构） */
+export interface FakDummy {
+  name: string;
+  /** 前 3 个位置，后 4 个朝向四元数 */
+  values: number[];
   tail: number[];
 }
 
@@ -175,6 +189,8 @@ export interface FakFrame {
   frameDt: number;
   /** 扁平顶点数据：每顶点 8 个 f32 = [pos3][normal3][uv2] */
   data: number[];
+  /** 该帧之后的挂点块（可为空） */
+  dummies: FakDummy[];
 }
 
 export interface FakMaterial {
@@ -206,6 +222,8 @@ export interface FakModel {
   frames: FakFrame[];
   materials: FakMaterial[];
   actions: FakAction[];
+  /** 各区之后的残留字节（G036 类损坏样本；正常文件为空） */
+  tail: number[];
 }
 
 /** FSM 子网格/材质记录与 FAK 逐字节同构（见 gui/src/fsm.rs） */
