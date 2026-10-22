@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  CharacterCatalog,
   FakModel,
   FsmModel,
   FskinModel,
@@ -11,6 +12,8 @@ import type {
 
 export const api = {
   scanModelSet: (dir: string) => invoke<ModelSet>("scan_model_set", { dir }),
+  /** 角色装扮目录扫描：基础模型 / 装备槽 / 时装 + 全根贴图索引 */
+  scanCharacter: (root: string) => invoke<CharacterCatalog>("scan_character", { root }),
   loadFskin: (path: string) => invoke<FskinModel>("load_fskin", { path }),
   saveFskin: (path: string, model: FskinModel) =>
     invoke<void>("save_fskin", { path, model }),
@@ -35,6 +38,8 @@ export const api = {
   listResDir: (dir: string) => invoke<ResEntry[]>("list_res_dir", { dir }),
   // 资源导出 / 导入（src 支持磁盘与 cpk: 包内路径；导入目标仅磁盘目录）
   exportFile: (src: string, dest: string) => invoke<void>("export_file", { src, dest }),
+  /** 模型导出（fskin/fsm/fak）：原样复制模型 + 材质关联纹理一并导出到同目录 */
+  exportModel: (src: string, dest: string) => invoke<string>("export_model", { src, dest }),
   exportDir: (src: string, destDir: string) => invoke<string>("export_dir", { src, destDir }),
   importFile: (src: string, destDir: string) => invoke<string>("import_file", { src, destDir }),
   // FAK 顶点动画模型（含全部帧顶点数据）

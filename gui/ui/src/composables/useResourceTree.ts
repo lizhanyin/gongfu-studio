@@ -12,6 +12,8 @@ export interface TreeNode {
   label: string;
   isDir: true;
   isModel: boolean;
+  /** 角色资源根（AvatarGirl/装备/时装目录的父目录，可进入角色装扮） */
+  isCharacter: boolean;
   isLeaf: false;
   children?: TreeNode[];
 }
@@ -22,6 +24,7 @@ function toNode(e: ResEntry): TreeNode {
     label: e.name,
     isDir: true,
     isModel: e.isModel,
+    isCharacter: !!e.isCharacter,
     isLeaf: false,
   };
 }
@@ -52,6 +55,7 @@ export function useResourceTree() {
           label,
           isDir: true,
           isModel: false,
+          isCharacter: false,
           isLeaf: false,
         },
       ];
@@ -109,13 +113,17 @@ export function useResourceTree() {
   /** 是否 CPK 包浏览模式（包内目录只读，不支持导入） */
   const isCpk = computed(() => rootDir.value.startsWith("cpk:"));
 
-  /** 导出单个资源文件（CPK 包内文件同样可导出） */
+  /** 导出单个资源文件（CPK 包内文件同样可导出）；模型文件（fskin/fsm/fak）连同关联纹理一起导出 */
   async function exportFile(path: string, name: string) {
     const dest = await save({ defaultPath: name });
     if (!dest) return;
     try {
-      await api.exportFile(path, dest);
-      message.success(`已导出: ${name}`);
+      if (/\.(fskin|fsm|fak)$/i.test(path)) {
+        message.success(await api.exportModel(path, dest));
+      } else {
+        await api.exportFile(path, dest);
+        message.success(`已导出: ${name}`);
+      }
     } catch (e) {
       message.error(`导出失败: ${e}`);
     }

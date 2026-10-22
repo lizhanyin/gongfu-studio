@@ -25,7 +25,7 @@
     <div
       v-if="row.slot"
       class="part-card"
-      :class="{ selected: skin.selectedPart === skin.slotCurrent(row.slot) }"
+      :class="{ selected: skin.selectedPart === skin.slotCurrent(row.slot), replaced: !!replacedBy(row.slot) }"
       @click="skin.selectPart(skin.slotCurrent(row.slot))"
     >
       <div class="row">
@@ -35,7 +35,8 @@
           @update:value="(v: boolean) => skin.toggleSlot(row.slot, v)"
         />
         <span class="name">{{ slotLabel(row.slot) }}</span>
-        <span v-if="skin.isDirty(skin.slotCurrent(row.slot))" class="dirty-dot">●</span>
+        <span v-if="replacedBy(row.slot)" class="replaced-note">由{{ replacedBy(row.slot) }}替换</span>
+        <span v-else-if="skin.isDirty(skin.slotCurrent(row.slot))" class="dirty-dot">●</span>
         <n-select
           size="tiny"
           style="width: 140px"
@@ -56,7 +57,10 @@
     <div
       v-else
       class="part-card"
-      :class="{ selected: skin.selectedPart === skin.groupSel.get(row.group!.signature) }"
+      :class="{
+        selected: skin.selectedPart === skin.groupSel.get(row.group!.signature),
+        replaced: headReplaced(row.group!),
+      }"
       @click="skin.selectPart(skin.groupSel.get(row.group!.signature) ?? null)"
     >
       <div class="row">
@@ -66,6 +70,7 @@
           @update:value="(v: boolean) => skin.toggleGroup(row.group!, v)"
         />
         <span class="name" :title="row.group!.label">{{ row.group!.label }}</span>
+        <span v-if="headReplaced(row.group!)" class="replaced-note">由时装替换</span>
         <span v-if="skin.isDirty(skin.groupSel.get(row.group!.signature))" class="dirty-dot">●</span>
         <n-select
           v-if="row.group!.parts.length > 1"
@@ -89,10 +94,18 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { SkinStore } from "../composables/useSkinMode";
+import type { DressStore } from "../composables/useDressMode";
 import type { PartGroup, PartInfo } from "../types";
 import { shortName } from "../utils";
 
-const props = defineProps<{ skin: SkinStore }>();
+const props = defineProps<{ skin: SkinStore; dress?: DressStore }>();
+
+/** 基础槽被装备/时装替换的来源标签（角色装扮模式） */
+const replacedBy = (slot: string) => props.dress?.replacedBaseSlots[slot] ?? null;
+
+/** 部件组是否为被时装替换的头部组 */
+const headReplaced = (g: PartGroup) =>
+  !!props.dress?.fashionOn && props.dress.isHeadGroup(g.signature);
 
 /** 渲染行：槽卡片在前（每个槽一张），其后独立组（跳过已并入槽的组） */
 const rows = computed(() => {

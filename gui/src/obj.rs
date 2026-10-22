@@ -1,7 +1,6 @@
-//! OBJ 导出：多个 fskin 合并为一个完整模型
+//! 模型导出：OBJ 合并导出（多个 fskin）与右键单文件导出（模型 + 关联纹理）
 
-use crate::fskin::parse_fskin;
-use crate::vfs;
+use crate::{fak, fsm, fskin, vfs};
 use std::fs;
 use std::path::Path;
 
@@ -34,7 +33,7 @@ pub fn export_obj(paths: &[String], out_dir: &str, base_name: &str) -> Result<St
 
     for p in paths {
         let bytes = vfs::read_file(p).map_err(|e| format!("读取 {p}: {e}"))?;
-        let m = parse_fskin(p, &bytes)?;
+        let m = fskin::parse_fskin(p, &bytes)?;
         let triangles = m.triangles_merged();
         let name = Path::new(p)
             .file_stem()
@@ -182,4 +181,117 @@ fn find_texture(root: Option<&str>, stem: &str) -> Option<String> {
         .into_iter()
         .find(|e| stem_of(&e.name).eq_ignore_ascii_case(stem))
         .map(|e| e.path)
+}
+
+/// 右键导出模型文件（fskin / fsm / fak）：原样复制模型字节，并把材质引用的
+/// 纹理（按 stem 在模型根目录树中定位，与 OBJ 导出同口径）复制到同一目录，
+/// 纹理保留原始文件名。未找到的纹理在返回文案中注明，不作为失败。
+pub fn export_model(src: &str, dest: &str) -> Result<String, String> {
+    let bytes = vfs::read_file(src).map_err(|e| format!("读取 {src}: {e}"))?;
+    let name = src.rsplit(['\\', '/']).next().unwrap_or(src);
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let texture_paths: Vec<String> = match ext.as_str() {
+        "fskin" => fskin::parse_fskin(src, &bytes)?
+            .materials
+            .iter()
+            .map(|m| m.texture_path.clone())
+            .collect(),
+        "fsm" => fsm::parse_fsm(src, &bytes)?
+            .materials
+            .iter()
+            .map(|m| m.texture_path.clone())
+            .collect(),
+        "fak" => fak::parse_fak(src, &bytes)?
+            .materials
+            .iter()
+            .map(|m| m.texture_path.clone())
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    // 材质引用按 stem 去重（不同材质常共享同一张贴图），保持首次出现顺序
+    let mut stems: Vec<String> = Vec::new();
+    for t in &texture_paths {
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(base) = t.rsplit(['\\', '/']).next() {
+            let stem = stem_of(base).to_string();
+            if !stems.contains(&stem) {
+                stems.push(stem);
+            }
+        }
+    }
+
+    let dest_dir = Path::new(dest)
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| "导出路径无效".to_string())?
+        .to_path_buf();
+    fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+    fs::write(dest, &bytes).map_err(|e| format!("写入失败: {e}"))?;
+
+    let model_root = parent_of(src).and_then(parent_of);
+    let mut copied = 0usize;
+    let mut missing = 0usize;
+    for stem in &stems {
+        let found = find_texture(model_root, stem).and_then(|p| {
+            let data = vfs::read_file(&p).ok()?;
+            let base = p.rsplit(['\\', '/']).next()?.to_string();
+            fs::write(dest_dir.join(&base), &data).is_ok().then_some(base)
+        });
+        match found {
+            Some(_) => copied += 1,
+            None => missing += 1,
+        }
+    }
+
+    Ok(match (stems.is_empty(), missing) {
+        (true, _) => format!("已导出: {name}"),
+        (false, 0) => format!("已导出: {name}（含 {copied} 张纹理）"),
+        (false, _) => format!("已导出: {name}（纹理 {copied} 张，{missing} 张未找到）"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res");
+
+    /// fskin：字节级原样复制 + 引用纹理（nvzhujue_boot）一并落盘
+    #[test]
+    fn export_fskin_with_textures() {
+        let out = std::env::temp_dir().join("gongfu_export_model/fskin");
+        let _ = fs::remove_dir_all(&out);
+        let src = format!("{RES}/system/AvatarGirl/girl_Boot.fskin");
+        let dest = out.join("girl_Boot.fskin");
+        let summary = export_model(&src, dest.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), fs::read(&src).unwrap(), "模型应原样复制");
+        assert_eq!(summary, "已导出: girl_Boot.fskin（含 1 张纹理）");
+        assert!(out.join("nvzhujue_boot.dds").is_file(), "关联纹理应导出到同目录");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// fsm / fak：同样携带材质纹理；fsm 多材质时按 stem 去重后逐张导出
+    #[test]
+    fn export_fsm_fak_with_textures() {
+        let out = std::env::temp_dir().join("gongfu_export_model/mixed");
+        let _ = fs::remove_dir_all(&out);
+
+        let src = format!("{RES}/system/Weapon/Jian/J01.FSM");
+        let summary = export_model(&src, out.join("J01.FSM").to_str().unwrap()).unwrap();
+        assert!(summary.contains("含 1 张纹理"), "{summary}");
+        assert!(out.join("j01-s01.dds").is_file());
+
+        let src = format!("{RES}/system/Monster/G080/G080.FAK");
+        let summary = export_model(&src, out.join("G080.FAK").to_str().unwrap()).unwrap();
+        assert!(summary.contains("含 2 张纹理"), "{summary}");
+        assert!(out.join("g080.dds").is_file() && out.join("g080+.dds").is_file());
+        let _ = fs::remove_dir_all(&out);
+    }
 }

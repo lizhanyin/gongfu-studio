@@ -3,7 +3,7 @@
     <div class="app">
       <header class="app-header">
         <span class="title">Gongfu Studio</span>
-        <MenuBar :skin="skin" :act="act" :res="res" />
+        <MenuBar :skin="skin" :act="act" :res="res" @dress="openDressMode()" />
         <div class="header-spacer"></div>
         <n-input
           v-model:value="res.rootDir"
@@ -18,7 +18,7 @@
       <div class="app-main">
         <!-- 左：资源树（res 为根，全高） -->
         <aside class="tree-panel">
-          <ResourceTree :tree="res" @preview-model="previewModelDir" />
+          <ResourceTree :tree="res" @preview-model="previewModelDir" @dress="openDressMode" />
         </aside>
 
         <div class="right-col">
@@ -65,7 +65,7 @@
             <ViewerHost :target="viewportRef" @ready="onViewerReady" />
 
             <!-- 检查器（可折叠）：独立组件，改 InspectorPanel.vue 只重载检查器子树 -->
-            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" />
+            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" :dress="dress" />
           </div>
 
           <!-- 右下：当前目录资源网格 -->
@@ -76,12 +76,14 @@
               @open-dir="res.selectDir"
               @preview-model="previewModelDir"
               @overlay-add="overlayAdd"
+              @dress="openDressMode"
             />
           </div>
         </div>
       </div>
 
       <footer class="app-footer">
+        <span v-if="dress.catalog">装扮: {{ dress.catalog.root }}</span>
         <span v-if="skin.modelSet">模型: {{ skin.modelSet.rootDir }}</span>
         <span v-if="act.actMeta">动作: {{ act.actMeta.fileName }}</span>
         <span v-if="fak.fakModel">FAK: {{ shortName(fak.fakModel.path) }}</span>
@@ -100,6 +102,7 @@ import { useSkinMode } from "./composables/useSkinMode";
 import { useActMode } from "./composables/useActMode";
 import { useFakMode } from "./composables/useFakMode";
 import { useFsmMode } from "./composables/useFsmMode";
+import { useDressMode } from "./composables/useDressMode";
 import { useResourceTree } from "./composables/useResourceTree";
 import { texDataFromDto, b64ToBytes, decodeTga, imageUrlFromB64 } from "./tex";
 import type { TexData, Viewer } from "./viewer";
@@ -127,6 +130,7 @@ const skin = useSkinMode(viewer);
 const act = useActMode(viewer);
 const fak = useFakMode(viewer);
 const fsm = useFsmMode(viewer);
+const dress = useDressMode(viewer, skin, act);
 const res = useResourceTree();
 
 // ---------------- 视口宿主（viewer.ts 的 HMR 边界）----------------
@@ -142,7 +146,7 @@ function onViewerReady(v: Viewer) {
   if (!first) rerenderViewport();
 }
 
-/** 视口重建后重放当前内容（互斥优先级与 previewModelDir 一致：fak > fsm > act > skin 扫描） */
+/** 视口重建后重放当前内容（互斥优先级与 previewModelDir 一致：fak > fsm > act > dress > skin 扫描） */
 async function rerenderViewport() {
   if (fak.fakModel) {
     const action = fak.currentAction;
@@ -152,6 +156,10 @@ async function rerenderViewport() {
   }
   if (fsm.fsmModel) {
     await fsm.openFsmFile(fsm.fsmModel.path);
+    return;
+  }
+  if (dress.catalog) {
+    await dress.replay();
     return;
   }
   if (act.actMeta) {
@@ -206,6 +214,7 @@ async function previewEntry(e: ResEntry) {
   switch (e.kind) {
     case "fskin":
       texPreview.value = null;
+      dress.close();
       fak.closeFak();
       fsm.closeFsm();
       await skin.soloPreview(e.path);
@@ -241,6 +250,7 @@ async function previewEntry(e: ResEntry) {
 
 /** FAK / FSM 与皮肤/骨架模式互斥 */
 async function openFakPreview(path: string) {
+  dress.close();
   skin.clearScene();
   act.closeAct();
   fsm.closeFsm();
@@ -248,10 +258,19 @@ async function openFakPreview(path: string) {
 }
 
 async function openFsmPreview(path: string) {
+  dress.close();
   skin.clearScene();
   act.closeAct();
   fak.closeFak();
   await fsm.openFsmFile(path);
+}
+
+/** 角色装扮模式：扫描资源根（或指定目录）装配基础模型 + 装备/时装 */
+async function openDressMode(root?: string) {
+  texPreview.value = null;
+  fak.closeFak();
+  fsm.closeFsm();
+  await dress.open(root ?? res.rootDir);
 }
 
 /** 整体模型预览：含 .fak（怪物）或 .fsm（武器）的目录走对应网格，其余走 fskin 装配 */
@@ -274,6 +293,7 @@ async function previewModelDir(dir: string) {
   }
   fak.closeFak();
   fsm.closeFsm();
+  dress.close();
   skin.scan(dir);
 }
 
@@ -286,9 +306,11 @@ async function overlayAdd(e: ResEntry) {
   if (skin.selectedPart !== e.path) skin.selectPart(e.path);
 }
 
-onMounted(() => {
+onMounted(async () => {
   // 视口实例与拾取接线由 ViewerHost 的 ready 回调负责
   res.init();
-  skin.scan(); // 开箱默认整体预览 rootDir（res/system/AvatarGirl）
+  // 开箱默认进入角色装扮（资源根含 AvatarGirl/装备目录时），失败回落原整体预览
+  const ok = await dress.open(res.rootDir);
+  if (!ok) skin.scan();
 });
 </script>

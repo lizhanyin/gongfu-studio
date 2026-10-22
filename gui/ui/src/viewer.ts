@@ -722,11 +722,12 @@ export class Viewer {
   }
 
   /** 换主贴图：多子网格时替换首槽（配色族切换语义针对主材质） */
-  refreshTexture(path: string, tex: TexData, texFile: string) {
+  refreshTexture(path: string, tex: TexData, texFile: string, matIndex = 0) {
     const p = this.parts.get(path);
-    if (!p || !p.mats.length) return;
-    p.mats[0].map = this.getTexture(texFile, tex);
-    p.mats[0].needsUpdate = true;
+    const mat = p?.mats[matIndex];
+    if (!mat) return;
+    mat.map = this.getTexture(texFile, tex);
+    mat.needsUpdate = true;
   }
 
   clearTexture(path: string) {
@@ -799,6 +800,7 @@ export class Viewer {
     this.diagnoseParts();
 
     this.applyFskelFrame(0, 0, 0);
+    this.refreshBoneAttached(); // 骨架加载/切换后按帧 0 位姿重挂骨骼挂接网格
   }
 
   // ---- 诊断日志 ----
@@ -2803,6 +2805,7 @@ export class Viewer {
     this.anchoredRoots.clear();
     this.anchoredChains.clear();
     this.anchoredMats.clear();
+    this.refreshBoneAttached(); // 骨架已清空：挂接网格回落为静态摆放
     this.applyStaticSkin(); // 默认状态对齐离群部件（hair05）
   }
 
@@ -2924,12 +2927,17 @@ export class Viewer {
   // ---------------- FSM 静态武器网格 ----------------
 
   /**
-   * 构建静态武器网格：每个子网格一个 Mesh，共享同一份顶点池属性
-   * （pos/normal/uv 直接取自文件，法线写入时归一化）。
-   * mats[i] 为子网格 i 的贴图；挂点用小球标记（位置取 values 前 3 个）。
+   * 构建静态网格的 Mesh 列表（每子网格一个，共享同一份顶点池属性，
+   * pos/normal/uv 直接取自文件，法线写入时归一化）。setFsm 与骨骼挂接共用。
    */
-  setFsm(model: FsmModel, mats: { tex: TexData | null; file: string | null }[]) {
-    this.clearFsm();
+  private buildFsmMeshes(
+    model: FsmModel,
+    mats: { tex: TexData | null; file: string | null }[]
+  ): {
+    meshes: THREE.Mesh[];
+    geoms: THREE.BufferGeometry[];
+    matsOut: THREE.MeshStandardMaterial[];
+  } {
     const n = model.vertexCount;
     const pos = new Float32Array(n * 3);
     const nrm = new Float32Array(n * 3);
@@ -2955,6 +2963,9 @@ export class Viewer {
       uv[i * 2 + 1] = model.vertices[b + 7];
     }
 
+    const meshes: THREE.Mesh[] = [];
+    const geoms: THREE.BufferGeometry[] = [];
+    const matsOut: THREE.MeshStandardMaterial[] = [];
     model.submeshes.forEach((s) => {
       const geom = new THREE.BufferGeometry();
       geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
@@ -2976,12 +2987,27 @@ export class Viewer {
       }
       const m = mats[matIdx];
       if (m?.tex && m.file) mat.map = this.getTexture(m.file, m.tex);
-      const mesh = new THREE.Mesh(geom, mat);
+      meshes.push(new THREE.Mesh(geom, mat));
+      geoms.push(geom);
+      matsOut.push(mat);
+    });
+    return { meshes, geoms, matsOut };
+  }
+
+  /**
+   * 构建静态武器网格：每个子网格一个 Mesh，共享同一份顶点池属性
+   * （pos/normal/uv 直接取自文件，法线写入时归一化）。
+   * mats[i] 为子网格 i 的贴图；挂点用小球标记（位置取 values 前 3 个）。
+   */
+  setFsm(model: FsmModel, mats: { tex: TexData | null; file: string | null }[]) {
+    this.clearFsm();
+    const { meshes, geoms, matsOut } = this.buildFsmMeshes(model, mats);
+    for (const mesh of meshes) {
       this.modelRoot.add(mesh);
       this.fsmMeshes.push(mesh);
-      this.fsmGeoms.push(geom);
-      this.fsmMats.push(mat);
-    });
+    }
+    this.fsmGeoms = geoms;
+    this.fsmMats = matsOut;
 
     // 挂点标记：尺寸按网格包围盒自适应（J01 剑长约 124）
     const diag = Math.hypot(
@@ -3024,6 +3050,94 @@ export class Viewer {
 
   hasFsm() {
     return this.fsmMeshes.length > 0;
+  }
+
+  // ---------------- 骨骼挂接网格（帽子等 FSM 静态件） ----------------
+
+  /** 挂接层级：holder（骨骼子级，矩阵 = 挂接时骨骼世界矩阵的逆）→ inner（显示旋转 + 偏移）→ 网格 */
+  private boneAttached = new Map<
+    string,
+    {
+      holder: THREE.Group;
+      inner: THREE.Group;
+      meshes: THREE.Mesh[];
+      geoms: THREE.BufferGeometry[];
+      mats: THREE.MeshStandardMaterial[];
+      boneName: string;
+    }
+  >();
+
+  /**
+   * FSM 网格挂到骨骼（帽子槽）：随骨骼刚性运动，挂接时位姿下与静态摆放一致。
+   * 骨架未加载或骨名不存在时按普通静态网格摆放。offset 为显示空间微调。
+   */
+  addBoneAttached(
+    path: string,
+    model: FsmModel,
+    mats: { tex: TexData | null; file: string | null }[],
+    boneName: string,
+    offset: [number, number, number] = [0, 0, 0]
+  ) {
+    this.removeBoneAttached(path);
+    const { meshes, geoms, matsOut } = this.buildFsmMeshes(model, mats);
+    const inner = new THREE.Group();
+    inner.position.set(offset[0], offset[1], offset[2]);
+    for (const mesh of meshes) inner.add(mesh);
+    const holder = new THREE.Group();
+    holder.matrixAutoUpdate = false;
+    holder.add(inner);
+    this.boneAttached.set(path, { holder, inner, meshes, geoms, mats: matsOut, boneName });
+    this.refreshBoneAttached(path);
+  }
+
+  removeBoneAttached(path: string) {
+    const e = this.boneAttached.get(path);
+    if (!e) return;
+    e.holder.parent?.remove(e.holder);
+    for (const g of e.geoms) g.dispose();
+    for (const m of e.mats) m.dispose();
+    this.boneAttached.delete(path);
+  }
+
+  hasBoneAttached(path: string) {
+    return this.boneAttached.has(path);
+  }
+
+  setBoneAttachedOffset(path: string, offset: [number, number, number]) {
+    const e = this.boneAttached.get(path);
+    if (e) e.inner.position.set(offset[0], offset[1], offset[2]);
+  }
+
+  /** 骨名列表（帽槽挂点选择用），按骨架当前骨序 */
+  boneNames(): string[] {
+    return this.skelBones.map((b) => b.name);
+  }
+
+  /**
+   * 按当前骨架重挂：holder 挂到目标骨骼下，矩阵 = 骨骼世界矩阵的逆
+   * （挂接时位姿下网格保持文件空间位置，之后随骨骼刚性跟随）。
+   * 骨架加载/切换（setFskel 应用帧 0 后）与挂接创建时调用。
+   */
+  private refreshBoneAttached(path?: string) {
+    const entries = path
+      ? [this.boneAttached.get(path)].filter((e) => !!e)
+      : [...this.boneAttached.values()];
+    for (const e of entries) {
+      const lower = e.boneName.toLowerCase();
+      const bone =
+        this.skelBones.find((b) => b.name.toLowerCase() === lower) ??
+        this.skelBones.find((b) => b.name.toLowerCase().includes(lower));
+      if (bone) {
+        bone.add(e.holder);
+        e.inner.rotation.y = MODEL_YAW; // 骨骼层级在 scene（数据空间），补显示旋转
+        bone.updateWorldMatrix(true, false);
+        e.holder.matrix.copy(bone.matrixWorld).invert();
+      } else {
+        this.modelRoot.add(e.holder); // modelRoot 已带显示旋转
+        e.inner.rotation.y = 0;
+        e.holder.matrix.identity();
+      }
+    }
   }
 
   /** 皮肤网格整体显隐（动作模式下叠加/隐藏绑定姿势网格），饰品叠层跟随 */
@@ -3107,6 +3221,7 @@ export class Viewer {
       p.geom.dispose();
       for (const m of p.mats) m.dispose();
     }
+    for (const path of [...this.boneAttached.keys()]) this.removeBoneAttached(path);
     for (const t of this.texCache.values()) t.dispose();
     this.controls.dispose();
     this.renderer.dispose();

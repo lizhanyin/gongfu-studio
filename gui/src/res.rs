@@ -24,6 +24,9 @@ pub struct ResEntry {
     pub byte_len: u64,
     /// 目录是否为"整体模型"（仅 AvatarBoy/AvatarGirl/Monster 范围内可整体预览）
     pub is_model: bool,
+    /// 目录是否为角色资源根（AvatarGirl/AvatarBoy/装备/时装目录的父目录，
+    /// 可进入角色装扮模式）
+    pub is_character: bool,
     pub vertex_count: Option<u32>,
     pub triangle_count: Option<u32>,
     pub frame_count: Option<u32>,
@@ -111,6 +114,7 @@ pub fn list_dir(dir: &str) -> Result<Vec<ResEntry>, String> {
     for e in entries {
         if e.is_dir {
             let is_model = is_model_dir(&e.path);
+            let is_character = crate::dress::is_character_root(&e.path);
             dirs.push(ResEntry {
                 name: e.name,
                 path: e.path,
@@ -118,6 +122,7 @@ pub fn list_dir(dir: &str) -> Result<Vec<ResEntry>, String> {
                 kind: "dir".into(),
                 byte_len: 0,
                 is_model,
+                is_character,
                 vertex_count: None,
                 triangle_count: None,
                 frame_count: None,
@@ -138,6 +143,7 @@ pub fn list_dir(dir: &str) -> Result<Vec<ResEntry>, String> {
                 kind,
                 byte_len: e.byte_len,
                 is_model: false,
+                is_character: false,
                 vertex_count: vc,
                 triangle_count: tc,
                 frame_count: fc,

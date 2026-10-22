@@ -1,4 +1,5 @@
 mod dds;
+mod dress;
 mod fak;
 mod fskel;
 mod fskin;
@@ -33,6 +34,12 @@ struct TexImageDto {
 #[tauri::command]
 async fn scan_model_set(dir: String) -> Result<fskin::ModelSet, String> {
     run_blocking(move || fskin::scan_model_set(&dir)).await
+}
+
+/// 角色装扮目录扫描：基础模型 / 装备槽 / 时装 + 全根贴图索引
+#[tauri::command]
+async fn scan_character(root: String) -> Result<dress::CharacterCatalog, String> {
+    run_blocking(move || dress::scan_character(&root)).await
 }
 
 #[tauri::command]
@@ -198,6 +205,12 @@ async fn export_file(src: String, dest: String) -> Result<(), String> {
     .await
 }
 
+/// 右键导出模型（fskin / fsm / fak）：原样复制模型 + 材质关联纹理一并导出到同目录
+#[tauri::command]
+async fn export_model(src: String, dest: String) -> Result<String, String> {
+    run_blocking(move || obj::export_model(&src, &dest)).await
+}
+
 /// 递归导出目录（磁盘目录或 CPK 包内子树）到目标目录下（以源目录名单独建子目录）
 #[tauri::command]
 async fn export_dir(src: String, dest_dir: String) -> Result<String, String> {
@@ -268,6 +281,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             scan_model_set,
+            scan_character,
             load_fskin,
             save_fskin,
             load_texture,
@@ -286,6 +300,7 @@ pub fn run() {
             save_fsm,
             list_res_dir,
             export_file,
+            export_model,
             export_dir,
             import_file
         ])

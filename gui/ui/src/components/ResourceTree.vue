@@ -35,7 +35,10 @@ import { message } from "../message";
 import { copyText, shortName } from "../utils";
 
 const props = defineProps<{ tree: ResourceTreeStore }>();
-const emit = defineEmits<{ (e: "previewModel", path: string): void }>();
+const emit = defineEmits<{
+  (e: "previewModel", path: string): void;
+  (e: "dress", path: string): void;
+}>();
 
 const selKeys = computed(() => (props.tree.currentDir ? [props.tree.currentDir] : []));
 
@@ -64,6 +67,7 @@ const menuOptions = computed<DropdownOption[]>(() => {
   const o = menuNode.value;
   if (!o) return [];
   const opts: DropdownOption[] = [{ key: "show", label: "在下方显示内容" }];
+  if (o.isCharacter) opts.unshift({ key: "dress", label: "角色装扮" });
   if (o.isModel) opts.unshift({ key: "model", label: "整体预览模型" });
   opts.push({ type: "divider" }, { key: "export", label: "导出文件" });
   if (!props.tree.isCpk) opts.push({ key: "import", label: "导入文件" });
@@ -91,6 +95,7 @@ async function onMenuSelect(key: string | number) {
   menuShow.value = false;
   if (!p) return;
   if (key === "model") emit("previewModel", p);
+  else if (key === "dress") emit("dress", p);
   else if (key === "show") props.tree.selectDir(p);
   else if (key === "export") props.tree.exportDir(p);
   else if (key === "import") props.tree.importToDir(p);
@@ -102,8 +107,9 @@ async function onMenuSelect(key: string | number) {
   }
 }
 
-/** 模型目录徽标 */
+/** 模型 / 角色目录徽标 */
 function renderSuffix({ option }: { option: TreeOption }) {
+  if (option.isCharacter) return h("span", { class: "model-badge" }, "角色");
   return option.isModel ? h("span", { class: "model-badge" }, "模型") : null;
 }
 </script>

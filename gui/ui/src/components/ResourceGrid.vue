@@ -33,15 +33,15 @@
             @contextmenu="onCtx($event, e)"
           >
             <div class="card-top">
-              <span class="kind" :class="e.isDir ? (e.isModel ? 'model' : 'dir') : e.kind">
+              <span class="kind" :class="e.isDir ? (e.isCharacter ? 'character' : e.isModel ? 'model' : 'dir') : e.kind">
                 {{ kindTag(e) }}
               </span>
               <n-button
-                v-if="e.isDir && e.isModel"
+                v-if="e.isDir && (e.isModel || e.isCharacter)"
                 size="tiny"
                 class="whole-btn"
-                @click.stop="emit('previewModel', e.path)"
-              >整体预览</n-button>
+                @click.stop="e.isCharacter ? emit('dress', e.path) : emit('previewModel', e.path)"
+              >{{ e.isCharacter ? "角色装扮" : "整体预览" }}</n-button>
             </div>
             <div class="card-name">{{ e.name }}</div>
             <div class="card-meta">{{ metaText(e) }}</div>
@@ -76,6 +76,7 @@ const emit = defineEmits<{
   (e: "openDir", path: string): void;
   (e: "previewModel", path: string): void;
   (e: "overlayAdd", entry: ResEntry): void;
+  (e: "dress", path: string): void;
 }>();
 
 // ---------- 面包屑 ----------
@@ -102,7 +103,7 @@ function goUp() {
 
 // ---------- 卡片 ----------
 function kindTag(e: ResEntry): string {
-  if (e.isDir) return e.isModel ? "模型" : "目录";
+  if (e.isDir) return e.isCharacter ? "角色" : e.isModel ? "模型" : "目录";
   const map: Record<string, string> = {
     fskin: "皮肤",
     fskel: "动作",
@@ -204,6 +205,7 @@ const menuOptions = computed<DropdownOption[]>(() => {
   if (!e) return [];
   const opts: DropdownOption[] = [];
   if (e.isDir) {
+    if (e.isCharacter) opts.push({ key: "dress", label: "角色装扮" });
     if (e.isModel) opts.push({ key: "model", label: "整体预览模型" });
     opts.push({ key: "enter", label: "进入目录" });
     opts.push({ type: "divider" }, { key: "export", label: "导出文件" });
@@ -233,6 +235,7 @@ async function onMenuSelect(key: string | number) {
   menuShow.value = false;
   if (!e) return;
   if (key === "model") emit("previewModel", e.path);
+  else if (key === "dress") emit("dress", e.path);
   else if (key === "enter") emit("openDir", e.path);
   else if (key === "preview") emit("preview", e);
   else if (key === "add") emit("overlayAdd", e);

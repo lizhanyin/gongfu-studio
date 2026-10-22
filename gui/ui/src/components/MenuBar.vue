@@ -22,6 +22,7 @@ import type { ResourceTreeStore } from "../composables/useResourceTree";
 const tick = (on: boolean) => () => h("span", { class: "menu-tick" }, on ? "✓" : "");
 
 const props = defineProps<{ skin: SkinStore; act: ActStore; res: ResourceTreeStore }>();
+const emit = defineEmits<{ (e: "dress"): void }>();
 
 /** 按作用分组的命令菜单：文件 / 视图（皮肤渲染）/ 动作 / 导出 */
 const options = computed<MenuOption[]>(() => {
@@ -34,6 +35,8 @@ const options = computed<MenuOption[]>(() => {
       children: [
         { label: "打开资源目录…", key: "open-root", icon: tick(false) },
         { label: "打开 CPK 资源包…", key: "open-cpk", icon: tick(false) },
+        { type: "divider", key: "file-d0" },
+        { label: "角色装扮…", key: "dress", icon: tick(false) },
         { type: "divider", key: "file-d1" },
         {
           label: props.res.treeLoading ? "刷新中…" : "刷新",
@@ -100,6 +103,9 @@ function onCommand(key: string | number) {
       break;
     case "open-cpk":
       void props.res.pickCpk();
+      break;
+    case "dress":
+      emit("dress");
       break;
     case "refresh":
       void props.res.refreshRoot();

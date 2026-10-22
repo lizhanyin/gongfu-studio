@@ -112,6 +112,53 @@ export interface ModelSet {
   texSlots: TexSlot[];
 }
 
+// ---------------- 角色装扮 ----------------
+
+/** 基础模型（AvatarGirl / AvatarBoy） */
+export interface CharacterBase {
+  /** 目录名小写（avatargirl / avatarboy） */
+  key: string;
+  label: string;
+  /** "f" | "m" */
+  gender: string;
+  dir: string;
+  actDir: string;
+  /** 默认骨架动作文件（girl.FSKEL 等），无则 null */
+  defaultFskel: string | null;
+}
+
+/** 装备/时装条目 */
+export interface EquipItem {
+  name: string;
+  path: string;
+  /** "f" | "m" | "u"（文件名前缀 fs / ms / 其他） */
+  gender: string;
+  /** 款式号（前缀字母后的数字），无则 null */
+  number: number | null;
+  vertexCount: number;
+  triangleCount: number;
+  /** 每材质槽贴图解析结果（全根索引匹配） */
+  textureFiles: (string | null)[];
+}
+
+/** 装备槽（hat / armonr / lower / glove / boot） */
+export interface CharacterSlot {
+  key: string;
+  label: string;
+  /** "fsm" | "fskin" */
+  kind: string;
+  items: EquipItem[];
+}
+
+export interface CharacterCatalog {
+  root: string;
+  bases: CharacterBase[];
+  slots: CharacterSlot[];
+  fashions: EquipItem[];
+  /** 全根贴图索引（小写 stem → 路径），跨目录解析装备/时装贴图 */
+  textures: TexInfo[];
+}
+
 // ---------------- 资源浏览 ----------------
 
 /** 资源目录的一个子项（树节点 / 网格卡片共用） */
@@ -124,6 +171,8 @@ export interface ResEntry {
   byteLen: number;
   /** 目录是否为"整体模型"（根级含 .fskin 或 act/ 内含 .FSKEL） */
   isModel: boolean;
+  /** 目录是否为角色资源根（可进入角色装扮模式） */
+  isCharacter?: boolean;
   vertexCount?: number;
   triangleCount?: number;
   frameCount?: number;

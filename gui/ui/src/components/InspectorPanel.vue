@@ -25,7 +25,8 @@
           title="换装变体"
           name="variants"
         >
-          <PartGroupList :skin="skin" />
+          <DressPanel v-if="dress?.catalog" :dress="dress" :act-dir-skeleton="actSkeletonNames" />
+          <PartGroupList :skin="skin" :dress="dress" />
         </n-collapse-item>
         <n-collapse-item
           v-if="skin.modelSet?.texSlots.length || skin.partTexVariants.length"
@@ -58,11 +59,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import type { SkinStore } from "../composables/useSkinMode";
 import type { ActStore } from "../composables/useActMode";
 import type { FakStore } from "../composables/useFakMode";
 import type { FsmStore } from "../composables/useFsmMode";
+import type { DressStore } from "../composables/useDressMode";
+import DressPanel from "./DressPanel.vue";
 import PartGroupList from "./PartGroupList.vue";
 import TexSlotPanel from "./TexSlotPanel.vue";
 import ActFileInfo from "./ActFileInfo.vue";
@@ -70,7 +73,16 @@ import FakFileInfo from "./FakFileInfo.vue";
 import FsmFileInfo from "./FsmFileInfo.vue";
 import PartInspector from "./PartInspector.vue";
 
-defineProps<{ skin: SkinStore; act: ActStore; fak: FakStore; fsm: FsmStore }>();
+const props = defineProps<{
+  skin: SkinStore;
+  act: ActStore;
+  fak: FakStore;
+  fsm: FsmStore;
+  dress?: DressStore;
+}>();
+
+/** 帽子挂点骨骼候选：当前骨架的骨名 */
+const actSkeletonNames = computed(() => props.act.actMeta?.boneNames ?? []);
 
 const inspectorCollapsed = ref(false);
 </script>
