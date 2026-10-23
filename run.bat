@@ -41,6 +41,10 @@ if not exist "gui\ui\node_modules" (
     call npm --prefix gui/ui install
     if errorlevel 1 goto :err
 )
+rem wasm toolchain check for fmath (frontend model calc kernel, see README):
+rem auto-installs the rustup wasm32 target if missing, errors on missing wasm-pack
+call npm --prefix gui/ui run wasm-check
+if errorlevel 1 goto :err
 
 echo [3/4] build frontend (gui/ui)...
 call npm --prefix gui/ui run build

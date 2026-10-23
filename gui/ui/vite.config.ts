@@ -9,6 +9,7 @@ export default defineConfig({
     strictPort: true,
   },
   build: {
-    target: "es2021",
+    // es2022：支持 fmath wasm wrapper（gfm.ts）的顶层 await init
+    target: "es2022",
   },
 });

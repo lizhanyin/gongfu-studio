@@ -46,6 +46,9 @@ if [ ! -d gui/ui/node_modules ]; then
     npm --prefix gui/ui install
 fi
 
+# fmath wasm 工具链自检（自动补 wasm32 目标；wasm-pack 缺失时报错并给指引）
+npm --prefix gui/ui run wasm-check
+
 echo "[3/4] 构建前端 (gui/ui)..."
 npm --prefix gui/ui run build
 

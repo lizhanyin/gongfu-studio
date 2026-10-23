@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["cpk", "cpktool", "gui"]
+members = ["cpk", "cpktool", "gui", "fmath"]
 
 [workspace.package]
 edition = "2024"
@@ -14,6 +14,8 @@ md-5 = "0.11"
 encoding_rs = "0.8"
 glob = "0.3"
 clap = { version = "4.6", features = ["derive"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
 
 [profile.release]
 opt-level = 3

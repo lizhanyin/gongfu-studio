@@ -40,6 +40,10 @@ if not exist "gui\ui\node_modules" (
     call npm --prefix gui/ui install
     if errorlevel 1 goto :err
 )
+rem wasm toolchain check for fmath (frontend model calc kernel, see README):
+rem auto-installs the rustup wasm32 target if missing, errors on missing wasm-pack
+call npm --prefix gui/ui run wasm-check
+if errorlevel 1 goto :err
 
 echo [4/6] start vite dev server (own window, close it to stop HMR)...
 start "Gongfu UI - vite dev" cmd /c "npm --prefix gui/ui run dev"

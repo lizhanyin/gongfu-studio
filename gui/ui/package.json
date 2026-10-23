@@ -5,7 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "predev": "npm run wasm:dev",
+    "wasm": "wasm-pack build ../../fmath --target web --out-dir ../gui/ui/src/wasm",
+    "wasm:dev": "wasm-pack build ../../fmath --target web --out-dir ../gui/ui/src/wasm --dev",
+    "wasm-check": "node scripts/wasm-check.mjs",
+    "build": "npm run wasm && vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "cd .. && tauri"
   },

@@ -1,0 +1,22 @@
+[package]
+name = "fmath"
+description = "前端模型计算内核（蒙皮 LBS / 布料 / 去穿透 / 绑定拟合 / FAK 插值），viewer.ts 的 wasm 移植"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+
+# wasm-pack 0.12 自带的 wasm-opt 解析不了 rustc 1.99 的产物，禁用
+# （体积/优化损失由 workspace release profile 的 opt-level=3 兜底）
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

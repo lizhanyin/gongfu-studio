@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { FakModel, FsmModel, FskinModel, FskelMeta, Influence, Vertex } from "./types";
+import { gfm, gfmEnabled } from "./gfm";
 
 export interface TexData {
   width: number;
@@ -35,6 +36,8 @@ interface PartObj {
   srcNrm: Float32Array;
   /** 几何当前是否处于蒙皮态（false = authored 绑定姿势直出） */
   skinned: boolean;
+  /** fmath wasm 部件槽位（-1 = TS 回退模式未注册） */
+  gfmId: number;
 }
 
 function b64ToBytes(b64: string): Uint8Array {
@@ -151,6 +154,13 @@ export class Viewer {
   private texCache = new Map<string, THREE.DataTexture>();
   private onPick: (path: string) => void = () => {};
 
+  // ---- fmath wasm 内核（模型计算迁入 Rust；gfmEnabled=false 走 TS 内置路径）----
+  /** 上次重绑的 wasm 视图版本（register/unregister 自增后需全量重取视图） */
+  private gfmViewsVer = -1;
+  /** 世界矩阵平表上传暂存（n×16，f64） */
+  private gfmWorldFlat: Float64Array | null = null;
+  private _skirtRecord = false;
+
   // ---- FSKEL 骨架 ----
   private skelBones: THREE.Bone[] = [];
   private skelRoot: THREE.Bone | null = null;
@@ -233,7 +243,13 @@ export class Viewer {
   /** 数据采集开关（cdp/collect-frames.mjs）：开启时 applySkirtDePenVerts
    *  把每次推出记入 skirtPushLog（帧开头清空；关闭时零开销）。
    *  phase 1=顶点胶囊 / 2=跨穿 tri-tri / 3=复扫 */
-  skirtRecord = false;
+  get skirtRecord(): boolean {
+    return this._skirtRecord;
+  }
+  set skirtRecord(on: boolean) {
+    this._skirtRecord = on;
+    if (gfmEnabled) gfm!.set_skirt_record(on);
+  }
   skirtPushLog: { v: number; phase: number; k: number; cap?: string }[] = [];
   /** 推出量时间平滑（"细微形变"修复）：无状态推出在相交起止边界
    *  0↔2.6~3.4 瞬跳（collect-frames 帧间抖动实测）。每顶点存上帧位移
@@ -457,6 +473,49 @@ export class Viewer {
     return t;
   }
 
+  // ---------------- fmath wasm 桥 ----------------
+
+  /**
+   * wasm 视图重绑：register/unregister 会令 wasm 线性内存增长，旧 Float32Array
+   * 视图随之分离——版本号变化时全量重取视图并换绑 position/normal attribute。
+   * 仅在部件增删时发生，帧路径无分配。
+   */
+  private gfmRebindViews() {
+    if (!gfmEnabled) return;
+    const ver = gfm!.views_version();
+    if (ver === this.gfmViewsVer) return;
+    this.gfmViewsVer = ver;
+    for (const p of this.parts.values()) {
+      if (p.gfmId < 0) continue;
+      const pos = new THREE.BufferAttribute(gfm!.pos_view(p.gfmId)!, 3);
+      const nrm = new THREE.BufferAttribute(gfm!.nrm_view(p.gfmId)!, 3);
+      pos.needsUpdate = true;
+      nrm.needsUpdate = true;
+      p.geom.setAttribute("position", pos);
+      p.geom.setAttribute("normal", nrm);
+    }
+  }
+
+  /** 当前帧世界矩阵平表上传（列主序 n×16；skin/depen/cloth 消费） */
+  private gfmUploadWorldMats() {
+    if (!gfmEnabled) return;
+    const n = this.worldMats.length;
+    if (!n) return;
+    if (!this.gfmWorldFlat || this.gfmWorldFlat.length !== n * 16) {
+      this.gfmWorldFlat = new Float64Array(n * 16);
+    }
+    for (let b = 0; b < n; b++) {
+      this.gfmWorldFlat.set(this.worldMats[b].elements, b * 16);
+    }
+    gfm!.set_world_mats(this.gfmWorldFlat, this.fskelBoneCount || n);
+  }
+
+  /** 部件蒙皮输出落盘后标记 attribute 上传（skinPart / depen 共用） */
+  private markPartAttrs(p: PartObj) {
+    (p.geom.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
+    (p.geom.getAttribute("normal") as THREE.BufferAttribute).needsUpdate = true;
+  }
+
   addPart(
     path: string,
     model: FskinModel,
@@ -546,9 +605,60 @@ export class Viewer {
       tri[k] = news[0]; tri[k + 1] = news[1]; tri[k + 2] = news[2];
     }
 
+    // fmath wasm 注册：SoA 影响表 + 含跨缝副本映射的 authored 数据；
+    // wasm 视图即几何 position/normal 缓冲（蒙皮/去穿透零拷贝直写）
+    const srcNrmF = Float32Array.from(srcNrm);
+    let gfmId = -1;
+    if (gfmEnabled) {
+      const vc = inflOf.length;
+      const origN = model.vertices.length;
+      const srcPos = new Float32Array(vc * 3);
+      const resolved = new Uint32Array(vc);
+      const totalInfl = inflOf.reduce((s, a) => s + a.length, 0);
+      const off = new Uint32Array(vc + 1);
+      const inflBone = new Uint32Array(totalInfl);
+      const inflWeight = new Float32Array(totalInfl);
+      const inflLocal = new Float32Array(totalInfl * 3);
+      let t = 0;
+      for (let i = 0; i < vc; i++) {
+        off[i] = t;
+        const si = i < origN ? i : clones[i - origN].src;
+        resolved[i] = si;
+        const vp = model.vertices[si];
+        srcPos[i * 3] = vp.pos[0];
+        srcPos[i * 3 + 1] = vp.pos[1];
+        srcPos[i * 3 + 2] = vp.pos[2];
+        for (const inf of inflOf[i]) {
+          inflBone[t] = inf.boneIndex;
+          inflWeight[t] = inf.weight;
+          inflLocal[t * 3] = inf.boneLocalPos[0];
+          inflLocal[t * 3 + 1] = inf.boneLocalPos[1];
+          inflLocal[t * 3 + 2] = inf.boneLocalPos[2];
+          t++;
+        }
+      }
+      off[vc] = t;
+      gfmId = gfm!.register_part(
+        srcPos,
+        srcNrmF,
+        resolved,
+        origN,
+        off,
+        inflBone,
+        inflWeight,
+        inflLocal
+      );
+    }
+
     const geom = new THREE.BufferGeometry();
-    geom.setAttribute("position", new THREE.BufferAttribute(Float32Array.from(pos), 3));
-    geom.setAttribute("normal", new THREE.BufferAttribute(Float32Array.from(nrm), 3));
+    geom.setAttribute(
+      "position",
+      new THREE.BufferAttribute(gfmId >= 0 ? gfm!.pos_view(gfmId)! : Float32Array.from(pos), 3)
+    );
+    geom.setAttribute(
+      "normal",
+      new THREE.BufferAttribute(gfmId >= 0 ? gfm!.nrm_view(gfmId)! : Float32Array.from(nrm), 3)
+    );
     geom.setAttribute("uv", new THREE.BufferAttribute(Float32Array.from(uv), 2));
     geom.setAttribute("color", new THREE.BufferAttribute(Float32Array.from(boneCol), 3));
     geom.setAttribute("color2", new THREE.BufferAttribute(Float32Array.from(uvCol), 3));
@@ -590,10 +700,12 @@ export class Viewer {
     this.modelRoot.add(mesh);
     const part: PartObj = {
       mesh, geom, mats, model, clones, overlayMesh: null, overlayMat: null,
-      inflOf, srcNrm: Float32Array.from(srcNrm),
+      inflOf, srcNrm: srcNrmF,
       skinned: this.skelBones.length > 0,
+      gfmId,
     };
     this.parts.set(path, part);
+    this.gfmRebindViews(); // 注册可能使其他部件的旧视图分离（wasm 内存增长）
     // 动作模式已绑骨架时立即按当前姿态蒙皮；静态模式对齐离群部件
     if (this.skelBones.length) {
       this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
@@ -617,6 +729,10 @@ export class Viewer {
     p.geom.dispose();
     for (const m of p.mats) m.dispose();
     this.parts.delete(path);
+    if (gfmEnabled && p.gfmId >= 0) {
+      gfm!.unregister_part(p.gfmId);
+      this.gfmRebindViews();
+    }
     if (this.skelBones.length) {
       this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
       this.setupSkirtRig(); // 裙摆防穿模点集随部件变化
@@ -716,6 +832,14 @@ export class Viewer {
     };
     apply(i, 0, 0);
     p.srcNrm.set(v.normal, i * 3);
+    // wasm 源数据同步（含引用该源顶点的跨缝副本；显示位已由上方视图写入）
+    if (gfmEnabled && p.gfmId >= 0) {
+      gfm!.set_src_vert(
+        p.gfmId, i,
+        v.pos[0], v.pos[1], v.pos[2],
+        v.normal[0], v.normal[1], v.normal[2]
+      );
+    }
     p.clones.forEach((c, t) => {
       if (c.src === i) {
         apply(vcount + t, c.du, c.dv);
@@ -801,6 +925,9 @@ export class Viewer {
     // CPU 蒙皮缓冲：各骨世界矩阵（法线静态，引擎不做法线蒙皮，无需绑定拟合）
     this.worldMats = Array.from({ length: n }, () => new THREE.Matrix4());
     this.skelParents = meta.parents;
+    if (gfmEnabled) {
+      gfm!.set_poses(poses, meta.boneCount, Int32Array.from(meta.parents));
+    }
     for (const p of this.parts.values()) p.skinned = true;
     const frameTotal = Math.max(Math.floor(poses.length / (n * 7)), 0);
     this.dlog(`FSKEL 已加载: ${n} 骨 · ${frameTotal} 帧 · ${meta.actions.length} 个动作 · 部件 ${this.parts.size}`);
@@ -1081,12 +1208,38 @@ export class Viewer {
   private setupChainAnchors() {
     this.anchoredChains.clear();
     this.anchoredMats.clear();
+    if (gfmEnabled) gfm!.clear_anchored();
     if (!this.anchoredRoots.size || !this.parts.size) return;
     for (const [root, a] of this.fitAnchoredChains(this.anchoredRoots)) {
       this.anchoredChains.set(root, a);
       for (const b of a.bindOf.keys()) this.anchoredMats.set(b, new THREE.Matrix4());
     }
     if (this.anchoredChains.size) {
+      if (gfmEnabled) {
+        // 拟合结果上传 wasm（skinPart 消费 wasm 侧 anchoredMats）
+        const carriers: number[] = [];
+        const tpInvs: number[] = [];
+        const counts: number[] = [];
+        const bones: number[] = [];
+        const mats: number[] = [];
+        for (const a of this.anchoredChains.values()) {
+          carriers.push(a.carrier);
+          tpInvs.push(...a.tpInv.elements);
+          counts.push(a.bindOf.size);
+          for (const [b, m] of a.bindOf) {
+            bones.push(b);
+            mats.push(...m.elements);
+          }
+        }
+        gfm!.setup_anchored(
+          this.fskelBoneCount || this.worldMats.length,
+          Uint32Array.from(carriers),
+          Float64Array.from(tpInvs),
+          Uint32Array.from(counts),
+          Uint32Array.from(bones),
+          Float64Array.from(mats)
+        );
+      }
       this.updateAnchoredMats();
       this.dlog(
         `链锚定生效: ${[...this.anchoredChains.keys()]
@@ -1142,6 +1295,11 @@ export class Viewer {
 
   /** 每帧刷新锚定合成矩阵 A_b = 载体当前世界 × Tp⁻¹ × M_bind_b（实例复用） */
   private updateAnchoredMats() {
+    if (gfmEnabled) {
+      this.gfmUploadWorldMats();
+      gfm!.update_anchored();
+      return;
+    }
     if (!this.anchoredChains.size || !this.worldMats.length) return;
     for (const a of this.anchoredChains.values()) {
       const carrier = this.worldMats[a.carrier];
@@ -1193,6 +1351,16 @@ export class Viewer {
   /** 输出并重置播放期累计诊断（裙摆去穿透/布料模拟），窗口内无事件则静默 */
   private diagFlush() {
     const d = this.diag;
+    if (gfmEnabled) {
+      // wasm 侧累计计数并入本窗口（TS 计数为 0，取 max 合并）
+      d.maxNeed = Math.max(d.maxNeed, gfm!.diag_max_need());
+      d.maxBone = gfm!.diag_max_bone();
+      d.clamp = Math.max(d.clamp, gfm!.diag_clamp());
+      d.clothSeek = Math.max(d.clothSeek, gfm!.diag_cloth_seek());
+      d.clothVelClamp = Math.max(d.clothVelClamp, gfm!.diag_cloth_vel_clamp());
+      d.clothSafeClamp = Math.max(d.clothSafeClamp, gfm!.diag_cloth_safe_clamp());
+      d.clothLagClamp = Math.max(d.clothLagClamp, gfm!.diag_cloth_lag_clamp());
+    }
     if (d.frames > 0 && (d.maxNeed > 0 || d.clamp > 0)) {
       const boneName =
         d.maxBone >= 0 ? this.skelBones[d.maxBone]?.name ?? `#${d.maxBone}` : "?";
@@ -1223,6 +1391,7 @@ export class Viewer {
     d.clothSafeClamp = 0;
     d.clothLagClamp = 0;
     this.lastMirrorSig = "";
+    if (gfmEnabled) gfm!.diag_reset();
   }
 
   /**
@@ -1259,6 +1428,7 @@ export class Viewer {
       this.clothCarrier = -1;
       this.clothTpInv = null;
       this.clothLastAbs = NaN;
+      if (gfmEnabled) gfm!.clear_cloth();
     }
     for (const p of this.parts.values()) this.skinPart(p);
     this.applySkirtDePenVerts(); // 暂停态切换开关也保持去穿透生效
@@ -1357,6 +1527,43 @@ export class Viewer {
     }
     this.skirtRelaxA = new Float64Array(this.skirtVerts.length * 3);
     this.skirtRelaxB = new Float64Array(this.skirtVerts.length * 3);
+    // wasm rig 上传（skirt_depen 消费；点集随部件增删重建，平滑状态一并重置）
+    if (gfmEnabled) {
+      const verts = new Uint32Array(this.skirtVerts.length * 2);
+      this.skirtVerts.forEach((sv, s) => {
+        verts[s * 2] = sv.p.gfmId;
+        verts[s * 2 + 1] = sv.i;
+      });
+      const triFlat = (list: { p: PartObj; a: number; b: number; c: number }[]) => {
+        const out = new Uint32Array(list.length * 4);
+        list.forEach((t, i) => out.set([t.p.gfmId, t.a, t.b, t.c], i * 4));
+        return out;
+      };
+      const adjOff = new Uint32Array(this.skirtAdj.length + 1);
+      let adjTotal = 0;
+      this.skirtAdj.forEach((nb, i) => {
+        adjOff[i] = adjTotal;
+        adjTotal += nb.length;
+      });
+      adjOff[this.skirtAdj.length] = adjTotal;
+      const adjFlat = new Uint32Array(adjTotal);
+      let ao = 0;
+      for (const nb of this.skirtAdj) {
+        adjFlat.set(nb, ao);
+        ao += nb.length;
+      }
+      const capsFlat = new Float32Array(this.legCaps.length * 2);
+      this.legCaps.forEach((c, i) => capsFlat.set([c.bone, c.len], i * 2));
+      gfm!.setup_skirt(
+        verts,
+        triFlat(this.skirtTris),
+        triFlat(this.skirtLegTris),
+        triFlat(this.skirtBodyTris),
+        adjOff,
+        adjFlat,
+        capsFlat
+      );
+    }
   }
 
   /**
@@ -1605,6 +1812,32 @@ export class Viewer {
    * 半径/网格内采样等代理判据都有反例（详见阶段二注释）。
    */
   private applySkirtDePenVerts(abs = NaN) {
+    if (gfmEnabled) {
+      this.gfmUploadWorldMats();
+      if (this.skirtRecord) this.skirtPushLog = [];
+      const touched = gfm!.skirt_depen(abs);
+      for (const p of this.parts.values()) {
+        for (let i = 0; i < touched.length; i++) {
+          if (touched[i] === p.gfmId) {
+            this.markPartAttrs(p);
+            break;
+          }
+        }
+      }
+      if (this.skirtRecord) {
+        // wasm 采集记录（v, phase, k, boneIdx 四元组）转 cdp 采集脚本的原口径
+        const log = gfm!.skirt_push_log();
+        for (let i = 0; i + 3 < log.length; i += 4) {
+          this.skirtPushLog.push({
+            v: log[i],
+            phase: log[i + 1],
+            k: log[i + 2],
+            cap: log[i + 3] >= 0 ? this.skelBones[log[i + 3]]?.name : undefined,
+          });
+        }
+      }
+      return;
+    }
     if (!this.skirtVerts.length || !this.legCaps.length || !this.worldMats.length) return;
     if (this.skirtRecord) this.skirtPushLog = [];
     const caps: {
@@ -2154,6 +2387,7 @@ export class Viewer {
     this.clothCarrier = -1;
     this.clothTpInv = null;
     this.clothLastAbs = NaN;
+    if (gfmEnabled) gfm!.clear_cloth(); // 无 poses/无载体等兜底路径也保持 wasm 侧一致
     if (!this.fskelPoses || !this.skelBones.length || !this.skelParents.length) return;
     const n = this.fskelBoneCount;
 
@@ -2220,11 +2454,39 @@ export class Viewer {
       });
       this.clothMats.set(b, new THREE.Matrix4());
     }
+    // wasm 模拟状态上传（updateClothMats/skinPart 消费 wasm 侧 clothMats）
+    if (gfmEnabled) {
+      const sims = new Float32Array(this.clothSims.length * 8);
+      this.clothSims.forEach((s, i) => {
+        sims.set(
+          [s.bone, s.anchor.x, s.anchor.y, s.anchor.z, s.target.x, s.target.y, s.target.z],
+          i * 8
+        );
+      });
+      gfm!.setup_cloth(
+        this.clothCarrier,
+        this.fskelBoneCount,
+        Float64Array.from(this.clothTpInv!.elements),
+        sims
+      );
+    }
     this.updateClothMats(this.clothLastAbs);
   }
 
-  /** 直接从姿态数组组合某帧各骨世界矩阵（不动当前骨架姿态） */
+  /** 直接从姿态数组组合某帧各骨世界矩阵（不动当前骨架姿态）。
+   *  wasm 路径仅支持无 mirror 覆盖的调用（diagnose 诊断用）；带 mirror 的
+   *  调用（镜像检测）走 wasm 的 lbs_residual 一次完成，不会到此分支 */
   private worldsFromPoses(frame: number, mirror?: Set<number>): THREE.Matrix4[] {
+    if (gfmEnabled && mirror === undefined) {
+      const flat = gfm!.worlds_from_poses(frame);
+      const out: THREE.Matrix4[] = [];
+      if (flat) {
+        for (let b = 0; b < this.fskelBoneCount; b++) {
+          out.push(new THREE.Matrix4().fromArray(flat, b * 16));
+        }
+      }
+      return out;
+    }
     const n = this.fskelBoneCount;
     const stride = n * 7;
     const poses = this.fskelPoses!;
@@ -2275,10 +2537,17 @@ export class Viewer {
     }
     if (!roots.length || !this.parts.size) {
       for (let b = 0; b < n; b++) this.skelBones[b].scale.setScalar(1);
+      if (gfmEnabled) gfm!.set_mirror(new Uint32Array(0));
       return;
     }
-    // 链上顶点的 LBS 残差和（帧 0，vs authored）
+    // 链上顶点的 LBS 残差和（帧 0，vs authored）。wasm 路径：组合 + 残差
+    // 一次内核完成（SoA 遍历）；mirror 仅用到 空集/单根 两种模式
     const residual = (mem: Set<number>, mirror: Set<number>): number => {
+      if (gfmEnabled) {
+        const arr = Uint32Array.from(mem);
+        if (mirror.size === 0) return gfm!.lbs_residual(0, 1, 0, arr);
+        return gfm!.lbs_residual(0, 2, mirror.values().next().value!, arr);
+      }
       const W = this.worldsFromPoses(0, mirror);
       let sum = 0;
       for (const p of this.parts.values()) {
@@ -2317,6 +2586,7 @@ export class Viewer {
     for (let b = 0; b < n; b++) {
       this.skelBones[b].scale.setScalar(this.mirrorBones.has(b) ? -1 : 1);
     }
+    if (gfmEnabled) gfm!.set_mirror(Uint32Array.from(this.mirrorBones));
   }
 
   /**
@@ -2324,6 +2594,11 @@ export class Viewer {
    * abs = i0+alpha 绝对帧；倒退/跳跃视为 seek，模拟点重置到携带目标。
    */
   private updateClothMats(abs: number) {
+    if (gfmEnabled) {
+      this.gfmUploadWorldMats();
+      gfm!.update_cloth(abs);
+      return;
+    }
     if (!this.clothSims.length || !this.clothTpInv || this.clothCarrier < 0) return;
     const carrier = this.worldMats[this.clothCarrier];
     if (!carrier) return;
@@ -2411,8 +2686,22 @@ export class Viewer {
     }
   }
 
-  /** 点对 (骨骼局部, 世界) 的刚体拟合：H = Σ(b-cb)(a-ca)ᵀ 极分解求 R，t = cb - R·ca */
+  /** 点对 (骨骼局部, 世界) 的刚体拟合：H = Σ(b-cb)(a-ca)ᵀ 极分解求 R，t = cb - R·ca。
+   *  拟合内核在 wasm（fmath fit_bind_matrix；极分解/两点对齐与 TS 口径一致） */
   private fitBindMatrix(pairs: [number[], number[]][]): THREE.Matrix4 {
+    if (gfmEnabled) {
+      const local = new Float32Array(pairs.length * 3);
+      const world = new Float32Array(pairs.length * 3);
+      pairs.forEach(([a, b], i) => {
+        local.set(a, i * 3);
+        world.set(b, i * 3);
+      });
+      return new THREE.Matrix4().fromArray(gfm!.fit_bind_matrix(local, world));
+    }
+    return this.fitBindMatrixLegacy(pairs);
+  }
+
+  private fitBindMatrixLegacy(pairs: [number[], number[]][]): THREE.Matrix4 {
     const n = pairs.length;
     if (n === 0) return new THREE.Matrix4();
     const ca = [0, 0, 0];
@@ -2603,6 +2892,12 @@ export class Viewer {
    * boneLocalPos 是引擎逐顶点写入的精确数据，直接加权即为游戏渲染结果。
    */
   private skinPart(p: PartObj) {
+    if (gfmEnabled && p.gfmId >= 0) {
+      this.gfmUploadWorldMats();
+      gfm!.skin_part(p.gfmId);
+      this.markPartAttrs(p);
+      return;
+    }
     if (!this.worldMats.length) return;
     const boneCount = this.fskelBoneCount || this.worldMats.length;
     const vcount = p.model.vertices.length;
@@ -2785,6 +3080,12 @@ export class Viewer {
 
   clearFskel() {
     for (const p of this.parts.values()) this.restorePart(p);
+    if (gfmEnabled) {
+      gfm!.clear_poses();
+      gfm!.clear_skirt();
+      gfm!.clear_anchored();
+      gfm!.clear_cloth();
+    }
     if (this.skelHelper) {
       this.modelRoot.remove(this.skelHelper);
       this.skelHelper.dispose();
@@ -2844,6 +3145,20 @@ export class Viewer {
     }
     this.fakPos = new THREE.BufferAttribute(pos, 3);
     this.fakNrm = new THREE.BufferAttribute(nrm, 3);
+    if (gfmEnabled) {
+      // 全帧一次性上传二进制（原 number[] JSON 逐帧行访问，序列化/访问双收益）；
+      // 顶点池属性换 wasm 视图，fak_frame 直写
+      const total = model.frames.reduce((s, f) => s + f.data.length, 0);
+      const all = new Float32Array(total);
+      let fo = 0;
+      for (const f of model.frames) {
+        all.set(f.data, fo);
+        fo += f.data.length;
+      }
+      gfm!.set_fak(all, model.frames.length, n);
+      this.fakPos = new THREE.BufferAttribute(gfm!.fak_pos_view()!, 3);
+      this.fakNrm = new THREE.BufferAttribute(gfm!.fak_nrm_view()!, 3);
+    }
     this.fakPos.setUsage(THREE.DynamicDrawUsage);
     this.fakNrm.setUsage(THREE.DynamicDrawUsage);
 
@@ -2880,6 +3195,12 @@ export class Viewer {
 
   /** 应用第 i0 帧；给出 i1/alpha 时做位置/法线 lerp 平滑插值（法线重归一化） */
   applyFakFrame(i0: number, i1: number, alpha: number) {
+    if (gfmEnabled) {
+      gfm!.fak_frame(i0, i1, alpha);
+      this.fakPos!.needsUpdate = true;
+      this.fakNrm!.needsUpdate = true;
+      return;
+    }
     const m = this.fakModel;
     const pos = this.fakPos;
     const nrm = this.fakNrm;
@@ -2925,6 +3246,7 @@ export class Viewer {
     for (const mesh of this.fakMeshes) this.modelRoot.remove(mesh);
     for (const g of this.fakGeoms) g.dispose();
     for (const m of this.fakMats) m.dispose();
+    if (gfmEnabled) gfm!.clear_fak();
     this.fakMeshes = [];
     this.fakGeoms = [];
     this.fakMats = [];

@@ -176,6 +176,22 @@ dev 模式原理：`gui/Cargo.toml` 的 `[features]` 转发 `tauri/custom-protoc
 （run-dev.bat / tauri dev）进入 cfg(dev)，窗口加载 tauri.conf.json 的 devUrl（vite，
 端口 1420）。改前端 HMR 即时生效，改 Rust 关闭应用重跑脚本即可。
 
+#### fmath：前端模型计算内核（wasm）
+
+前端的重计算（CPU 蒙皮 LBS、裙摆去穿透、布料 verlet、锚定链矩阵、绑定矩阵
+极分解拟合、镜像骨检测残差、FAK 顶点插值）在 `fmath` crate（wasm-bindgen），
+`npm run build` / `npm run dev`（predev）自动经 wasm-pack 构建到 `gui/ui/src/wasm`
+（产物不入库）。前端 `gui/ui/src/gfm.ts` 装载单例，`viewer.ts` 持 wasm 内存
+视图直连 three.js BufferAttribute——每帧只上传一次世界矩阵平表，蒙皮/去穿透
+结果零拷贝回写。数值口径与原 TS 实现对齐（f64 中间量）；cdp 采集（skirtRecord /
+skirtPushLog / window.__viewer）接口不变。回退调试：URL 加 `?gfm=ts` 或
+localStorage 置 `gfm_off=1` 后刷新，走 viewer.ts 内置 TS 实现做 A/B 对比。
+前置工具链（run.bat / run-dev.bat / run.sh 的依赖步骤会自动自检，缺失时
+`npm --prefix gui/ui run wasm-check` 给出指引）：全局 wasm-pack
+（`cargo install wasm-pack`）+ rustup 的 wasm32-unknown-unknown 目标（自检
+自动补装）。冒烟验证：`node gui/ui/scripts/wasm-smoke.mjs`（先
+`npm run wasm`）；Rust 侧单测 `cargo test -p fmath`。
+
 HMR 边界：改 `.vue` 组件 = 组件级热替换；改检查器 = 只重载检查器子树
 （`components/InspectorPanel.vue`）；改 `viewer.ts` = **原位热替换，零重建**——
 ViewerHost.vue 对 viewer.ts 做依赖级 accept，把存活实例的原型换到新类上，方法体 /
