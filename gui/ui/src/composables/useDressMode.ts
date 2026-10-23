@@ -13,17 +13,18 @@ import type { ActStore } from "./useActMode";
 import { message } from "../message";
 import { shortName } from "../utils";
 
-/** 装备槽 → 穿上后隐藏的基础部件槽（scan_model_set 的槽名） */
+/** 装备槽 → 穿上后隐藏的基础部件槽（scan_model_set 的槽名）。
+ *  hat 隐藏 hair：头部装备模型自带头发（替换原发型，游戏实测） */
 const SLOT_HIDE_BASE: Record<string, string[]> = {
-  hat: [],
+  hat: ["hair"],
   armonr: ["upper"],
   lower: ["lower"],
   glove: [],
   boot: ["boot"],
 };
 
-/** 时装（全身含头）隐藏的基础部件槽；头部独立组另行处理，发型保留 */
-const FASHION_HIDE_BASE = ["upper", "lower", "boot"];
+/** 时装（全身含头，模型同样自带头发 → 发型一并替换，游戏实测）隐藏的基础部件槽 */
+const FASHION_HIDE_BASE = ["hair", "upper", "lower", "boot"];
 
 /** 与时装互斥渲染的身体装备槽（帽子可与时装共存） */
 const FASHION_MUTEX_SLOTS = ["armonr", "lower", "glove", "boot"];

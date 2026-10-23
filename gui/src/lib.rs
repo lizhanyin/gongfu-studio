@@ -429,3 +429,473 @@ pub fn skirt_probe_for_test(fskel_path: &str, fskin_paths: &[String]) -> Result<
     }
     Ok(out)
 }
+
+// ---------------------------------------------------------------- 帽子挂接探针
+
+type M3 = [[f32; 3]; 3]; // 行主序，v' = R·v
+type V3 = [f32; 3];
+
+fn m3_identity() -> M3 {
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+}
+
+fn m3_mul(a: &M3, b: &M3) -> M3 {
+    let mut r = [[0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    r
+}
+
+fn m3_apply(m: &M3, p: &V3) -> V3 {
+    [
+        m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2],
+        m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2],
+        m[2][0] * p[0] + m[2][1] * p[1] + m[2][2] * p[2],
+    ]
+}
+
+/// 四元数 (x,y,z,w) → 旋转矩阵（three.js 约定，与 viewer applyFskelFrame 一致）
+fn quat_to_m3(q: &[f32; 4]) -> M3 {
+    let [x, y, z, w] = *q;
+    [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+        ],
+        [
+            2.0 * (x * y + w * z),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - w * x),
+        ],
+        [
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ]
+}
+
+fn v3_add(a: &V3, b: &V3) -> V3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+struct WorldXf {
+    r: M3,
+    t: V3,
+}
+
+fn bbox_of(out: &mut String, name: &str, pts: &[V3]) -> ([f32; 3], [f32; 3]) {
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for p in pts {
+        for i in 0..3 {
+            mn[i] = mn[i].min(p[i]);
+            mx[i] = mx[i].max(p[i]);
+        }
+    }
+    let c = [
+        (mn[0] + mx[0]) / 2.0,
+        (mn[1] + mx[1]) / 2.0,
+        (mn[2] + mx[2]) / 2.0,
+    ];
+    out.push_str(&format!(
+        "{name:26} min[{:7.1},{:7.1},{:7.1}] max[{:7.1},{:7.1},{:7.1}] 中心[{:7.1},{:7.1},{:7.1}]\n",
+        mn[0], mn[1], mn[2], mx[0], mx[1], mx[2], c[0], c[1], c[2]
+    ));
+    (mn, mx)
+}
+
+/// 诊断探针（hat_probe 示例用）：帽子挂接排查——FSKEL 帧0 头骨世界矩阵
+/// （骨轴 +X 与 +Z 在数据空间的实际朝向）、FM01 帽模局部网格与挂点、
+/// girl_head / girl_Hair01 蒙皮后包围盒，并模拟 viewer 当前挂接变换
+/// （headWorld · (Rz(-90°)·v + lift·X)），量化前后偏差。
+pub fn hat_probe_for_test(fskel_path: &str, fsm_path: &str, fskin_paths: &[String]) -> Result<String, String> {
+    let bytes = std::fs::read(fskel_path).map_err(|e| format!("读 FSKEL 失败: {e}"))?;
+    let f = fskel::parse_fskel(fskel_path, &bytes)?;
+    let meta = f.meta();
+    let n = meta.bone_count as usize;
+    let pose = f.frames_flat(0, 1); // 帧0: 每骨 (t3, q4)
+    let mut out = format!("== FSKEL {}: {n} 骨 · {} 帧\n", meta.file_name, meta.frame_count);
+
+    // 世界矩阵（父链组合，parents 可能乱序，迭代到稳定）
+    let mut world: Vec<Option<WorldXf>> = (0..n).map(|_| None).collect();
+    let root_idx = (0..n).find(|&i| meta.parents[i] < 0).ok_or("无根骨")?;
+    let rq = |i: usize| {
+        let o = i * 7;
+        (
+            [pose[o], pose[o + 1], pose[o + 2]],
+            quat_to_m3(&[
+                pose[o + 3],
+                pose[o + 4],
+                pose[o + 5],
+                pose[o + 6],
+            ]),
+        )
+    };
+    let (t0, r0) = rq(root_idx);
+    world[root_idx] = Some(WorldXf { r: r0, t: t0 });
+    let mut guard = 0;
+    while world.iter().any(|w| w.is_none()) {
+        guard += 1;
+        if guard > 1000 {
+            return Err("骨链解析死循环".into());
+        }
+        for i in 0..n {
+            if world[i].is_none() {
+                let p = meta.parents[i] as usize;
+                if let Some(pw) = &world[p] {
+                    let (t, r) = rq(i);
+                    world[i] = Some(WorldXf {
+                        r: m3_mul(&pw.r, &r),
+                        t: v3_add(&m3_apply(&pw.r, &t), &pw.t),
+                    });
+                }
+            }
+        }
+    }
+
+    // 头骨：viewer autoHatBone 同款匹配（含 head / tou）
+    let head = (0..n)
+        .find(|&i| meta.bone_names[i].to_lowercase().contains("head"))
+        .or_else(|| (0..n).find(|&i| meta.bone_names[i].to_lowercase().contains("tou")))
+        .ok_or("无头骨")?;
+    let hw = world[head].as_ref().unwrap();
+    out += &format!(
+        "== 头骨 {}(#{head}) 帧0: 世界原点 [{:.2},{:.2},{:.2}]\n",
+        meta.bone_names[head], hw.t[0], hw.t[1], hw.t[2]
+    );
+    out += &format!(
+        "  local t=[{:.2},{:.2},{:.2}] q=[{:.3},{:.3},{:.3},{:.3}]\n",
+        pose[head * 7],
+        pose[head * 7 + 1],
+        pose[head * 7 + 2],
+        pose[head * 7 + 3],
+        pose[head * 7 + 4],
+        pose[head * 7 + 5],
+        pose[head * 7 + 6]
+    );
+    out += &format!(
+        "  骨轴 +X(骨方向)=[{:.3},{:.3},{:.3}]  +Y=[{:.3},{:.3},{:.3}]  +Z=[{:.3},{:.3},{:.3}]\n",
+        hw.r[0][0], hw.r[1][0], hw.r[2][0],
+        hw.r[0][1], hw.r[1][1], hw.r[2][1],
+        hw.r[0][2], hw.r[1][2], hw.r[2][2],
+    );
+    // 头骨父链（颈部走向）
+    out += "  -- 父链(根→头) --\n";
+    let mut chain = vec![head];
+    while meta.parents[*chain.last().unwrap()] >= 0 {
+        chain.push(meta.parents[*chain.last().unwrap()] as usize);
+    }
+    for &b in chain.iter().rev() {
+        let w = world[b as usize].as_ref().unwrap();
+        out += &format!(
+            "  {:16} 世界t=[{:6.1},{:6.1},{:6.1}] local t=[{:.2},{:.2},{:.2}] q=[{:.3},{:.3},{:.3},{:.3}]\n",
+            meta.bone_names[b],
+            w.t[0], w.t[1], w.t[2],
+            pose[b * 7],
+            pose[b * 7 + 1],
+            pose[b * 7 + 2],
+            pose[b * 7 + 3],
+            pose[b * 7 + 4],
+            pose[b * 7 + 5],
+            pose[b * 7 + 6]
+        );
+    }
+
+    // ---- 帽模 FSM 局部网格 ----
+    let bytes = std::fs::read(fsm_path).map_err(|e| format!("读 FSM 失败: {e}"))?;
+    let hat = fsm::parse_fsm(fsm_path, &bytes)?;
+    let hat_pts: Vec<V3> = hat
+        .vertices
+        .chunks(8)
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
+    out += &format!(
+        "\n== {} 帽模（局部坐标, {} 顶点）\n",
+        hat.path.rsplit(['\\', '/']).next().unwrap_or(&hat.path),
+        hat.vertex_count
+    );
+    bbox_of(&mut out, "局部 bbox", &hat_pts);
+    // 垂发侧判定：按 local Y 分层（下层=垂发/帽檐下发丝，顶层=冠环），
+    // 各层的 Z 质心与范围 → 帽模不对称侧在 +Z 还是 −Z
+    {
+        let mut mn = [f32::MAX; 3];
+        let mut mx = [f32::MIN; 3];
+        for p in &hat_pts {
+            for i in 0..3 {
+                mn[i] = mn[i].min(p[i]);
+                mx[i] = mx[i].max(p[i]);
+            }
+        }
+        let y_mid = (mn[1] + mx[1]) / 2.0;
+        let mut layer = |name: &str, pred: &dyn Fn(&V3) -> bool| {
+            let sel: Vec<V3> = hat_pts.iter().filter(|p| pred(p)).copied().collect();
+            if sel.is_empty() {
+                out += &format!("  {name}: 无顶点\n");
+                return;
+            }
+            let n = sel.len();
+            let cz = sel.iter().map(|p| p[2]).sum::<f32>() / n as f32;
+            let mut zmn = f32::MAX;
+            let mut zmx = f32::MIN;
+            for p in &sel {
+                zmn = zmn.min(p[2]);
+                zmx = zmx.max(p[2]);
+            }
+            out += &format!("  {name}: {n} 点, Z∈[{zmn:.1},{zmx:.1}] 质心Z={cz:.1}\n");
+        };
+        layer("下层(y<y_mid, 垂发)", &|p: &V3| p[1] < y_mid);
+        layer("顶层(y≥y_mid, 冠)", &|p: &V3| p[1] >= y_mid);
+    }
+    for d in &hat.dummies {
+        out += &format!(
+            "  dummy {} pos=[{:.2},{:.2},{:.2}] q=[{:.2},{:.2},{:.2},{:.2}]\n",
+            d.name,
+            d.values[0],
+            d.values[1],
+            d.values[2],
+            d.values[3],
+            d.values[4],
+            d.values[5],
+            d.values[6]
+        );
+    }
+
+    // ---- 基础头/发 fskin 蒙皮到帧0 ----
+    let mut skin_boxes: Vec<(String, [f32; 3], [f32; 3])> = Vec::new();
+    for path in fskin_paths {
+        let bytes = std::fs::read(path).map_err(|e| format!("读 FSKIN 失败: {e}"))?;
+        let m = fskin::parse_fskin(path, &bytes)?;
+        let fname = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
+        let mut pts: Vec<V3> = Vec::with_capacity(m.vertices.len());
+        let mut bone_hits = std::collections::BTreeMap::new();
+        for v in &m.vertices {
+            let mut p = [0f32; 3];
+            for inf in &v.influences {
+                if let Some(w) = world.get(inf.bone_index as usize).and_then(|w| w.as_ref()) {
+                    let lp = m3_apply(&w.r, &inf.bone_local_pos);
+                    p = v3_add(
+                        &p,
+                        &[
+                            (lp[0] + w.t[0]) * inf.weight,
+                            (lp[1] + w.t[1]) * inf.weight,
+                            (lp[2] + w.t[2]) * inf.weight,
+                        ],
+                    );
+                    *bone_hits.entry(inf.bone_index).or_insert(0f32) += inf.weight;
+                }
+            }
+            pts.push(p);
+        }
+        out += &format!("\n== {fname} 蒙皮@帧0 ({} 顶点)\n", m.vertices.len());
+        let (mn, mx) = bbox_of(&mut out, &format!("{fname} bbox"), &pts);
+        skin_boxes.push((fname.clone(), mn, mx));
+        let mut hits: Vec<_> = bone_hits.into_iter().collect();
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        out += &format!(
+            "  主影响骨: {}\n",
+            hits.iter()
+                .take(4)
+                .map(|(b, w)| format!(
+                    "{}(#{}, w={:.1})",
+                    meta.bone_names.get(*b as usize).map(String::as_str).unwrap_or("?"),
+                    b,
+                    w
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let y_mid = (mn[1] + mx[1]) / 2.0;
+        let upper: Vec<V3> = pts.iter().filter(|p| p[1] > y_mid).copied().collect();
+        bbox_of(&mut out, &format!("{fname} 上半"), &upper);
+    }
+
+    // ---- 模拟 viewer 当前挂接: data = headWorld · (Rz(-90°)·v + lift·X) ----
+    let rz = |v: &V3| -> V3 { [v[1], -v[0], v[2]] };
+    for lift in [9.0f32, 0.0] {
+        let sim: Vec<V3> = hat_pts
+            .iter()
+            .map(|v| {
+                let b = rz(v);
+                let b = [b[0] + lift, b[1], b[2]];
+                v3_add(&m3_apply(&hw.r, &b), &hw.t)
+            })
+            .collect();
+        out += &format!("\n== 模拟挂接 lift={lift}: data = headWorld·(Rz(-90°)v+({lift},0,0))\n");
+        bbox_of(&mut out, "挂接后 bbox", &sim);
+    }
+
+    // ---- 朝向搜索：24 个轴对齐纯旋转 × 平移网格，按对称 chamfer 对齐帽模↔基础发 ----
+    // （帽模替换基础发，两者同戴一颗头，最优刚体变换即游戏挂接约定）
+    if let Some((hair_name, hmn, _hmx)) = skin_boxes.iter().find(|(n, _, _)| n.contains("Hair")) {
+        let bytes = std::fs::read(fskin_paths.iter().find(|p| p.contains("Hair")).unwrap())
+            .map_err(|e| format!("读 FSKIN 失败: {e}"))?;
+        let hm = fskin::parse_fskin(fskin_paths.iter().find(|p| p.contains("Hair")).unwrap(), &bytes)?;
+        let hair_pts: Vec<V3> = {
+            let mut pts = Vec::with_capacity(hm.vertices.len());
+            for v in &hm.vertices {
+                let mut p = [0f32; 3];
+                for inf in &v.influences {
+                    if let Some(w) = world.get(inf.bone_index as usize).and_then(|w| w.as_ref()) {
+                        let lp = m3_apply(&w.r, &inf.bone_local_pos);
+                        p = v3_add(
+                            &p,
+                            &[
+                                (lp[0] + w.t[0]) * inf.weight,
+                                (lp[1] + w.t[1]) * inf.weight,
+                                (lp[2] + w.t[2]) * inf.weight,
+                            ],
+                        );
+                    }
+                }
+                pts.push(p);
+            }
+            pts
+        };
+        let _ = (hair_name, hmn);
+        // 均匀下采样
+        let step = |v: &[V3], want: usize| -> Vec<V3> {
+            let s = (v.len() / want).max(1);
+            v.iter().step_by(s).copied().collect()
+        };
+        let src = step(&hat_pts, 300);
+        let dst = step(&hair_pts, 300);
+        let chamfer = |a: &[V3], b: &[V3]| -> f32 {
+            let mut sum = 0f32;
+            for p in a {
+                let mut best = f32::MAX;
+                for q in b {
+                    let d = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+                    best = best.min(d);
+                }
+                sum += best.sqrt();
+            }
+            sum / a.len() as f32
+        };
+        // 24 个纯旋转：列是单位轴的带符号置换
+        let axes: [V3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut results: Vec<(f32, String, M3, V3)> = Vec::new();
+        for xi in 0..3 {
+            for sx in [1.0f32, -1.0] {
+                for yi in 0..3 {
+                    if yi == xi {
+                        continue;
+                    }
+                    for sy in [1.0f32, -1.0] {
+                        // 第三轴 = 右手系补全
+                        let zi = 3 - xi - yi;
+                        let sz = if (xi, yi) == (0, 1) || (xi, yi) == (1, 2) || (xi, yi) == (2, 0) {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        let col = |i: usize, s: f32| -> V3 {
+                            [axes[i][0] * s, axes[i][1] * s, axes[i][2] * s]
+                        };
+                        let c1 = col(xi, sx);
+                        let c2 = col(yi, sy);
+                        let c3 = col(zi, sz);
+                        // det 检查（右手系）
+                        let det = c1[0] * (c2[1] * c3[2] - c2[2] * c3[1])
+                            - c1[1] * (c2[0] * c3[2] - c2[2] * c3[0])
+                            + c1[2] * (c2[0] * c3[1] - c2[1] * c3[0]);
+                        if det < 0.0 {
+                            continue;
+                        }
+                        let r = [
+                            [c1[0], c2[0], c3[0]],
+                            [c1[1], c2[1], c3[1]],
+                            [c1[2], c2[2], c3[2]],
+                        ];
+                        let name = format!("meshX→[{:.0},{:.0},{:.0}] Y→[{:.0},{:.0},{:.0}] Z→[{:.0},{:.0},{:.0}]",
+                            c1[0], c1[1], c1[2], c2[0], c2[1], c2[2], c3[0], c3[1], c3[2]);
+                        // 平移：先质心对齐，再 ±10 步 2.5 小网格精修
+                        let src_c = [
+                            src.iter().map(|p| p[0]).sum::<f32>() / src.len() as f32,
+                            src.iter().map(|p| p[1]).sum::<f32>() / src.len() as f32,
+                            src.iter().map(|p| p[2]).sum::<f32>() / src.len() as f32,
+                        ];
+                        let dst_c = [
+                            dst.iter().map(|p| p[0]).sum::<f32>() / dst.len() as f32,
+                            dst.iter().map(|p| p[1]).sum::<f32>() / dst.len() as f32,
+                            dst.iter().map(|p| p[2]).sum::<f32>() / dst.len() as f32,
+                        ];
+                        let rot_c = m3_apply(&r, &src_c);
+                        let base_t = [
+                            dst_c[0] - rot_c[0],
+                            dst_c[1] - rot_c[1],
+                            dst_c[2] - rot_c[2],
+                        ];
+                        let mut best = (f32::MAX, [0f32; 3]);
+                        for tx in -4..=4i32 {
+                            for ty in -4..=4i32 {
+                                for tz in -4..=4i32 {
+                                    let t = [
+                                        base_t[0] + tx as f32 * 2.5,
+                                        base_t[1] + ty as f32 * 2.5,
+                                        base_t[2] + tz as f32 * 2.5,
+                                    ];
+                                    let moved: Vec<V3> = src
+                                        .iter()
+                                        .map(|p| v3_add(&m3_apply(&r, p), &t))
+                                        .collect();
+                                    let c = chamfer(&moved, &dst);
+                                    if c < best.0 {
+                                        best = (c, t);
+                                    }
+                                }
+                            }
+                        }
+                        results.push((best.0, name, r, best.1));
+                    }
+                }
+            }
+        }
+        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        out += "\n== 朝向搜索（帽模→基础发 chamfer，top8；t 为数据空间平移）==\n";
+        for (c, name, _, t) in results.iter().take(8) {
+            out += &format!("  chamfer={c:6.2}  {name}  t=[{:.1},{:.1},{:.1}]\n", t[0], t[1], t[2]);
+        }
+        // 当前实现（Option A: Rz(-90°), lift=9）的 chamfer 对照
+        let cur: Vec<V3> = hat_pts
+            .iter()
+            .map(|v| {
+                let b = rz(v);
+                let b = [b[0] + 9.0, b[1], b[2]];
+                v3_add(&m3_apply(&hw.r, &b), &hw.t)
+            })
+            .collect();
+        let cur_sub = step(&cur, 300);
+        out += &format!(
+            "  当前实现 chamfer={:.2}\n",
+            chamfer(&cur_sub, &dst)
+        );
+        // Option B: Rz(-90°)·Rx(π)（mesh Z→骨−Z）
+        let rb = |v: &V3| -> V3 { [v[1], v[0], -v[2]] }; // Rx(π)后Rz(-90°): (x,y,z)->(y,x,-z)
+        for lift in [7.0f32, 9.0] {
+            let sim: Vec<V3> = hat_pts
+                .iter()
+                .map(|v| {
+                    let b = rb(v);
+                    let b = [b[0] + lift, b[1], b[2]];
+                    v3_add(&m3_apply(&hw.r, &b), &hw.t)
+                })
+                .collect();
+            let sub = step(&sim, 300);
+            out += &format!(
+                "  OptionB(meshZ→data+Z) lift={lift} chamfer={:.2}\n",
+                chamfer(&sub, &dst)
+            );
+            bbox_of(&mut out, &format!("OptionB lift={lift} bbox"), &sim);
+        }
+    }
+    Ok(out)
+}

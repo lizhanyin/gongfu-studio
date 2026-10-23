@@ -304,6 +304,12 @@ export class Viewer {
   private static readonly CLOTH_G = 300;
   /** 腿部胶囊半径系数（×段长）：实测大腿网格面 ≈0.145×段长，取 0.18 含余量 */
   private static readonly CLOTH_LEG_R = 0.18;
+  /** 帽子挂接偏移（骨局部系；经 fix 节点双层 Yaw 抵消后所见方向：
+   *  X=沿骨轴上下、Y=左右、Z=前后(−Z 为脸侧)）。头部装备模型自带头发
+   *  （替换原发型，时装同理），锚点对齐头发区域：FM01 发丝与基础发上下缘
+   *  贴齐实测 lift≈7（hat_probe），花环帽实测需 10；前后原点对位差≈3；
+   *  左右 0.5 微调。由面板偏移实测值 (3,0.5,1) 折算固化 */
+  private static readonly HAT_OFFSET = new THREE.Vector3(10, -1.5, -3);
   // 每帧复用的临时对象
   private cCarry = new THREE.Matrix4();
   private cAnchor = new THREE.Vector3();
@@ -3060,6 +3066,7 @@ export class Viewer {
       this.worldMats[b].copy(this.skelBones[b].matrixWorld);
     }
     this.updateAnchoredMats();
+    this.updateBoneAttachedMats(); // 帽子等骨骼挂接件：写入骨骼相对运动（显示共轭）
     this.updateClothMats(i0 + alpha);
     // 关节小球跟随世界坐标
     const m = new THREE.Matrix4();
@@ -3389,22 +3396,32 @@ export class Viewer {
 
   // ---------------- 骨骼挂接网格（帽子等 FSM 静态件） ----------------
 
-  /** 挂接层级：holder（骨骼子级，矩阵 = 挂接时骨骼世界矩阵的逆）→ inner（显示旋转 + 偏移）→ 网格 */
+  /** 挂接层级（骨路径）：modelRoot(带 MODEL_YAW) → holder（每帧 = 骨骼相对运动
+   *  boneW(t)·boneW0⁻¹，见 updateBoneAttachedMats）→ fix（静态 = Yawπ·骨绑定
+   *  姿态·沿骨平移，与 body 显示旋转共轭对齐）→ inner（FSM 局部系→骨系旋转 +
+   *  偏移）→ 网格。静态时 Yawπ·Yawπ 相消 = 旧的骨下直接挂接位置；
+   *  动画时经 Yawπ 共轭，俯仰/侧倾与身体网格同向（不共轭会镜像反相） */
   private boneAttached = new Map<
     string,
     {
       holder: THREE.Group;
+      fix: THREE.Group;
       inner: THREE.Group;
       meshes: THREE.Mesh[];
       geoms: THREE.BufferGeometry[];
       mats: THREE.MeshStandardMaterial[];
       boneName: string;
+      /** 绑定的骨骼实例（骨架重载后重找）；null = 静态回落（挂 modelRoot） */
+      bone: THREE.Bone | null;
+      /** 绑定时骨骼世界矩阵的逆（相对运动载体，bone 非空时有效） */
+      bindInv: THREE.Matrix4;
     }
   >();
 
   /**
-   * FSM 网格挂到骨骼（帽子槽）：随骨骼刚性运动，挂接时位姿下与静态摆放一致。
-   * 骨架未加载或骨名不存在时按普通静态网格摆放。offset 为显示空间微调。
+   * FSM 网格挂到骨骼（帽子槽）：随骨骼刚性运动，且动画相位与身体网格一致
+   * （经 MODEL_YAW 共轭，见 boneAttached 注释）。骨架未加载或骨名不存在时
+   * 按普通静态网格摆放。offset 为 fix 系（≈显示空间）微调。
    */
   addBoneAttached(
     path: string,
@@ -3418,10 +3435,23 @@ export class Viewer {
     const inner = new THREE.Group();
     inner.position.set(offset[0], offset[1], offset[2]);
     for (const mesh of meshes) inner.add(mesh);
+    const fix = new THREE.Group();
+    fix.matrixAutoUpdate = false;
+    fix.add(inner);
     const holder = new THREE.Group();
     holder.matrixAutoUpdate = false;
-    holder.add(inner);
-    this.boneAttached.set(path, { holder, inner, meshes, geoms, mats: matsOut, boneName });
+    holder.add(fix);
+    this.boneAttached.set(path, {
+      holder,
+      fix,
+      inner,
+      meshes,
+      geoms,
+      mats: matsOut,
+      boneName,
+      bone: null,
+      bindInv: new THREE.Matrix4(),
+    });
     this.refreshBoneAttached(path);
   }
 
@@ -3449,9 +3479,23 @@ export class Viewer {
   }
 
   /**
-   * 按当前骨架重挂：holder 挂到目标骨骼下，矩阵 = 骨骼世界矩阵的逆
-   * （挂接时位姿下网格保持文件空间位置，之后随骨骼刚性跟随）。
-   * 骨架加载/切换（setFskel 应用帧 0 后）与挂接创建时调用。
+   * 按当前骨架重挂。FSM 网格为**局部坐标**建模（原点 = 挂点锚，帽子/武器均
+   * 绕原点，实测 FM01 bbox ±10~15、J01 ±10~43，不存在世界坐标 authored 的 FSM）。
+   *
+   * 静态摆放：网格局部原点落到「骨骼原点 + HAT_OFFSET」（骨局部系，
+   *  X=沿骨轴抬升/Y=左右/Z=前后），inner 只转 Rz(−90°)（mesh +Y 冠/刃方向对骨轴 +X，前后不翻转——
+   * 花环帽游戏内实测，加 Rx(π) 会前后反；本地 FM01 前后近对称无法判定）。
+   *
+   * 运动学（关键）：身体网格显示经过 modelRoot 的 MODEL_YAW(π)，而骨骼层级在
+   * scene（数据空间）——若帽子直接挂骨骼下渲染，其俯仰/侧倾相对身体是**共轭
+   * 镜像**的（头前倾时帽子后仰，实测）。故挂接改为 modelRoot → holder（每帧
+   * = boneW(t)·boneW0⁻¹ 相对运动）→ fix（= Yawπ·boneW0·T静态）→ inner：
+   * 静态时 Yawπ·I·Yawπ 相消，与骨下直接挂接完全同位；动画时总变换 =
+   * Yawπ·(boneW(t)·boneW0⁻¹)·Yawπ·(boneW0·T) = 共轭相对运动 × 静态位，
+   * 与身体蒙皮顶点的显示运动逐点同向。绕竖直轴转动原本就一致，水平轴转动
+   * 由共轭修正。
+   *
+   * 骨名不存在时按普通静态网格摆放（挂 modelRoot、无每帧更新）。
    */
   private refreshBoneAttached(path?: string) {
     const entries = path
@@ -3463,15 +3507,37 @@ export class Viewer {
         this.skelBones.find((b) => b.name.toLowerCase() === lower) ??
         this.skelBones.find((b) => b.name.toLowerCase().includes(lower));
       if (bone) {
-        bone.add(e.holder);
-        e.inner.rotation.y = MODEL_YAW; // 骨骼层级在 scene（数据空间），补显示旋转
-        bone.updateWorldMatrix(true, false);
-        e.holder.matrix.copy(bone.matrixWorld).invert();
+        e.bone = bone;
+        bone.updateWorldMatrix(true, false); // 绑定姿态（骨架加载后为帧 0；中途换帽取当前帧，相对运动不受影响）
+        e.bindInv.copy(bone.matrixWorld).invert();
+        this.modelRoot.add(e.holder);
+        e.holder.matrix.identity(); // 相对运动：绑定瞬间 = I（每帧由 updateBoneAttachedMats 重写）
+        e.fix.matrix
+          .makeRotationY(MODEL_YAW)
+          .multiply(bone.matrixWorld)
+          .multiply(
+            new THREE.Matrix4().makeTranslation(
+              Viewer.HAT_OFFSET.x,
+              Viewer.HAT_OFFSET.y,
+              Viewer.HAT_OFFSET.z
+            )
+          );
+        e.inner.rotation.set(0, 0, -Math.PI / 2); // Rz(−90°): mesh +Y→骨+X；前后不翻转（游戏帽模实测）
       } else {
+        e.bone = null;
         this.modelRoot.add(e.holder); // modelRoot 已带显示旋转
-        e.inner.rotation.y = 0;
         e.holder.matrix.identity();
+        e.fix.matrix.identity();
+        e.inner.rotation.set(0, 0, 0);
       }
+    }
+  }
+
+  /** 每帧把骨骼当前相对运动写入挂接 holder（applyFskelFrame 在骨骼世界矩阵
+   *  刷新后调用；静态回落路径 bone=null 跳过） */
+  private updateBoneAttachedMats() {
+    for (const e of this.boneAttached.values()) {
+      if (e.bone) e.holder.matrix.multiplyMatrices(e.bone.matrixWorld, e.bindInv);
     }
   }
 
