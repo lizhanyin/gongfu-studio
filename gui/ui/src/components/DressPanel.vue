@@ -189,7 +189,7 @@ const setCurrentValue = computed(() => {
 });
 
 const boneOptions = computed(() => [
-  { label: "自动 (含 head)", value: "" },
+  { label: "自动 (tag_Hat)", value: "" },
   ...props.actDirSkeleton.map((n) => ({ label: n, value: n })),
 ]);
 

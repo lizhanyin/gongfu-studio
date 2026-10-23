@@ -176,6 +176,11 @@ export class Viewer {
   private tmpVec = new THREE.Vector3();
   /** 当前帧各骨世界矩阵（蒙皮数据源，applyFskelFrame 时刷新） */
   private worldMats: THREE.Matrix4[] = [];
+  /** 帧 0（绑定姿态）各骨世界矩阵快照：骨骼挂接件的静态基准。挂接若取
+   *  点击瞬间的姿态，头部俯仰经 Yawπ 共轭会留残差——不同时刻戴的帽贴合
+   *  度有细微差别；固定绑定姿态后渲染结果与挂接时刻无关（等价引擎逐帧
+   *  重算 boneW(t)·offset），日志数值也可复现 */
+  private bindWorldMats: THREE.Matrix4[] = [];
   /** 各骨共识绑定拟合（boneLocalPos→pos，跨部件多数分簇）。authored pos
    *  与多数部件摆放不一致的部件（Girl_hair05×0x6）静态模式下按此渲染
    *  绑定姿态，与头部对齐；一致部件保持 authored 原样。 */
@@ -305,11 +310,15 @@ export class Viewer {
   /** 腿部胶囊半径系数（×段长）：实测大腿网格面 ≈0.145×段长，取 0.18 含余量 */
   private static readonly CLOTH_LEG_R = 0.18;
   /** 帽子挂接偏移（骨局部系；经 fix 节点双层 Yaw 抵消后所见方向：
-   *  X=沿骨轴上下、Y=左右、Z=前后(−Z 为脸侧)）。头部装备模型自带头发
+   *  X=沿骨轴上下、Y=左右、Z=前后(−Z 为脸侧)）。仅对**无 tag_Hat 挂点骨的
+   *  骨架**的回落挂法生效（挂普通 head 骨）：头部装备模型自带头发
    *  （替换原发型，时装同理），锚点对齐头发区域：FM01 发丝与基础发上下缘
    *  贴齐实测 lift≈7（hat_probe），花环帽实测需 10；前后原点对位差≈3；
    *  左右 0.5 微调。由面板偏移实测值 (3,0.5,1) 折算固化 */
   private static readonly HAT_OFFSET = new THREE.Vector3(10, -1.5, -3);
+  /** tag 挂点直挂的锚点补偿（fix/面板帧）：tag_Hat 骨原点相对游戏实际渲染
+   *  挂点的残差，由用户面板实测折算固化。面板偏移在此基础上微调（+） */
+  private static readonly TAG_MOUNT_OFFSET = new THREE.Vector3(-1.5, -0.5, 6.5);
   // 每帧复用的临时对象
   private cCarry = new THREE.Matrix4();
   private cAnchor = new THREE.Vector3();
@@ -937,7 +946,7 @@ export class Viewer {
     for (const p of this.parts.values()) p.skinned = true;
     const frameTotal = Math.max(Math.floor(poses.length / (n * 7)), 0);
     this.dlog(`FSKEL 已加载: ${n} 骨 · ${frameTotal} 帧 · ${meta.actions.length} 个动作 · 部件 ${this.parts.size}`);
-    this.detectMirrorBones(); // 镜像骨检测需部件顶点（无部件时跳过，addPart 会重跑）
+    this.detectMirrorBones(true); // 镜像骨检测需部件顶点（无部件时跳过，addPart 会重跑）；骨架重载须全量重判
     this.setupSkirtRig(); // 裙摆防穿模点集（腿胶囊 + 裙片顶点）
     this.detectCloth();
     this.setupChainAnchors(); // 链锚定随骨架重拟合：换骨架后部件仍在场时，
@@ -945,6 +954,7 @@ export class Viewer {
     this.diagnoseParts();
 
     this.applyFskelFrame(0, 0, 0);
+    this.bindWorldMats = this.worldMats.map((m) => m.clone()); // 帧 0 快照（挂接静态基准）
     this.refreshBoneAttached(); // 骨架加载/切换后按帧 0 位姿重挂骨骼挂接网格
   }
 
@@ -2530,7 +2540,7 @@ export class Viewer {
    * 38.3→3.2，其余链镜像反而变差。检测结果写入 mirrorBones 并同步到
    * 可视骨骼的 scale（THREE 的 T·R·S 与引擎镜像语义等价）。
    */
-  private detectMirrorBones() {
+  private detectMirrorBones(full = false) {
     this.mirrorBones.clear();
     if (!this.fskelPoses || !this.skelParents.length || !this.skelBones.length) return;
     const n = this.fskelBoneCount;
@@ -2573,17 +2583,22 @@ export class Viewer {
       }
       return sum;
     };
+    // 部件增删的中间窗口（链部件暂缺，全部链上无顶点）：跳过本轮——不清
+    // 标志、不打日志，链部件装回后下一轮自然重判。避免换装时标志清了又
+    // 建、日志反复打印（套装切换实测）；骨架重载（full）仍全量重判
+    const plains = roots.map((r) => residual(this.boneChainMembers(r), new Set()));
+    if (!full && plains.every((s) => s === 0)) return;
     const lines: string[] = [];
-    for (const r of roots) {
+    roots.forEach((r, i) => {
       const mem = this.boneChainMembers(r);
-      const plain = residual(mem, new Set());
+      const plain = plains[i];
       const mirrored = residual(mem, new Set([r]));
       const isMir = mirrored < plain * 0.5 && mirrored < plain - 5;
       if (isMir) this.mirrorBones.add(r);
       lines.push(
         `${this.skelBones[r].name}(#${r}) 残差 ${plain.toFixed(1)}→${mirrored.toFixed(1)}${isMir ? " ⇒镜像" : ""}`
       );
-    }
+    });
     const sig = [...this.mirrorBones].sort((a, b) => a - b).join(",");
     if (sig !== this.lastMirrorSig) {
       this.lastMirrorSig = sig;
@@ -3087,6 +3102,7 @@ export class Viewer {
 
   clearFskel() {
     for (const p of this.parts.values()) this.restorePart(p);
+    this.bindWorldMats = [];
     if (gfmEnabled) {
       gfm!.clear_poses();
       gfm!.clear_skirt();
@@ -3421,7 +3437,8 @@ export class Viewer {
   /**
    * FSM 网格挂到骨骼（帽子槽）：随骨骼刚性运动，且动画相位与身体网格一致
    * （经 MODEL_YAW 共轭，见 boneAttached 注释）。骨架未加载或骨名不存在时
-   * 按普通静态网格摆放。offset 为 fix 系（≈显示空间）微调。
+   * 按普通静态网格摆放。offset 为 fix 系微调：tag 挂点骨下 Y=上下（tag 帧
+   * +Y 朝上），普通 head 骨回落路径 X=沿骨轴上下。
    */
   addBoneAttached(
     path: string,
@@ -3453,11 +3470,130 @@ export class Viewer {
       bindInv: new THREE.Matrix4(),
     });
     this.refreshBoneAttached(path);
+    // 挂接监控：晚到装配/骨缺失/多帽叠加（幽灵）都在此暴露，__diagLog 可查。
+    // 位置为显示空间、绑定姿态（帧 0）数值
+    const e = this.boneAttached.get(path)!;
+    const tail = path.replace(/^.*[\\/]/, "");
+    if (!e.bone) {
+      this.dwarn(`帽子挂接: ${tail} 骨「${boneName}」不存在，回落静态摆放`);
+    } else {
+      // 报绑定姿态（帧 0）数值：与挂接时刻无关、可复现；播放中帽子随头部
+      // 运动，实时位置用 boneAttachedInfo() 查
+      const idx = this.skelBones.indexOf(e.bone);
+      const bindW = (idx >= 0 ? this.bindWorldMats[idx] : null) ?? e.bone.matrixWorld;
+      const anchor = new THREE.Vector3().setFromMatrixPosition(bindW);
+      const origin = new THREE.Vector3().copy(e.inner.position).applyMatrix4(e.fix.matrix);
+      const f = (p: THREE.Vector3) => `${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)}`;
+      this.dlog(
+        `帽子挂接: ${tail} → 骨 ${e.bone.name} 锚(${f(anchor)}) · 原点(${f(origin)}) · rotY ${e.inner.rotation.y.toFixed(2)} · 偏移 [${offset.join(",")}]`
+      );
+    }
+    if (this.boneAttached.size > 1) {
+      this.dwarn(
+        `帽子挂接: 同时存在 ${this.boneAttached.size} 顶（${[...this.boneAttached.keys()]
+          .map((k) => k.replace(/^.*[\\/]/, ""))
+          .join(" + ")}），疑似幽灵叠加`
+      );
+    }
+  }
+
+  /** 挂接状态快照（CDP/诊断用）：`__viewer.boneAttachedInfo()` 直查。
+   *  显示空间坐标；origin=网格原点落点，bbox=帽子网格世界包围盒 min/max */
+  boneAttachedInfo(): {
+    path: string;
+    bone: string | null;
+    anchor: number[] | null;
+    rotY: number;
+    offset: number[];
+    origin: number[] | null;
+    bbox: number[][] | null;
+  }[] {
+    return [...this.boneAttached.entries()].map(([path, e]) => {
+      e.holder.updateMatrixWorld(true);
+      const o = e.meshes[0]
+        ? new THREE.Vector3().setFromMatrixPosition(e.meshes[0].matrixWorld)
+        : null;
+      const box = new THREE.Box3();
+      let has = false;
+      for (const m of e.meshes) {
+        m.geometry.computeBoundingBox();
+        if (m.geometry.boundingBox) {
+          box.union(m.geometry.boundingBox.clone().applyMatrix4(m.matrixWorld));
+          has = true;
+        }
+      }
+      const a = e.bone
+        ? new THREE.Vector3().setFromMatrixPosition(e.bone.matrixWorld)
+        : null;
+      return {
+        path,
+        bone: e.bone?.name ?? null,
+        anchor: a ? [+a.x.toFixed(1), +a.y.toFixed(1), +a.z.toFixed(1)] : null,
+        rotY: +e.inner.rotation.y.toFixed(3),
+        offset: e.inner.position.toArray().map((n) => +n.toFixed(2)),
+        origin: o ? [+o.x.toFixed(1), +o.y.toFixed(1), +o.z.toFixed(1)] : null,
+        bbox: has
+          ? [
+              [+box.min.x.toFixed(1), +box.min.y.toFixed(1), +box.min.z.toFixed(1)],
+              [+box.max.x.toFixed(1), +box.max.y.toFixed(1), +box.max.z.toFixed(1)],
+            ]
+          : null,
+      };
+    });
+  }
+
+  /** 帽子网格 vs 身体部件的穿模监控（bbox 级近似：落在某身体部件世界 AABB
+   *  内的帽子顶点数与最深下探量；bbox 内 ≠ 真穿面，作观察指标用）。
+   *  刚体 FSM 帽（引擎同款挂接）长发的固有穿模靠它量化定位 */
+  hatOverlapInfo(): {
+    hat: string;
+    part: string;
+    vertsInBox: number;
+    deepestY: number;
+  }[] {
+    const out: { hat: string; part: string; vertsInBox: number; deepestY: number }[] =
+      [];
+    const v = new THREE.Vector3();
+    for (const [hatPath, e] of this.boneAttached.entries()) {
+      e.holder.updateMatrixWorld(true);
+      const hatName = hatPath.replace(/^.*[\\/]/, "");
+      for (const p of this.parts.values()) {
+        if (!p.mesh?.geometry) continue;
+        p.mesh.updateMatrixWorld(true);
+        p.mesh.geometry.computeBoundingBox();
+        const bb = p.mesh.geometry.boundingBox!.clone().applyMatrix4(
+          p.mesh.matrixWorld
+        );
+        bb.expandByScalar(-0.5); // 收缩排除贴面顶点
+        let n = 0;
+        let deepest = 1e9;
+        for (const m of e.meshes) {
+          const pos = m.geometry.attributes.position;
+          for (let i = 0; i < pos.count; i++) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(m.matrixWorld);
+            if (bb.containsPoint(v)) {
+              n++;
+              deepest = Math.min(deepest, v.y);
+            }
+          }
+        }
+        if (n > 0) out.push({ hat: hatName, part: p.model.path.replace(/^.*[\\/]/, ""), vertsInBox: n, deepestY: +deepest.toFixed(1) });
+      }
+    }
+    if (out.length) {
+      this.dwarn(
+        `帽子穿模监控: ${out
+          .map((o) => `${o.hat}×${o.part} ${o.vertsInBox}顶点(至y${o.deepestY})`)
+          .join(" · ")}`
+      );
+    }
+    return out;
   }
 
   removeBoneAttached(path: string) {
     const e = this.boneAttached.get(path);
     if (!e) return;
+    this.dlog(`帽子卸下: ${path.replace(/^.*[\\/]/, "")} · 剩余 ${this.boneAttached.size - 1}`);
     e.holder.parent?.remove(e.holder);
     for (const g of e.geoms) g.dispose();
     for (const m of e.mats) m.dispose();
@@ -3480,20 +3616,33 @@ export class Viewer {
 
   /**
    * 按当前骨架重挂。FSM 网格为**局部坐标**建模（原点 = 挂点锚，帽子/武器均
-   * 绕原点，实测 FM01 bbox ±10~15、J01 ±10~43，不存在世界坐标 authored 的 FSM）。
+   * 绕原点，实测 FM01 bbox ±10~15、J01 ±10~43，不存在世界坐标 authored 的 FSM；
+   * 帽类 FSM 挂点区全为 0，不带任何逐模型修正）。
    *
-   * 静态摆放：网格局部原点落到「骨骼原点 + HAT_OFFSET」（骨局部系，
-   *  X=沿骨轴抬升/Y=左右/Z=前后），inner 只转 Rz(−90°)（mesh +Y 冠/刃方向对骨轴 +X，前后不翻转——
-   * 花环帽游戏内实测，加 Rx(π) 会前后反；本地 FM01 前后近对称无法判定）。
+   * tag_* 挂点骨（引擎约定，AvatarBoy/Girl 全部 FSKEL 均自带 tag_Hat /
+   * tag_LWeapon / tag_LWrist / tag_RWeapon / tag_RWrist）：原点直落骨骼原点、
+   * 零偏移，姿态 = tag 帧 × Ry(180°)。tag_Hat 的局部 Q(−0.707,−0.707,0,0)
+   * 把 tag 帧转成 +Y 朝上，但 tag 的 Z 轴被它翻向 Head 的 −Z——恒等直挂会
+   * 前后反面（实测）；Ry(π) 冠方向不变、前后归位，与旧 Head01+Rz(−90°)
+   * 手调位的实测姿态逐轴一致（mesh +Y→上、+Z→Head+Z=脑后、+X→Head−Y）。
+   * 帽子按 Y-up 围绕原点 authored（FM01 顶点 Y −9.15..15.09 挂
+   * tag_Hat(153.8) 后恰覆盖头部 144.4~167.6，78 顶帽子实测同一锚成立，
+   * 见 cpk/examples/hat_probe）。
    *
-   * 运动学（关键）：身体网格显示经过 modelRoot 的 MODEL_YAW(π)，而骨骼层级在
-   * scene（数据空间）——若帽子直接挂骨骼下渲染，其俯仰/侧倾相对身体是**共轭
-   * 镜像**的（头前倾时帽子后仰，实测）。故挂接改为 modelRoot → holder（每帧
-   * = boneW(t)·boneW0⁻¹ 相对运动）→ fix（= Yawπ·boneW0·T静态）→ inner：
-   * 静态时 Yawπ·I·Yawπ 相消，与骨下直接挂接完全同位；动画时总变换 =
-   * Yawπ·(boneW(t)·boneW0⁻¹)·Yawπ·(boneW0·T) = 共轭相对运动 × 静态位，
-   * 与身体蒙皮顶点的显示运动逐点同向。绕竖直轴转动原本就一致，水平轴转动
-   * 由共轭修正。
+   * 普通骨骼（骨架无 tag 挂点骨时的回落，如挂 Bip01 Head01）：沿用旧手调位
+   * ——骨骼原点 + HAT_OFFSET（骨局部系，X=沿骨轴抬升/Y=左右/Z=前后），
+   * inner 转 Rz(−90°)（mesh +Y 冠/刃方向对骨轴 +X，前后不翻转——花环帽
+   * 游戏内实测）。该挂法只逼近了 tag_Hat 的位置（HAT_OFFSET.x=10≈局部
+   * 9.47）未复现其姿态，不对称帽子会有残差，仅兜底用。
+   *
+   * 运动学（两种挂法相同）：身体网格显示经过 modelRoot 的 MODEL_YAW(π)，
+   * 而骨骼层级在 scene（数据空间）——若帽子直接挂骨骼下渲染，其俯仰/侧倾
+   * 相对身体是**共轭镜像**的（头前倾时帽子后仰，实测）。故挂接改为
+   * modelRoot → holder（每帧 = boneW(t)·boneW0⁻¹ 相对运动）→
+   * fix（= Yawπ·boneW0·[T静态]）→ inner：静态时 Yawπ·I·Yawπ 相消，与骨下
+   * 直接挂接完全同位；动画时总变换 = Yawπ·(boneW(t)·boneW0⁻¹)·Yawπ·(boneW0·T)
+   * = 共轭相对运动 × 静态位，与身体蒙皮顶点的显示运动逐点同向。绕竖直轴
+   * 转动原本就一致，水平轴转动由共轭修正。
    *
    * 骨名不存在时按普通静态网格摆放（挂 modelRoot、无每帧更新）。
    */
@@ -3508,21 +3657,39 @@ export class Viewer {
         this.skelBones.find((b) => b.name.toLowerCase().includes(lower));
       if (bone) {
         e.bone = bone;
-        bone.updateWorldMatrix(true, false); // 绑定姿态（骨架加载后为帧 0；中途换帽取当前帧，相对运动不受影响）
-        e.bindInv.copy(bone.matrixWorld).invert();
+        // 静态基准恒取帧 0（绑定姿态）快照：渲染结果与挂接时刻无关（等价
+        // 引擎逐帧重算 boneW(t)·offset）。若取点击瞬间姿态，播放中戴帽的
+        // 头部俯仰经 Yawπ 共轭会留残差——不同时刻戴的帽贴合度有细微差别
+        const idx = this.skelBones.indexOf(bone);
+        const bindW = (idx >= 0 ? this.bindWorldMats[idx] : null) ?? bone.matrixWorld;
+        e.bindInv.copy(bindW).invert();
         this.modelRoot.add(e.holder);
-        e.holder.matrix.identity(); // 相对运动：绑定瞬间 = I（每帧由 updateBoneAttachedMats 重写）
-        e.fix.matrix
-          .makeRotationY(MODEL_YAW)
-          .multiply(bone.matrixWorld)
-          .multiply(
+        bone.updateWorldMatrix(true, false);
+        // 以当前姿态播种相对运动（暂停在非 0 帧时挂接也在正确位置；
+        // 播放中由 updateBoneAttachedMats 每帧重写为同一函数）
+        e.holder.matrix.multiplyMatrices(bone.matrixWorld, e.bindInv);
+        const isTag = bone.name.toLowerCase().startsWith("tag_");
+        e.fix.matrix.makeRotationY(MODEL_YAW).multiply(bindW);
+        if (isTag) {
+          // 锚点补偿（用户实测值固化）；面板偏移另算
+          e.fix.matrix.multiply(
+            new THREE.Matrix4().makeTranslation(
+              Viewer.TAG_MOUNT_OFFSET.x,
+              Viewer.TAG_MOUNT_OFFSET.y,
+              Viewer.TAG_MOUNT_OFFSET.z
+            )
+          );
+        } else {
+          e.fix.matrix.multiply(
             new THREE.Matrix4().makeTranslation(
               Viewer.HAT_OFFSET.x,
               Viewer.HAT_OFFSET.y,
               Viewer.HAT_OFFSET.z
             )
           );
-        e.inner.rotation.set(0, 0, -Math.PI / 2); // Rz(−90°): mesh +Y→骨+X；前后不翻转（游戏帽模实测）
+        }
+        // tag 挂法：Ry(π) 前后归位（恒等直挂会反面）；回落挂法：Rz(−90°) mesh +Y→骨+X
+        e.inner.rotation.set(0, isTag ? Math.PI : 0, isTag ? 0 : -Math.PI / 2);
       } else {
         e.bone = null;
         this.modelRoot.add(e.holder); // modelRoot 已带显示旋转

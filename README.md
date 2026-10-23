@@ -169,6 +169,8 @@ run-dev.bat            # 开发式：vite dev (HMR) + cargo build --no-default-f
 npm --prefix gui/ui install    # 首次
 npm --prefix gui/ui run tauri dev      # 开发运行（等价 run-dev.bat，由 tauri CLI 托管并监听 Rust 改动）
 npm --prefix gui/ui run tauri build    # 生成 NSIS 安装包
+
+npm run wasm:dev
 ```
 
 dev 模式原理：`gui/Cargo.toml` 的 `[features]` 转发 `tauri/custom-protocol`——默认构建
@@ -211,6 +213,33 @@ ViewerHost.vue 对 viewer.ts 做依赖级 accept，把存活实例的原型换�
 - 视口：左键旋转、右键平移、滚轮缩放，点击网格选中对应部件；
 - 左侧卡片：开关 = 显示/隐藏，下拉 = 切换该组变体，点击卡片 = 选中编辑；
 - 「保存当前部件」写回原文件；「另存为」可导出副本；红色 ● 表示有未保存修改。
+
+### 帽子挂接（tag 挂点骨体系）
+
+引擎约定（IDA 逆向 GongfuClient.exe + F3D.dll 确证）：角色 FSKEL 自带
+`tag_Hat` / `tag_LWeapon` / `tag_LWrist` / `tag_RWeapon` / `tag_RWrist` 挂点骨；
+客户端对 FSM 帽子调 `SGAvatarAttachment::BindToTagNode("tag_Hat")`，引擎每帧
+`骨矩阵(tag) × 节点世界矩阵` 直接设为网格世界矩阵——无逐帽偏移、无去穿透，
+顶点原样渲染（Hat 目录 78 个 FSM 全为刚体，长发型下段与衣领相交属游戏原貌）。
+查看器等效实现：`viewer.ts` 挂 tag 骨（零偏移 + 内旋 Ry(π) + 锚点补偿
+`TAG_MOUNT_OFFSET`，面板实测折算），无 tag 骨的骨架回落 Head01+固定偏移。
+
+**动态加载问题与修复**（换装稳定性，两条）：
+
+1. **挂接基准不确定**（2026-10-24 修）：挂接静态基准原取「点击瞬间的骨骼
+   姿态」，动作播放中头部一直在动——不同时刻戴帽，日志锚/原点每次不同，
+   且头部俯仰经 MODEL_YAW 共轭留残差，帽子贴合度随挂接时刻有细微差别。
+   修复：骨架加载时快照帧 0（绑定姿态）全部骨矩阵 `bindWorldMats`，挂接
+   恒以 bindW 为静态基准、以当前姿态播种相对运动——渲染结果成为与挂接
+   时刻无关的帧函数（等价引擎逐帧重算），日志数值可复现（实测三个不同
+   时刻挂接数值唯一）。
+2. **快速切换竞态**（2026-10-23 修）：装备装配是异步的（CPK 读模型/贴图），
+   来回切套装时上一次装配晚到仍挂入场景，卸载只按当前路径卸——残留
+   「幽灵帽子」叠加错位。修复：`dressWants(path)` 守卫，装配完成即将挂入
+   前校验该路径仍被开启槽位/时装需要。配套监控：挂接/卸下写诊断日志
+   （绑定姿态锚/原点坐标），骨缺失与多帽叠加告警；CDP 直查
+   `__viewer.boneAttachedInfo()`（锚/原点/包围盒/实时位置）与
+   `__viewer.hatOverlapInfo()`（穿模顶点计数）。
 
 ### fskin 格式速查（逆向结论）
 

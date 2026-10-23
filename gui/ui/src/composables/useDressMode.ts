@@ -97,6 +97,20 @@ export function useDressMode(
     );
   }
 
+  /** 装配意愿检查：装配是异步的（CPK 读模型/贴图），快速切换套装时上一次
+   *  装配可能晚到——若此刻该路径已不被任何开启槽位/时装需要，放弃挂入，
+   *  避免幽灵部件残留场景（曾致来回切套装后两顶帽子叠加错位） */
+  function dressWants(path: string): boolean {
+    for (const s of catalog.value?.slots ?? []) {
+      if (equipOn.get(s.key) && equipPath.get(s.key) === path) {
+        // 时装覆盖期间身体装备只记录不渲染，迟到的装配也不应挂入
+        if (fashionOn.value && FASHION_MUTEX_SLOTS.includes(s.key)) return false;
+        return true;
+      }
+    }
+    return fashionOn.value && fashionPath.value === path;
+  }
+
   /** fskin 每材质槽解析贴图后加入视口（装备/时装共用） */
   async function addFskinPart(path: string) {
     const v = viewer.value;
@@ -116,6 +130,7 @@ export function useDressMode(
       files.push(file);
       texes.push(file ? await ensureTex(file) : null);
     }
+    if (!dressWants(path)) return; // 竞态守卫：晚到的过期装配
     v.addPart(path, m, texes, files);
   }
 
@@ -276,7 +291,11 @@ export function useDressMode(
   function autoHatBone(): string {
     if (hatBone.value) return hatBone.value;
     const names = viewer.value?.boneNames() ?? [];
+    // 引擎约定：骨架自带 tag_Hat 挂点骨（AvatarBoy/Girl 全部 FSKEL 均有），
+    // 网格帧=tag 帧、零偏移直挂；无 tag 骨的骨架回落含 head 的普通骨
+    // （viewer 走 HAT_OFFSET+Rz(−90°) 旧手调位）
     return (
+      names.find((n) => n.toLowerCase() === "tag_hat") ??
       names.find((n) => n.toLowerCase().includes("head")) ??
       names.find((n) => n.toLowerCase().includes("tou")) ??
       ""
@@ -299,6 +318,7 @@ export function useDressMode(
       const file = md.texturePath ? resolveTexPath(md.texturePath) : null;
       mats.push({ tex: file ? await ensureTex(file) : null, file });
     }
+    if (!dressWants(path)) return; // 竞态守卫：晚到的过期装配
     v.addBoneAttached(path, m, mats, autoHatBone(), hatOffset.value);
   }
 
@@ -504,6 +524,10 @@ export function useDressMode(
     scanning.value = true;
     viewer.value?.holdRender(true);
     try {
+      // 换根重扫前先按旧目录/旧路径卸下全部装扮件（equipPath/fashionPath 与
+      // catalog 一旦先清空，removeAllDressParts 将查不到路径什么都不卸，
+      // 旧套装部件残留场景，与新装配的基础模型重叠）
+      removeAllDressParts();
       const c = await api.scanCharacter(root ?? "");
       catalog.value = c;
       // 重扫时保留当前基础模型（资源里仍有时），首次默认女体
