@@ -193,6 +193,30 @@ const fsm = useFsmMode(viewer);
 const dress = useDressMode(viewer, skin, act);
 const res = useResourceTree();
 
+// ---------------- CDP/端到端验证钩子 ----------------
+// window.__e2e.openScene(root, suitNo, actionName)：release 亦可直调，
+// 走同一套 composable（changeRoot → dress.open → selectSet → 动作），
+// 供 CDP 复现用户场景做截图对比，不参与正常交互流程。
+;(window as unknown as {
+  __e2e?: {
+    openScene(root: string, suitNo: number, action: string): Promise<string>;
+  };
+}).__e2e = {
+  async openScene(root, suitNo, action) {
+    await res.changeRoot(root);
+    // open 尾部的统计 toast 对个别槽位可能抛错（items 缺失），但装配已完成，
+    // 失败不阻断——继续 selectSet 即可
+    await dress.open(root).catch(() => {});
+    await dress.selectSet(suitNo);
+    // 装配是异步的（CPK 读模型/贴图），给足稳定时间
+    await new Promise((r) => setTimeout(r, 2500));
+    const names = (act.actMeta?.actions ?? []).map((a) => a.name);
+    const i = names.indexOf(action);
+    if (i >= 0) act.selectAction(i);
+    return `ok actions=${names.length} picked=${names[i] ?? "?"}`;
+  },
+};
+
 // ---------------- 视口宿主（viewer.ts 的 HMR 边界）----------------
 
 /** ViewerHost 重建视口（首次挂载 / viewer.ts 热更）后：换实例、重挂拾取、重放当前内容 */

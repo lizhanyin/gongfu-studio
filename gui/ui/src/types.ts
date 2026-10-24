@@ -208,6 +208,19 @@ export interface FskelMeta {
   boneNames: string[];
   parents: number[];
   actions: FskelAction[];
+  /** 每骨镜像标志（首帧）：1 = 引擎对该骨世界矩阵追加 Scale(-1,-1,-1)
+   *  （FSKEL 帧记录尾部 1 字节，IDA sub_1004C290 确证） */
+  mirrorFirst?: number[];
+  /** 帧间标志翻转的骨（挂点类，如 tag_LWeapon 持械/空手），含逐帧值 */
+  mirrorUnstable?: FskelMirrorUnstable[];
+}
+
+/** 帧间镜像标志变化的骨 */
+export interface FskelMirrorUnstable {
+  bone: number;
+  name: string;
+  /** 逐帧镜像标志（与 frameCount 等长） */
+  flags: number[];
 }
 
 // ---------------- FAK 顶点动画 ----------------

@@ -1,4 +1,4 @@
-import { computed, onMounted, onUnmounted, reactive, ref, type ShallowRef } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch, type ShallowRef } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { FskelMeta } from "../types";
@@ -163,6 +163,21 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
     }
   }
 
+  // ---- 骨骼选中联动（viewer 点击骨线条/关节 ↔ 检查器列表高亮）----
+  const selectedBone = ref(-1);
+  const boneList = computed(() => {
+    void actMeta.value; // 骨架重载后重算
+    return viewer.value?.boneNames?.() ?? [];
+  });
+  function selectBone(i: number) {
+    if (i >= 0) selectedBone.value = i;
+    else selectedBone.value = -1;
+    viewer.value?.selectBone(i);
+  }
+  watch(viewer, (v) => {
+    if (v) v.onBonePick = (b) => (selectedBone.value = b);
+  }, { immediate: true });
+
   onMounted(() => {
     lastTs = performance.now();
     playRaf = requestAnimationFrame(playTick);
@@ -193,6 +208,9 @@ export function useActMode(viewer: ShallowRef<Viewer | null>) {
     setSkinOverlay,
     setSkeletonVisible,
     frameSkeleton,
+    selectedBone,
+    boneList,
+    selectBone,
     exportBvh,
     exportGlb,
   });

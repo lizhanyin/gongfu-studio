@@ -12,10 +12,13 @@
 //!       [0][-1][1][1] 根记录头 + 整棵骨骼树（链式序列化）直至下一帧
 //! EOF   [magic][01][f32 1/30][u32 0]
 //!
-//! 节点记录 [u32 id][u32 父id][u32 子数]：
-//!   子数=0（叶子）: [T3][Qxyz]              — Qw=+0.0 时引擎省略
-//!   子数≥1: [u32 链子id][子数-1×附加子链根][T3][Q4][u8 00 可选]
-//! 链间分隔符（语义未定，按字节形态跳过）: [magic][01] / 裸 01 / f32 1.0 / 00
+//! 节点记录 [u32 id][u32 父id][u32 链子数][链子id×N][T3][Q4][u8 镜像标志]：
+//!   Q 恒 16B —— w=+0.0 时导出器存 4 字节 sentinel（0xB33BBD2E，作 float
+//!   ≈ -0.0002，引擎原值使用），w=1.0 同理是真实值（旧解析把它们误当
+//!   "分隔符"跳过，净推进字节相同所以姿态一直正确）；
+//!   镜像标志 1=引擎对该骨世界矩阵追加 Scale(-1,-1,-1)（IDA sub_1004C290
+//!   逐字段确证 = 骨记录 +52；旧解析把 00 当"可选终止符"、01 当"裸 01
+//!   分隔符"吞掉）。残留链间分隔符仅 [magic][01] / 00。
 //! ```
 //!
 //! 坐标系 Y-up，骨骼世界矩阵 = 父 × T × R(Q)，帧率 30 FPS。
@@ -70,6 +73,21 @@ pub struct FskelMeta {
     pub parents: Vec<i32>,
     /// 动作分段（同名连续帧合并）
     pub actions: Vec<FskelAction>,
+    /// 每骨镜像标志（首帧）：1 = 引擎对该骨世界矩阵追加 Scale(-1,-1,-1)。
+    /// 来自 FSKEL 帧记录尾部的 1 字节（IDA sub_1004C290 确证）
+    pub mirror_first: Vec<u8>,
+    /// 帧间标志有变化的骨（如 tag_LWeapon 持械/空手翻转），含逐帧标志值
+    pub mirror_unstable: Vec<FskelMirrorUnstable>,
+}
+
+/// 帧间镜像标志变化的骨（仅挂点类会出现）
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FskelMirrorUnstable {
+    pub bone: u32,
+    pub name: String,
+    /// 逐帧镜像标志（与 frame_count 等长）
+    pub flags: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -89,6 +107,8 @@ pub struct FskelFile {
     /// 动作分段（同名连续帧合并）
     pub actions: Vec<FskelAction>,
     frames: Vec<Vec<BonePose>>,
+    /// 每帧每骨镜像标志（与 frames 等长同序）
+    mirror: Vec<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------- 读取工具
@@ -193,33 +213,32 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// T3 + Q(x,y,z[,w])；引擎在 Qw=+0.0 时省略 w（magic 字节不可能成为合法 w）
-    fn read_tq(&self, p: &mut usize) -> Result<BonePose, String> {
+    /// T3 + Q(x,y,z,w) + 1B 镜像标志。引擎格式（IDA sub_1004C290 逐字段
+    /// 确证，2026-10-24）：**Q 恒 16B、标志恒 1B**。导出器把 w=0 的四元数
+    /// 存成 4 字节 sentinel（0x2EBD3BB3，作 float ≈ -0.0002，引擎原值使
+    /// 用），其后 1 字节即镜像标志（0=普通 1=镜像，引擎合成时对该骨世界
+    /// 矩阵追加 Scale(-1,-1,-1)，即骨记录 +52）。旧解析把 sentinel+flag
+    /// 误当"MAGIC 分隔符+可选 00/裸 01 分隔符"——净推进字节相同所以姿态
+    /// 一直是对的，但标志位被吞。w=1.0（f32 1.0 分隔符）同理是真实的 w。
+    /// 返回 (姿态, 镜像标志)。p 停在记录末尾。
+    fn read_tq(&self, p: &mut usize) -> Result<(BonePose, u8), String> {
         let mut t = [0f32; 3];
         for v in t.iter_mut() {
             *v = f32_at(self.b, *p).ok_or("读取 T 越界")?;
             *p += 4;
         }
         let mut q = [0f32; 4];
-        for v in q.iter_mut().take(3) {
+        for v in q.iter_mut() {
             *v = f32_at(self.b, *p).ok_or("读取 Q 越界")?;
             *p += 4;
         }
-        if self.b.len() >= *p + 4
-            && self.b[*p..*p + 4] != MAGIC
-            && u32_at(self.b, *p) != Some(0)
-        {
-            q[3] = f32_at(self.b, *p).unwrap_or(0.0);
-            *p += 4;
-        }
-        if self.b.get(*p) == Some(&0) {
-            *p += 1; // 可选 00 终止符
-        }
-        Ok(BonePose { t, q })
+        let mirror = self.b.get(*p).copied().unwrap_or(0);
+        *p += 1;
+        Ok((BonePose { t, q }, mirror))
     }
 
-    /// 节点记录 → (id, 父id, 姿态)。p 停在记录末尾。
-    fn parse_record(&self, p: &mut usize) -> Result<(u32, i32, BonePose), String> {
+    /// 节点记录 → (id, 父id, 姿态, 镜像标志)。p 停在记录末尾。
+    fn parse_record(&self, p: &mut usize) -> Result<(u32, i32, BonePose, u8), String> {
         let id = u32_at(self.b, *p).ok_or("读取 id 越界")?;
         let par = u32_at(self.b, *p + 4).ok_or("读取 parent 越界")?;
         let flag = u32_at(self.b, *p + 8).ok_or("读取 flag 越界")?;
@@ -227,12 +246,9 @@ impl<'a> Walker<'a> {
         if id >= self.bone_count || (par != 0xffff_ffff && par >= self.bone_count) || flag > 32 {
             return Err(format!("非法节点记录 id={id} par={par} flag={flag} @0x{:x}", *p - 12));
         }
-        if flag > 0 {
-            *p += 4; // 链子 id
-            *p += 4 * (flag as usize - 1); // 附加子链根
-        }
-        let pose = self.read_tq(p)?;
-        Ok((id, par as i32, pose))
+        *p += 4 * flag as usize; // 链子 id 列表（首个为链子 id，余为附加子链根）
+        let (pose, mirror) = self.read_tq(p)?;
+        Ok((id, par as i32, pose, mirror))
     }
 
     /// 跳过链间分隔符：[magic][01] / 裸 01 / f32 1.0 / 00
@@ -253,14 +269,17 @@ impl<'a> Walker<'a> {
     }
 
     /// 走完整帧。start = 帧签名后 20 字节（根记录的 T3Q4），end = 下一帧偏移。
-    /// 返回 (每骨姿态, 每骨父id)。全部骨骼收齐后允许在尾部余渣处停止。
-    fn walk_frame(&self, start: usize, end: usize) -> Result<(Vec<BonePose>, Vec<i32>), String> {
+    /// 返回 (每骨姿态, 每骨父id, 每骨镜像标志)。全部骨骼收齐后允许在尾部余渣处停止。
+    fn walk_frame(&self, start: usize, end: usize) -> Result<(Vec<BonePose>, Vec<i32>, Vec<u8>), String> {
         let bc = self.bone_count as usize;
         let mut poses: Vec<Option<BonePose>> = vec![None; bc];
         let mut parents = vec![0i32; bc];
+        let mut mirrors = vec![0u8; bc];
         let mut filled = 1usize;
         let mut p = start;
-        poses[0] = Some(self.read_tq(&mut p)?);
+        let (root_pose, root_mirror) = self.read_tq(&mut p)?;
+        poses[0] = Some(root_pose);
+        mirrors[0] = root_mirror;
         parents[0] = -1;
         let mut guard = 0usize;
         while p < end {
@@ -278,7 +297,7 @@ impl<'a> Walker<'a> {
                 }
                 return Err(format!("帧数据无法识别 @0x{p:x}（已解析 {filled}/{bc} 骨骼）"));
             }
-            let (id, par, pose) = self.parse_record(&mut p)?;
+            let (id, par, pose, mirror) = self.parse_record(&mut p)?;
             if poses[id as usize].is_some() {
                 if filled == bc {
                     break;
@@ -287,13 +306,14 @@ impl<'a> Walker<'a> {
             }
             poses[id as usize] = Some(pose);
             parents[id as usize] = par;
+            mirrors[id as usize] = mirror;
             filled += 1;
         }
         let mut out = Vec::with_capacity(bc);
         for (i, po) in poses.into_iter().enumerate() {
             out.push(po.ok_or(format!("骨骼 {i} 缺少姿态数据"))?);
         }
-        Ok((out, parents))
+        Ok((out, parents, mirrors))
     }
 }
 
@@ -330,17 +350,19 @@ pub fn parse_fskel(path: &str, b: &[u8]) -> Result<FskelFile, String> {
 
     let walker = Walker { b, bone_count };
     let mut all_frames = Vec::with_capacity(frames.len());
+    let mut all_mirrors = Vec::with_capacity(frames.len());
     let mut parents = Vec::new();
     for (i, (off, _name)) in frames.iter().enumerate() {
         let end = frames
             .get(i + 1)
             .map(|(o, _)| *o)
             .unwrap_or_else(|| b.len().saturating_sub(20));
-        let (poses, par) = walker.walk_frame(off + 20, end)?;
+        let (poses, par, mirrors) = walker.walk_frame(off + 20, end)?;
         if i == 0 {
             parents = par;
         }
         all_frames.push(poses);
+        all_mirrors.push(mirrors);
     }
 
     // 同名连续帧合并为动作
@@ -365,6 +387,7 @@ pub fn parse_fskel(path: &str, b: &[u8]) -> Result<FskelFile, String> {
         frame_dt,
         actions,
         frames: all_frames,
+        mirror: all_mirrors,
     })
 }
 
@@ -378,6 +401,19 @@ impl FskelFile {
     }
 
     pub fn meta(&self) -> FskelMeta {
+        // 镜像标志：首帧全量 + 帧间变化骨的逐帧值（通常仅挂点骨，如 tag_LWeapon）
+        let bc = self.bone_names.len();
+        let mirror_first = self.mirror.first().cloned().unwrap_or_else(|| vec![0u8; bc]);
+        let mut mirror_unstable = Vec::new();
+        for b in 0..bc {
+            if self.mirror.iter().any(|f| f[b] != mirror_first[b]) {
+                mirror_unstable.push(FskelMirrorUnstable {
+                    bone: b as u32,
+                    name: self.bone_names[b].clone(),
+                    flags: self.mirror.iter().map(|f| f[b]).collect(),
+                });
+            }
+        }
         FskelMeta {
             file_name: Path::new(&self.path)
                 .file_name()
@@ -392,6 +428,8 @@ impl FskelFile {
             bone_names: self.bone_names.clone(),
             parents: self.parents.clone(),
             actions: self.actions.clone(),
+            mirror_first,
+            mirror_unstable,
         }
     }
 
@@ -888,6 +926,36 @@ mod tests {
             total_frames += f.frames.len();
         }
         eprintln!("共 {} 文件 {total_frames} 帧全部解析通过", paths.len());
+    }
+
+    /// 镜像标志（引擎骨记录 +52，随帧记录尾部 1 字节携带）：
+    /// girl.FSKEL 首帧镜像骨名单与 IDA/数据双重确证的一致，且
+    /// tag_LWeapon 帧间翻转（持械/空手）。
+    #[test]
+    fn mirror_flags_girl() {
+        let p = std::path::Path::new(ACT_DIR).join("girl.FSKEL");
+        let Ok(bytes) = fs::read(&p) else {
+            eprintln!("girl.FSKEL 不存在，跳过");
+            return;
+        };
+        let f = parse_fskel(&p.to_string_lossy(), &bytes).unwrap();
+        let meta = f.meta();
+        let got: Vec<u32> = meta
+            .mirror_first
+            .iter()
+            .enumerate()
+            .filter(|(_, &m)| m != 0)
+            .map(|(i, _)| i as u32)
+            .collect();
+        assert_eq!(
+            got,
+            vec![41, 42, 43, 54, 58, 62, 66, 70, 75, 77, 107, 113, 134],
+            "girl.FSKEL 镜像骨名单（tag_LWeapon/tag_LWrist/五条 Bone 链根/Nub）"
+        );
+        let names: Vec<&str> = meta.mirror_unstable.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(names, vec!["tag_LWeapon"], "帧间翻转仅 tag_LWeapon");
+        assert!(meta.mirror_unstable[0].flags.len() == meta.frame_count as usize);
+        assert_eq!(f.parents[41], 20, "tag_LWeapon 挂在 Bip01 脊柱链下");
     }
 
     #[test]

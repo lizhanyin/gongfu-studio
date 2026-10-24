@@ -38,6 +38,10 @@ interface PartObj {
   skinned: boolean;
   /** fmath wasm 部件槽位（-1 = TS 回退模式未注册） */
   gfmId: number;
+  /** 合成自动绑发件（长发 FSM 代理，见 addBoneAttached）：boneLocalPos 按
+   *  当前骨架绑定姿态生成、数据自洽，链诊断/锚定闸门跳过（纯 LBS 即正确，
+   *  再锚定会叠加骨盆载体双重运动） */
+  syntheticHair?: boolean;
 }
 
 function b64ToBytes(b64: string): Uint8Array {
@@ -165,6 +169,18 @@ export class Viewer {
   private skelBones: THREE.Bone[] = [];
   private skelRoot: THREE.Bone | null = null;
   private skelHelper: THREE.SkeletonHelper | null = null;
+  /** 自建可拾取骨线条（每段=父→骨，segment i 对应 boneSegOf[i]）：
+   *  点击显示骨名+整段变色（SkeletonHelper 无法按段取色/拾取） */
+  private boneLines: THREE.LineSegments | null = null;
+  private boneSegOf: number[] = [];
+  /** 骨线条基色 / 选中高亮色 */
+  private static readonly BONE_BASE = new THREE.Color(0x5fd0a8);
+  private static readonly BONE_HI = new THREE.Color(0xff4d4d);
+  /** 选中的骨骼索引（-1 = 无）；点击骨线条/关节/检查器列表联动 */
+  selectedBone = -1;
+  /** 骨骼选中回调（useActMode 注册，驱动检查器列表联动） */
+  onBonePick: (bone: number) => void = () => {};
+  private boneLabelEl: HTMLDivElement | null = null;
   private jointMesh: THREE.InstancedMesh | null = null;
   /** 骨架可视化（线条 + 关节小球）显隐，跨动作加载保持（默认关） */
   private skeletonVisible = false;
@@ -189,8 +205,14 @@ export class Viewer {
   // ---- 裙摆布料骨（Bone* 链）----
   /** 骨架父索引（worldsFromPoses 组合世界矩阵用） */
   private skelParents: number[] = [];
-  /** 镜像骨：Bone* 链根中本地旋转带反射的（引擎骨记录 +52 标记，见 detectMirrorBones） */
+  /** 镜像骨：FSKEL 帧记录尾部 1B 标志=1 的骨（引擎骨记录 +52，含 Bone*
+   *  链根、手指/脚趾 Nub、tag_LWeapon 等挂点骨）。数据驱动（mirrorFlagsFirst，
+   *  fskel.rs 直接解析）；无标志数据时 detectMirrorBones 回退残差推导 */
   private mirrorBones = new Set<number>();
+  /** 每骨镜像标志（首帧，来自 FskelMeta.mirrorFirst）；null = 数据不可用 */
+  private mirrorFlagsFirst: number[] | null = null;
+  /** 帧间镜像标志翻转的骨（挂点类）：骨索引 → 逐帧标志 */
+  private mirrorUnstable = new Map<number, number[]>();
   private mirrorScale = new THREE.Vector3(-1, -1, -1);
   /** 布料骨：Bone* 布料链成员（见 detectCloth） */
   private clothBones = new Set<number>();
@@ -299,6 +321,8 @@ export class Viewer {
    *  错位（qm 系实测 60~123）；正常动作的链静态姿态相对绑定摆放失配
    *  最大 ~15（std8 后中裙片），纯 LBS 不穿腿——游戏即按纯 LBS 渲染 */
   private static readonly ANCHOR_MISMATCH_MIN = 25;
+  /** 长发合成件与身体网格的最小间隙（体表外推目标距离） */
+  private static readonly HAIR_BODY_MARGIN = 1.5;
   private tmpScale = new THREE.Vector3(1, 1, 1);
   // 模拟参数：弹簧 K（s⁻²）、速度阻尼（上扬加重/下落轻放，借鉴 AniCloth_SW
   // 各向异性空气阻尼：y↑3.2 vs y↓0.4）、重力（u/s²，模型身高 ~160）
@@ -446,6 +470,25 @@ export class Viewer {
     );
     const ray = new THREE.Raycaster();
     ray.setFromCamera(ndc, this.camera);
+    // 骨架可见时优先拾取骨骼（线条 + 关节球）：命中即选中显示骨名并高亮
+    if (this.skeletonVisible) {
+      ray.params.Line.threshold = 1.2;
+      const targets: THREE.Object3D[] = [];
+      if (this.boneLines) targets.push(this.boneLines);
+      if (this.jointMesh) targets.push(this.jointMesh);
+      const bh = ray.intersectObjects(targets, false);
+      if (bh.length) {
+        const h = bh[0];
+        const bone =
+          h.object === this.jointMesh
+            ? (h as unknown as { instanceId?: number }).instanceId ?? -1
+            : this.boneSegOf[Math.floor((h.index ?? 0) / 2)] ?? -1;
+        if (bone >= 0) {
+          this.selectBone(bone);
+          return;
+        }
+      }
+    }
     const meshes = [...this.parts.values()].map((p) => p.mesh);
     const hits = ray.intersectObjects(meshes, false);
     if (hits.length) {
@@ -456,6 +499,7 @@ export class Viewer {
         }
       }
     }
+    this.deselectBone(); // 点空处清除骨骼选中
   }
 
   private resize() {
@@ -686,6 +730,10 @@ export class Viewer {
         roughness: 0.75,
         metalness: 0.0,
         vertexColors: false,
+        // 贴图镂空区（发丝/帽檐 alpha=0）按引擎同款 alpha-test 裁掉，
+        // 否则 RGB=0 的透明 texel 渲染成黑块。阈值须低于 highlight 的
+        // 压暗 opacity 0.28，避免未选中件被整件裁没
+        alphaTest: 0.1,
       });
       const tex = texes[k] ?? null;
       const texFile = texFiles[k] ?? null;
@@ -724,7 +772,8 @@ export class Viewer {
     // 动作模式已绑骨架时立即按当前姿态蒙皮；静态模式对齐离群部件
     if (this.skelBones.length) {
       this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
-      this.setupSkirtRig(); // 裙摆防穿模点集随部件变化
+      this.setupSkirtRig();
+      this.setupHairBodyGrid(); // 裙摆防穿模点集随部件变化
       this.detectCloth(); // 布料检测的点集随部件变化
       this.setupChainAnchors(); // 锚定链拟合随部件顶点变化
       this.diagnoseParts(part);
@@ -750,7 +799,8 @@ export class Viewer {
     }
     if (this.skelBones.length) {
       this.detectMirrorBones(); // 镜像判定依赖顶点，部件增删后重跑
-      this.setupSkirtRig(); // 裙摆防穿模点集随部件变化
+      this.setupSkirtRig();
+      this.setupHairBodyGrid(); // 裙摆防穿模点集随部件变化
       this.detectCloth(); // 布料检测的点集随部件变化
       this.setupChainAnchors(); // 锚定链拟合随部件顶点变化
     } else {
@@ -915,12 +965,34 @@ export class Viewer {
     }
 
     // SkeletonHelper 只接受单一根 Object3D（内部遍历 children），不能传骨骼数组
-    this.skelHelper = this.skelRoot ? new THREE.SkeletonHelper(this.skelRoot) : null;
-    if (this.skelHelper) {
-      const mat = this.skelHelper.material as THREE.LineBasicMaterial;
-      mat.linewidth = 2;
-      this.skelHelper.visible = this.skeletonVisible;
-      this.modelRoot.add(this.skelHelper);
+    // 可拾取骨线条：每段对应一根骨（父→本骨），支持点击变色/显示名。
+    // 与关节球共用骨序；root 骨无父不画线。
+    {
+      const segs: number[] = [];
+      this.boneSegOf = [];
+      for (let b = 0; b < n; b++) {
+        const par = meta.parents[b];
+        if (par >= 0 && par < n) {
+          this.boneSegOf.push(b);
+          segs.push(b, par);
+        }
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(segs.length * 3), 3));
+      const col = new Float32Array(segs.length * 3);
+      for (let i = 0; i < segs.length; i++) {
+        col[i * 3] = Viewer.BONE_BASE.r;
+        col[i * 3 + 1] = Viewer.BONE_BASE.g;
+        col[i * 3 + 2] = Viewer.BONE_BASE.b;
+      }
+      g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+      this.boneLines = new THREE.LineSegments(
+        g,
+        new THREE.LineBasicMaterial({ vertexColors: true })
+      );
+      this.boneLines.visible = this.skeletonVisible;
+      this.modelRoot.add(this.boneLines);
+      this.deselectBone();
     }
 
     // 关节小球（按骨骼索引着色）
@@ -940,6 +1012,12 @@ export class Viewer {
     // CPU 蒙皮缓冲：各骨世界矩阵（法线静态，引擎不做法线蒙皮，无需绑定拟合）
     this.worldMats = Array.from({ length: n }, () => new THREE.Matrix4());
     this.skelParents = meta.parents;
+    // 引擎确定性镜像标志（IDA sub_1004C290：骨记录 +52 随 FSKEL 帧数据携带）
+    this.mirrorFlagsFirst =
+      meta.mirrorFirst && meta.mirrorFirst.length === n ? meta.mirrorFirst : null;
+    this.mirrorUnstable = new Map(
+      (meta.mirrorUnstable ?? []).map((u) => [u.bone, u.flags])
+    );
     if (gfmEnabled) {
       gfm!.set_poses(poses, meta.boneCount, Int32Array.from(meta.parents));
     }
@@ -947,7 +1025,8 @@ export class Viewer {
     const frameTotal = Math.max(Math.floor(poses.length / (n * 7)), 0);
     this.dlog(`FSKEL 已加载: ${n} 骨 · ${frameTotal} 帧 · ${meta.actions.length} 个动作 · 部件 ${this.parts.size}`);
     this.detectMirrorBones(true); // 镜像骨检测需部件顶点（无部件时跳过，addPart 会重跑）；骨架重载须全量重判
-    this.setupSkirtRig(); // 裙摆防穿模点集（腿胶囊 + 裙片顶点）
+    this.setupSkirtRig();
+      this.setupHairBodyGrid(); // 裙摆防穿模点集（腿胶囊 + 裙片顶点）
     this.detectCloth();
     this.setupChainAnchors(); // 链锚定随骨架重拟合：换骨架后部件仍在场时，
     // addPart 时按旧骨架拟合的锚定必须作废（错锚会拉歪上身/裙片）
@@ -1073,6 +1152,7 @@ export class Viewer {
     for (const r of roots) for (const m of this.boneChainMembers(r)) chainOf.set(m, r);
     const vertsOf = new Map<number, Vertex[]>(roots.map((r) => [r, []]));
     for (const p of this.parts.values()) {
+      if (p.syntheticHair) continue;
       for (const v of p.model.vertices) {
         for (const inf of v.influences) {
           const r = chainOf.get(inf.boneIndex);
@@ -1148,6 +1228,36 @@ export class Viewer {
     for (const [root, s] of stats) {
       if (s.swingRot < 15 && s.swingPos < 3) cand.add(root);
     }
+    // 部件语义判据：时装/发型类部件（非裙槽——路径不含 Lower/Boot）的链
+    // 默认 authored 基准。实测帧 0 逐影响失配无法区分：时装裙（FK38_Lower
+    // 链89 avg12.1/链95 17.4）与 SZ_38 披发链（12.6）同区间——"对着非绑定
+    // 姿态导出"是时装资产常态；裙的偏移在宽松裙容差内无害、头发的偏移在
+    // 紧贴身体处穿模，只能按部件语义分流。裙槽部件（Lower/Boot，含基础
+    // girl_Lower）保持纯 LBS 现状（std8/run9/qmw 多轮打磨行为不变），
+    // 仍可经 mismatch>25 错位门槛锚定。隐藏部件（被时装顶替）不计。
+    const skirtSlot = (path: string) => /lower|boot/i.test(path);
+    const semanticAnchor = new Map<number, { skirt: boolean; hair: number }>();
+    for (const root of vertsOf.keys()) {
+      semanticAnchor.set(root, { skirt: false, hair: 0 });
+    }
+    for (const p of this.parts.values()) {
+      if (p.mesh.visible === false || p.syntheticHair) continue;
+      const isSkirt = skirtSlot(p.model.path);
+      for (const v of p.model.vertices) {
+        for (const inf of v.influences) {
+          const r = chainOf.get(inf.boneIndex);
+          if (r === undefined) break;
+          const e = semanticAnchor.get(r);
+          if (!e) break;
+          if (isSkirt) e.skirt = true;
+          else e.hair++;
+          break;
+        }
+      }
+    }
+    for (const [root, e] of semanticAnchor) {
+      if (!e.skirt && e.hair > 0) this.anchoredRoots.add(root);
+    }
     const mismOf = new Map<number, number>();
     if (cand.size) {
       const fits = this.fitAnchoredChains(cand);
@@ -1192,8 +1302,13 @@ export class Viewer {
       const offTxt = `LBS↔绑定偏移 avg ${s.offAvg.toFixed(1)}/max ${s.offMax.toFixed(1)}`;
       const swingTxt = `摆动 ${s.swingRot.toFixed(1)}°/${s.swingPos.toFixed(1)}`;
       if (this.anchoredRoots.has(root)) {
+        const sem = semanticAnchor.get(root);
+        const semTxt = sem && !sem.skirt && sem.hair > 0 ? ` · 语义锚(${sem.hair}发顶点)` : "";
+        const whyTxt = sem && !sem.skirt && sem.hair > 0
+          ? "时装/发型部件链(authored 基准)"
+          : `锚定失配 ${mismOf.get(root)?.toFixed(1) ?? "?"}(>${Viewer.ANCHOR_MISMATCH_MIN})`;
         this.dwarn(
-          `布料链 ${name}(#${root}) 顶点${s.verts.length}: ${offTxt} · ${swingTxt} 近乎静止 · 锚定失配 ${mismOf.get(root)!.toFixed(1)}(>${Viewer.ANCHOR_MISMATCH_MIN}) → 静态错位链(游戏为运行时布料, 精确LBS放错裙片位置) ⇒ 已锚定为绑定摆放随载体骨`
+          `布料链 ${name}(#${root}) 顶点${s.verts.length}: ${offTxt} · ${swingTxt}${semTxt} · ${whyTxt} ⇒ 已增量锚定(绑定摆放随载体+动画增量)`
         );
       } else if (mismOf.has(root)) {
         this.dlog(
@@ -1274,42 +1389,90 @@ export class Viewer {
     const out = new Map<number, { carrier: number; tpInv: THREE.Matrix4; bindOf: Map<number, THREE.Matrix4> }>();
     if (!this.parts.size) return out;
     const n = this.fskelBoneCount;
-    // 各骨单影响点对（绑定拟合输入），仅链成员 + 载体需要
-    const need = new Set<number>();
-    for (const root of roots) {
-      const carrier = this.skelParents[root];
-      if (carrier >= 0 && carrier < n) need.add(carrier);
-      for (const m of this.boneChainMembers(root)) need.add(m);
-    }
-    const pairsOf = new Map<number, [number[], number[]][]>();
-    for (const b of need) pairsOf.set(b, []);
-    for (const p of this.parts.values()) {
-      for (const v of p.model.vertices) {
-        for (const inf of v.influences) {
-          if (v.influences.length === 1 || inf.weight >= 0.99) {
-            const arr = pairsOf.get(inf.boneIndex);
-            if (arr) arr.push([inf.boneLocalPos, v.pos]);
-          }
-        }
-      }
-    }
+    const W0 = this.worldFromPosesCached(0);
+    // 链级整体刚体修正 C：源 = 帧0 LBS 位置(W₀(b)·lp)，目标 = authored。
+    // M_bind(b) = C·W₀(b)；锚定合成 A_b(t) = 载体(t)·W₀(载)⁻¹·C·W_t(b)——
+    // 即"纯 LBS 动画结果整体刚体拉回绑定摆放"。逐骨 Kabsch 在发束类资产上
+    // 因点近共线退化（SZ_38 披发实测 solo 残差 8~24）；链级 24~32 点沿长
+    // 条发束散布良好。配套链 C≈I 自动退化为纯 LBS；极退化（polar 失败）
+    // C=I 同样回落纯 LBS，不会更糟。
     for (const root of roots) {
       const carrier = this.skelParents[root];
       if (carrier < 0 || carrier >= n) continue;
-      const bindOf = new Map<number, THREE.Matrix4>();
-      for (const b of this.boneChainMembers(root)) {
-        bindOf.set(b, this.fitBindMatrix(pairsOf.get(b) ?? []));
+      const members = this.boneChainMembers(root);
+      const memberSet = new Set(members);
+      const src: number[] = [];
+      const dst: number[] = [];
+      let np = 0;
+      for (const p of this.parts.values()) {
+        if (p.mesh.visible === false || p.syntheticHair) continue;
+        for (const v of p.model.vertices) {
+          for (const inf of v.influences) {
+            if (inf.boneIndex >= n || !memberSet.has(inf.boneIndex)) continue;
+            const M = W0[inf.boneIndex].elements;
+            const lp = inf.boneLocalPos;
+            src.push(
+              M[0] * lp[0] + M[4] * lp[1] + M[8] * lp[2] + M[12],
+              M[1] * lp[0] + M[5] * lp[1] + M[9] * lp[2] + M[13],
+              M[2] * lp[0] + M[6] * lp[1] + M[10] * lp[2] + M[14]
+            );
+            dst.push(v.pos[0], v.pos[1], v.pos[2]);
+            np++;
+          }
+        }
       }
+      if (!np) continue;
+      const pairs = Array.from(
+        { length: np },
+        (_, i) => [[src[i * 3], src[i * 3 + 1], src[i * 3 + 2]], [dst[i * 3], dst[i * 3 + 1], dst[i * 3 + 2]]] as [number[], number[]]
+      );
+      let C = this.fitBindMatrix(pairs);
+      // 拟合质量闸：链内前后发束等非刚体分布会让单一 C 拟合出错误旋转
+      // （SZ_38 链101 实测 b104 偏 31.6，比不修还差）。C 自身残差过大时弃用，
+      // 回退 C=I = 纯 LBS（链 89 残差 1.5 保留；链 101 残差 ~12 回退）。
+      let cres = 0;
+      const Ce = C.elements;
+      for (let i = 0; i < np; i++) {
+        const x = src[i * 3], y = src[i * 3 + 1], z = src[i * 3 + 2];
+        cres += Math.hypot(
+          Ce[0] * x + Ce[4] * y + Ce[8] * z + Ce[12] - dst[i * 3],
+          Ce[1] * x + Ce[5] * y + Ce[9] * z + Ce[13] - dst[i * 3 + 1],
+          Ce[2] * x + Ce[6] * y + Ce[10] * z + Ce[14] - dst[i * 3 + 2]
+        );
+      }
+      cres /= np;
+      if (cres > 8) C = new THREE.Matrix4();
+      const bindOf = new Map<number, THREE.Matrix4>();
+      for (const b of members) {
+        bindOf.set(b, new THREE.Matrix4().multiplyMatrices(C, W0[b]));
+      }
+      const w0carrier = this.bindWorldMats[carrier];
       out.set(root, {
         carrier,
-        tpInv: this.fitBindMatrix(pairsOf.get(carrier) ?? []).invert(),
+        tpInv: w0carrier
+          ? w0carrier.clone().invert()
+          : this.fitBindMatrix([]).invert(),
         bindOf,
       });
     }
     return out;
   }
 
-  /** 每帧刷新锚定合成矩阵 A_b = 载体当前世界 × Tp⁻¹ × M_bind_b（实例复用） */
+  /** worldsFromPoses 帧缓存（fitAnchoredChains 逐链多次调用时复用） */
+  private worldsFrameCache = new Map<number, THREE.Matrix4[]>();
+  private worldFromPosesCached(frame: number): THREE.Matrix4[] {
+    let w = this.worldsFrameCache.get(frame);
+    if (!w) {
+      w = this.worldsFromPoses(frame);
+      this.worldsFrameCache.set(frame, w);
+    }
+    return w;
+  }
+
+  /** 每帧刷新增量锚定合成矩阵（实例复用）：
+   *  A_b(t) = 载体(t) × Tp⁻¹ × M_bind_b × (W₀(b)⁻¹ · W_t(b))
+   *  基准贴 authored 绑定摆放随载体，链自身 FSKEL 动画以帧 0 骨姿态为
+   *  原点叠加（配套链上 M_bind≈W₀ 退化为纯 LBS；脱节链拉回绑定摆放） */
   private updateAnchoredMats() {
     if (gfmEnabled) {
       this.gfmUploadWorldMats();
@@ -1317,12 +1480,21 @@ export class Viewer {
       return;
     }
     if (!this.anchoredChains.size || !this.worldMats.length) return;
+    const w0 = this.bindWorldMats;
+    const delta = new THREE.Matrix4();
     for (const a of this.anchoredChains.values()) {
       const carrier = this.worldMats[a.carrier];
       if (!carrier) continue;
       this.cAnchorM.multiplyMatrices(carrier, a.tpInv);
       for (const [b, bind] of a.bindOf) {
-        this.anchoredMats.get(b)!.multiplyMatrices(this.cAnchorM, bind);
+        const out = this.anchoredMats.get(b)!;
+        out.multiplyMatrices(this.cAnchorM, bind);
+        const base = w0[b];
+        const wt = this.worldMats[b];
+        if (base && wt) {
+          delta.multiplyMatrices(base.clone().invert(), wt);
+          out.multiply(delta);
+        }
       }
     }
   }
@@ -1435,7 +1607,8 @@ export class Viewer {
     if (this.clothSimEnabled === on) return;
     this.clothSimEnabled = on;
     if (on) {
-      this.setupSkirtRig(); // 腿胶囊等共享数据（addPart/fskel 加载时已建则幂等）
+      this.setupSkirtRig();
+      this.setupHairBodyGrid(); // 腿胶囊等共享数据（addPart/fskel 加载时已建则幂等）
       this.detectCloth();
     } else {
       this.clothBones.clear();
@@ -1448,6 +1621,7 @@ export class Viewer {
     }
     for (const p of this.parts.values()) this.skinPart(p);
     this.applySkirtDePenVerts(); // 暂停态切换开关也保持去穿透生效
+    this.applyHairBodyDepen();
   }
 
   /**
@@ -2529,21 +2703,48 @@ export class Viewer {
   }
 
   /**
-   * 镜像骨检测（数据推导，等价于引擎骨记录 +52 的 mirror 标记）。
+   * 镜像骨判定。
    *
-   * Bone* 链中存在镜像骨（DCC 里用镜像工具复制的骨骼，本地旋转带反射）：
-   * F3D 引擎对标记骨的世界矩阵追加 Scale(-1,-1,-1)（sub_10052100 +52），
-   * 其 FSKIN 的 boneLocalPos 也按镜像空间导出。文件里没找到显式标记位
-   * （节点 fl 的附加 dword 是子骨索引），但镜像可从绑定数据判定：对每条
-   * 链根试 镜像/不镜像 两种合成，取链上顶点 LBS 残差（vs authored）小
-   * 的一侧——实测 Bone26(0x6b)/Bone55(0x71) 镜像后残差 40.6→2.1、
-   * 38.3→3.2，其余链镜像反而变差。检测结果写入 mirrorBones 并同步到
-   * 可视骨骼的 scale（THREE 的 T·R·S 与引擎镜像语义等价）。
+   * 首选数据驱动：FSKEL 帧记录尾部本来就有 1 字节镜像标志（IDA sub_1004C290
+   * 逐字段确证 = 引擎骨记录 +52；旧解析把它当"可选终止符/裸 01 分隔符"吞掉）。
+   * 标志=1 的骨（Bone* 链根、手指/脚趾 Nub、tag_LWeapon 等）引擎对其世界
+   * 矩阵追加 Scale(-1,-1,-1)（sub_10052100 +52），FSKIN 的 boneLocalPos 也
+   * 按镜像空间导出。名单跨动作文件稳定；残差检测曾在 Bone37/33/43 上漏检
+   * （链静止残差≈0）、Bone01/05/16/66 上两可，标志位一律给出确定答案。
+   *
+   * 无标志数据（旧后端/异常文件）时回退残差推导：对每条 Bone* 链根试
+   * 镜像/不镜像两种合成，取链上顶点 LBS 残差（vs authored）小的一侧——
+   * 实测 Bone26/Bone55 镜像后残差 40.6→2.1、38.3→3.2。
+   * 两种路径的结果都写入 mirrorBones 并经 syncMirrorVisuals 同步到
+   * 可视骨骼 scale 与 wasm 内核（THREE 的 T·R·S 与引擎镜像语义等价）。
    */
   private detectMirrorBones(full = false) {
     this.mirrorBones.clear();
     if (!this.fskelPoses || !this.skelParents.length || !this.skelBones.length) return;
     const n = this.fskelBoneCount;
+    // 数据驱动：引擎标志位（骨记录 +52，fskel.rs 解析 FSKEL 帧数据获得）
+    if (this.mirrorFlagsFirst && this.mirrorFlagsFirst.length === n) {
+      const names: string[] = [];
+      for (let b = 0; b < n; b++) {
+        if (this.mirrorFlagsFirst[b]) {
+          this.mirrorBones.add(b);
+          names.push(`${this.skelBones[b].name}(#${b})`);
+        }
+      }
+      const sig = [...this.mirrorBones].sort((a, b) => a - b).join(",");
+      if (sig !== this.lastMirrorSig) {
+        this.lastMirrorSig = sig;
+        const flip = this.mirrorUnstable.size
+          ? ` · 帧间翻转: ${[...this.mirrorUnstable.keys()]
+              .map((b) => this.skelBones[b]?.name ?? b)
+              .join("/")}`
+          : "";
+        this.dlog(`镜像骨(引擎标志位): ${names.join(" · ")}${flip}`);
+      }
+      this.syncMirrorVisuals();
+      return;
+    }
+    // 回退：残差推导（无标志数据时）
     // 链根 = Bone* 且父不是 Bone*
     const roots: number[] = [];
     for (let b = 0; b < n; b++) {
@@ -2604,7 +2805,239 @@ export class Viewer {
       this.lastMirrorSig = sig;
       this.dlog(`镜像骨检测(链根LBS残差 不镜像→镜像): ${lines.join(" · ")}`);
     }
-    for (let b = 0; b < n; b++) {
+    this.syncMirrorVisuals();
+  }
+
+  // ---- 长发合成件逐帧身体去穿透（applyFskelFrame 末尾调用）----
+  /** 身体三角形空间网格（分桶 key = x|y|z 格坐标；构建于 setupHairBodyGrid） */
+  private hairBodyCells = new Map<string, { p: PartObj; a: number; b: number; c: number }[]>();
+  private hairBodyCellSize = 8;
+
+  /** 重建身体三角形网格桶（部件增删/骨架重载后调用；authored 坐标分桶，
+   *  桶 AABB 外扩 6 容纳动画位移 + 间隙余量） */
+  private setupHairBodyGrid() {
+    this.hairBodyCells.clear();
+    const cs = this.hairBodyCellSize;
+    const pad = 6;
+    for (const p of this.parts.values()) {
+      if (p.syntheticHair || p.mesh.visible === false) continue;
+      for (const sm of p.model.submeshes) {
+        for (let t = 0; t + 2 < sm.triangles.length; t += 3) {
+          const a = sm.triangles[t];
+          const b = sm.triangles[t + 1];
+          const c = sm.triangles[t + 2];
+          const va = p.model.vertices[a]?.pos;
+          const vb = p.model.vertices[b]?.pos;
+          const vc = p.model.vertices[c]?.pos;
+          if (!va || !vb || !vc) continue;
+          for (let gx = Math.floor((Math.min(va[0], vb[0], vc[0]) - pad) / cs); gx <= Math.floor((Math.max(va[0], vb[0], vc[0]) + pad) / cs); gx++) {
+            for (let gy = Math.floor((Math.min(va[1], vb[1], vc[1]) - pad) / cs); gy <= Math.floor((Math.max(va[1], vb[1], vc[1]) + pad) / cs); gy++) {
+              for (let gz = Math.floor((Math.min(va[2], vb[2], vc[2]) - pad) / cs); gz <= Math.floor((Math.max(va[2], vb[2], vc[2]) + pad) / cs); gz++) {
+                const key = gx + "|" + gy + "|" + gz;
+                let arr = this.hairBodyCells.get(key);
+                if (!arr) this.hairBodyCells.set(key, (arr = []));
+                arr.push({ p, a, b, c });
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** 逐帧：长发合成件顶点推出身体网格（当前渲染坐标；体内判定用
+   *  静止基准点（构建期已外推，必在体外）→ 当前位的穿面检测） */
+  private applyHairBodyDepen() {
+    if (!this.hairBodyCells.size) return;
+    const MARGIN = 1.2;
+    const cs = this.hairBodyCellSize;
+    for (const part of this.parts.values()) {
+      if (!part.syntheticHair) continue;
+      const rest = (part.model as FskinModel & { __restPos?: Float64Array }).__restPos;
+      const pos = part.mesh.geometry.getAttribute("position");
+      if (!pos || !rest) continue;
+      const arr = pos.array as Float32Array;
+      const gx0 = (x: number) => Math.floor(x / cs);
+      for (let i = 0; i < pos.count; i++) {
+        const o = i * 3;
+        if (o + 2 >= rest.length) continue; // 拆缝副本无静止基准（构建期未外推）
+        let px = arr[o];
+        let py = arr[o + 1];
+        let pz = arr[o + 2];
+        const cell = this.hairBodyCells.get(gx0(px) + "|" + gx0(py) + "|" + gx0(pz));
+        if (!cell) continue;
+        const rx = rest[o];
+        const ry = rest[o + 1];
+        const rz = rest[o + 2];
+        let bestD = Infinity;
+        let qx = 0;
+        let qy = 0;
+        let qz = 0;
+        let crossings = 0;
+        const dx = rx - px;
+        const dy = ry - py;
+        const dz = rz - pz;
+        const segLen2 = dx * dx + dy * dy + dz * dz;
+        for (const tr of cell) {
+          const pa = (tr.p.mesh.geometry.getAttribute("position").array as Float32Array);
+          const a3 = tr.a * 3;
+          const b3 = tr.b * 3;
+          const c3 = tr.c * 3;
+          const ax = pa[a3], ay = pa[a3 + 1], az = pa[a3 + 2];
+          const e1x = pa[b3] - ax, e1y = pa[b3 + 1] - ay, e1z = pa[b3 + 2] - az;
+          const e2x = pa[c3] - ax, e2y = pa[c3 + 1] - ay, e2z = pa[c3 + 2] - az;
+          // 最近点（Ericson 摘要：三顶点+边，含面内情形——发-体表为浅交，
+          // 用三边+顶点最近已够判定距离；面内精确最近对浅穿影响 <0.2）
+          const cands: [number, number, number][] = [
+            [ax, ay, az],
+            [pa[b3], pa[b3 + 1], pa[b3 + 2]],
+            [pa[c3], pa[c3 + 1], pa[c3 + 2]],
+          ];
+          for (let e = 0; e < 3; e++) {
+            const s1 = cands[e];
+            const s2 = cands[(e + 1) % 3];
+            const ex = s2[0] - s1[0], ey = s2[1] - s1[1], ez = s2[2] - s1[2];
+            const t = Math.max(0, Math.min(1, ((px - s1[0]) * ex + (py - s1[1]) * ey + (pz - s1[2]) * ez) / (ex * ex + ey * ey + ez * ez || 1)));
+            cands.push([s1[0] + ex * t, s1[1] + ey * t, s1[2] + ez * t]);
+          }
+          for (const q of cands) {
+            const dd = (px - q[0]) ** 2 + (py - q[1]) ** 2 + (pz - q[2]) ** 2;
+            if (dd < bestD) {
+              bestD = dd;
+              qx = q[0];
+              qy = q[1];
+              qz = q[2];
+            }
+          }
+          // rest→cur 穿面计数（Möller；dir = d）
+          if (segLen2 > 1e-9) {
+            const pxx = dy * e2z - dz * e2y, pxy = dz * e2x - dx * e2z, pxz = dx * e2y - dy * e2x;
+            const det = e1x * pxx + e1y * pxy + e1z * pxz;
+            if (det > 1e-9 || det < -1e-9) {
+              const inv = 1 / det;
+              const tx = px - ax, ty = py - ay, tz = pz - az;
+              const u = (tx * pxx + ty * pxy + tz * pxz) * inv;
+              if (u >= 0 && u <= 1) {
+                const qxx = ty * e1z - tz * e1y, qxy = tz * e1x - tx * e1z, qxz = tx * e1y - ty * e1x;
+                const vv = (dx * qxx + dy * qxy + dz * qxz) * inv;
+                if (vv >= 0 && u + vv <= 1) {
+                  const t2 = (e2x * qxx + e2y * qxy + e2z * qxz) * inv;
+                  if (t2 > 1e-4 && t2 < 1 - 1e-4) crossings++;
+                }
+              }
+            }
+          }
+        }
+        const d = Math.sqrt(bestD);
+        const inside = crossings % 2 === 1;
+        if (!inside && d >= MARGIN) continue;
+        // 推出方向：体内 → 从最近表面点指向静止基准（必外）；体外近面 → 远离
+        let dirx: number, diry: number, dirz: number;
+        if (inside) {
+          dirx = rx - qx;
+          diry = ry - qy;
+          dirz = rz - qz;
+        } else {
+          dirx = px - qx;
+          diry = py - qy;
+          dirz = pz - qz;
+        }
+        const dl = Math.hypot(dirx, diry, dirz);
+        if (dl < 1e-6) continue;
+        arr[o] = qx + (dirx / dl) * MARGIN;
+        arr[o + 1] = qy + (diry / dl) * MARGIN;
+        arr[o + 2] = qz + (dirz / dl) * MARGIN;
+      }
+      pos.needsUpdate = true;
+    }
+  }
+
+  /** 选中骨骼：整段线条变色 + 关节球高亮 + 屏幕浮标显示骨名 */
+  selectBone(b: number) {
+    if (b === this.selectedBone) {
+      if (b >= 0) this.onBonePick(b); // 重复点击仅刷新回调
+      return;
+    }
+    const prev = this.selectedBone;
+    this.selectedBone = b;
+    const colAttr = this.boneLines?.geometry.getAttribute("color") as
+      | THREE.BufferAttribute
+      | undefined;
+    if (colAttr) {
+      const setSeg = (bone: number, c: THREE.Color) => {
+        const seg = this.boneSegOf.indexOf(bone);
+        if (seg < 0) return;
+        for (const v of [seg * 6, seg * 6 + 3]) {
+          colAttr.setXYZ(v, c.r, c.g, c.b);
+        }
+      };
+      setSeg(prev, Viewer.BONE_BASE);
+      setSeg(b, Viewer.BONE_HI);
+      colAttr.needsUpdate = true;
+    }
+    if (this.jointMesh && prev >= 0) this.jointMesh.setColorAt(prev, boneColor(prev));
+    if (this.jointMesh && b >= 0) this.jointMesh.setColorAt(b, Viewer.BONE_HI);
+    if (this.jointMesh?.instanceColor) this.jointMesh.instanceColor.needsUpdate = true;
+    if (b >= 0) {
+      if (!this.boneLabelEl) {
+        this.boneLabelEl = document.createElement("div");
+        this.boneLabelEl.className = "bone-label";
+        this.container.appendChild(this.boneLabelEl);
+      }
+      this.boneLabelEl.style.display = "block";
+    }
+    this.onBonePick(b);
+  }
+
+  deselectBone() {
+    if (this.selectedBone < 0) return;
+    this.selectBone(-1);
+    if (this.boneLabelEl) this.boneLabelEl.style.display = "none";
+  }
+
+  /** 每帧刷新骨线条端点（父/骨当前世界平移） */
+  private updateBoneLines() {
+    if (!this.boneLines) return;
+    const pos = this.boneLines.geometry.getAttribute("position") as THREE.BufferAttribute;
+    const arr = pos.array as Float32Array;
+    for (let i = 0; i < this.boneSegOf.length; i++) {
+      const b = this.boneSegOf[i];
+      const par = this.skelParents[b];
+      const mb = this.worldMats[b]?.elements;
+      const mp = this.worldMats[par]?.elements;
+      if (!mb || !mp) continue;
+      arr[i * 6] = mp[12];
+      arr[i * 6 + 1] = mp[13];
+      arr[i * 6 + 2] = mp[14];
+      arr[i * 6 + 3] = mb[12];
+      arr[i * 6 + 4] = mb[13];
+      arr[i * 6 + 5] = mb[14];
+    }
+    pos.needsUpdate = true;
+    this.updateBoneLabel();
+  }
+
+  /** 骨名浮标跟随选中骨骼的屏幕投影 */
+  private updateBoneLabel() {
+    const b = this.selectedBone;
+    if (b < 0 || !this.boneLabelEl) return;
+    const bone = this.skelBones[b];
+    if (!bone) return;
+    bone.updateWorldMatrix(true, false);
+    const p = bone.getWorldPosition(this.tmpVec).applyMatrix4(this.modelRoot.matrixWorld);
+    p.project(this.camera);
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const x = ((p.x + 1) / 2) * rect.width;
+    const y = ((1 - p.y) / 2) * rect.height;
+    this.boneLabelEl.style.left = x + 10 + "px";
+    this.boneLabelEl.style.top = y - 14 + "px";
+    this.boneLabelEl.textContent = `#${b} ${this.skelBones[b].name}`;
+  }
+
+  /** 镜像结果同步：可视骨骼 scale 与 wasm 内核 mirror 集 */
+  private syncMirrorVisuals() {
+    this.worldsFrameCache.clear(); // 镜像集变化使缓存的世界矩阵失效
+    for (let b = 0; b < this.fskelBoneCount; b++) {
       this.skelBones[b].scale.setScalar(this.mirrorBones.has(b) ? -1 : 1);
     }
     if (gfmEnabled) gfm!.set_mirror(Uint32Array.from(this.mirrorBones));
@@ -3080,6 +3513,7 @@ export class Viewer {
     for (let b = 0; b < n; b++) {
       this.worldMats[b].copy(this.skelBones[b].matrixWorld);
     }
+    this.updateBoneLines();
     this.updateAnchoredMats();
     this.updateBoneAttachedMats(); // 帽子等骨骼挂接件：写入骨骼相对运动（显示共轭）
     this.updateClothMats(i0 + alpha);
@@ -3093,6 +3527,7 @@ export class Viewer {
     // 全部件按当前姿态重新蒙皮，随后逐顶点去穿透（改顶点位置，不改骨矩阵）
     for (const p of this.parts.values()) this.skinPart(p);
     this.applySkirtDePenVerts(i0 + alpha);
+    this.applyHairBodyDepen(); // 长发合成件 vs 身体网格（静态外推兜不住动作期摆动）
     // 诊断窗口：按新帧号去重（scrub 反复应用同帧不重复计），每 30 帧 flush
     if (i0 !== this.diag.i0) {
       this.diag.i0 = i0;
@@ -3114,6 +3549,14 @@ export class Viewer {
       this.skelHelper.dispose();
       this.skelHelper = null;
     }
+    if (this.boneLines) {
+      this.modelRoot.remove(this.boneLines);
+      this.boneLines.geometry.dispose();
+      (this.boneLines.material as THREE.Material).dispose();
+      this.boneLines = null;
+    }
+    this.boneSegOf = [];
+    this.deselectBone();
     if (this.jointMesh) {
       this.modelRoot.remove(this.jointMesh);
       this.jointMesh.geometry.dispose();
@@ -3198,6 +3641,7 @@ export class Viewer {
         side: THREE.DoubleSide,
         roughness: 0.75,
         metalness: 0.0,
+        alphaTest: 0.1, // 特效贴图镂空区裁掉，避免透明 texel 渲染成黑块
       });
       if (fm) {
         mat.color.setRGB(fm.diffuse[0], fm.diffuse[1], fm.diffuse[2]);
@@ -3337,6 +3781,9 @@ export class Viewer {
         side: THREE.DoubleSide,
         roughness: 0.75,
         metalness: 0.0,
+        // 帽/长发 FSM 贴图带 alpha 镂空（发帘边缘、帽檐），透明 texel 需
+        // 裁掉——引擎按 alpha-test 处理，RGB=0 的镂空区不透明渲染即黑块
+        alphaTest: 0.1,
       });
       if (fm) {
         mat.color.setRGB(fm.diffuse[0], fm.diffuse[1], fm.diffuse[2]);
@@ -3431,6 +3878,12 @@ export class Viewer {
       bone: THREE.Bone | null;
       /** 绑定时骨骼世界矩阵的逆（相对运动载体，bone 非空时有效） */
       bindInv: THREE.Matrix4;
+      /** 长发 FSM 自动绑骨件（addBoneAttached 分流）：合成蒙皮部件的重建材料 */
+      autoHair?: {
+        model: FsmModel;
+        mats: { tex: TexData | null; file: string | null }[];
+        offset: [number, number, number];
+      };
     }
   >();
 
@@ -3448,6 +3901,33 @@ export class Viewer {
     offset: [number, number, number] = [0, 0, 0]
   ) {
     this.removeBoneAttached(path);
+    // 长发 FSM（FM38 实测 y 跨 87 vs 普通帽 29）自动绑骨：原版引擎对 FSM
+    // 帽是 SGAvatarAttachment 刚挂（客户端仅 tag_* 五挂点、SMM 无蒙皮数据，
+    // 游戏里长发同样刚性穿模）。viewer 增强：按 tag 挂接姿态把顶点最近分配
+    // 到 头/颈骨+Bone* 发链骨 合成蒙皮件，走 LBS——近头随头、发束随链动画
+    // （舞蹈 74°/帧摆动）。lp 按绑定帧生成故数据自洽，纯 LBS 即正确。
+    if (this.isLongHairFsm(model) && this.skelBones.length) {
+      const lower = boneName.toLowerCase();
+      const bone =
+        this.skelBones.find((b) => b.name.toLowerCase() === lower) ??
+        this.skelBones.find((b) => b.name.toLowerCase().includes(lower));
+      if (bone) {
+        this.boneAttached.set(path, {
+          holder: new THREE.Group(),
+          fix: new THREE.Group(),
+          inner: new THREE.Group(),
+          meshes: [],
+          geoms: [],
+          mats: [],
+          boneName,
+          bone,
+          bindInv: new THREE.Matrix4(),
+          autoHair: { model, mats, offset },
+        });
+        this.buildAutoHairPart(path);
+        return;
+      }
+    }
     const { meshes, geoms, matsOut } = this.buildFsmMeshes(model, mats);
     const inner = new THREE.Group();
     inner.position.set(offset[0], offset[1], offset[2]);
@@ -3590,7 +4070,360 @@ export class Viewer {
     return out;
   }
 
+  /** 长发 FSM 判定：网格 Y 跨度 > 50（FM38 披发 87 vs 普通帽 29） */
+  private isLongHairFsm(m: FsmModel): boolean {
+    let mn = Infinity;
+    let mx = -Infinity;
+    for (let i = 1; i < m.vertices.length; i += 8) {
+      const y = m.vertices[i];
+      if (y < mn) mn = y;
+      if (y > mx) mx = y;
+    }
+    return mx - mn > 50;
+  }
+
+  /** 长发 FSM → 合成蒙皮部件：顶点经挂接矩阵（refreshBoneAttached 同口径）
+   *  变换到数据空间，最近分配到 头/颈骨+tag 挂点骨+Bone* 发链骨（前二骨
+   *  距离加权平滑），boneLocalPos = 绑定帧世界矩阵逆 × 世界位置。骨架重载
+   *  后由 refreshBoneAttached 重建（lp 相对新骨架重新生成）。 */
+  private buildAutoHairPart(path: string) {
+    const e = this.boneAttached.get(path);
+    const ah = e?.autoHair;
+    if (!e || !ah || !e.bone || !this.skelBones.length || !this.bindWorldMats.length) return;
+    const { model, mats, offset } = ah;
+    const bone = e.bone;
+    const idx = this.skelBones.indexOf(bone);
+    const bindW = (idx >= 0 ? this.bindWorldMats[idx] : null) ?? bone.matrixWorld;
+    const isTag = bone.name.toLowerCase().startsWith("tag_");
+    // 挂接基准与 refreshBoneAttached 完全同口径（含 TAG_MOUNT_OFFSET 标定：
+    // 那是显示空间的挂点标定，长发同样适用——实测去掉后 crown 整体偏后~6.5
+    // 偏上 0.5 悬空）。长发与帽的差别不在挂点，而在绑定：长发只绑头/颈骨系
+    // （随头刚体运动），authored 网格自带的垂坠形态与大间隙得以保留。
+    const fix = new THREE.Matrix4().makeRotationY(MODEL_YAW).multiply(bindW);
+    if (isTag) {
+      fix.multiply(
+        new THREE.Matrix4().makeTranslation(
+          Viewer.TAG_MOUNT_OFFSET.x,
+          Viewer.TAG_MOUNT_OFFSET.y,
+          Viewer.TAG_MOUNT_OFFSET.z
+        )
+      );
+    } else {
+      fix.multiply(
+        new THREE.Matrix4().makeTranslation(
+          Viewer.HAT_OFFSET.x,
+          Viewer.HAT_OFFSET.y,
+          Viewer.HAT_OFFSET.z
+        )
+      );
+    }
+    const inner = new THREE.Matrix4()
+      .makeRotationY(isTag ? Math.PI : 0)
+      .setPosition(offset[0], offset[1], offset[2]);
+    if (!isTag) inner.multiply(new THREE.Matrix4().makeRotationZ(-Math.PI / 2));
+    const mount = fix.multiply(inner);
+
+    const n = this.fskelBoneCount;
+    // 候选骨：只用头/颈骨 + tag 挂点骨——游戏内 FM38 类长发 FSM 是
+    // SGAvatarAttachment 刚挂（引擎无 FSM 蒙皮），发帘随头整体运动、从挂点
+    // 垂直下坠（authored 网格自带游戏里的大间隙与全长，参照游戏截图）。
+    // Ponytail/Bone* 链都不参与：链弧线会把发帘拉去包背（实测贴背无隙）。
+    const cand: number[] = [];
+    for (let b = 0; b < n; b++) {
+      const nm = this.skelBones[b]?.name ?? "";
+      if (/head|neck/i.test(nm) || b === idx) cand.push(b);
+    }
+
+    // 身体间隙外推：FM38 类长发按原厂挂接姿态本就贴背/嵌背（刚挂时代游戏
+    // 同样穿）。合成时以其余部件的绑定姿态三角形（authored 位置）为障碍，
+    // 把发顶点推到体表外 HAIR_BODY_MARGIN——体内点（射线奇偶判定）沿
+    // (q−p) 推出、体外近点沿 (p−q) 推开；随后沿三角形邻接做两轮均值松弛
+    // 保持发面平整（避免逐点推出起皱）。
+    {
+      const MARGIN = Viewer.HAIR_BODY_MARGIN;
+      const tris: number[] = [];
+      for (const p2 of this.parts.values()) {
+        // 障碍只取身体件：偏移触发的重建路径里旧发件要到 addPart 才被替换，
+        // 若算进障碍会把新发从自身旧壳上再推一层 MARGIN（逐次调整爆跳根因）
+        if (p2.mesh.visible === false || p2.syntheticHair) continue;
+        // 障碍三角形用模型 authored 索引（几何索引含拆缝副本，越界 model.vertices）
+        for (const sm of p2.model.submeshes) {
+          for (let t = 0; t + 2 < sm.triangles.length; t += 3) {
+            const va = p2.model.vertices[sm.triangles[t]]?.pos;
+            const vb = p2.model.vertices[sm.triangles[t + 1]]?.pos;
+            const vc = p2.model.vertices[sm.triangles[t + 2]]?.pos;
+            if (!va || !vb || !vc) continue;
+            tris.push(va[0], va[1], va[2], vb[0], vb[1], vb[2], vc[0], vc[1], vc[2]);
+          }
+        }
+      }
+      if (tris.length) {
+        const nv = model.vertexCount;
+        const pwArr: THREE.Vector3[] = [];
+        for (let i = 0; i < nv; i++) {
+          pwArr.push(
+            new THREE.Vector3(
+              model.vertices[i * 8],
+              model.vertices[i * 8 + 1],
+              model.vertices[i * 8 + 2]
+            ).applyMatrix4(mount)
+          );
+        }
+        // 射线奇偶（自头顶 +Y 向下）体内判定 + 最近三角形点
+        const insideOf = (pnt: THREE.Vector3): boolean => {
+          let hits = 0;
+          const ay = 400;
+          for (let i = 0; i < tris.length; i += 9) {
+            // AABB 粗筛：三角形在点 xy 附近
+            const minX = Math.min(tris[i], tris[i + 3], tris[i + 6]);
+            const maxX = Math.max(tris[i], tris[i + 3], tris[i + 6]);
+            const minZ = Math.min(tris[i + 2], tris[i + 5], tris[i + 8]);
+            const maxZ = Math.max(tris[i + 2], tris[i + 5], tris[i + 8]);
+            if (pnt.x < minX - 0.1 || pnt.x > maxX + 0.1 || pnt.z < minZ - 0.1 || pnt.z > maxZ + 0.1) continue;
+            // Möller–Trumbore：自 (x,400,z) 向 -Y
+            const e1x = tris[i + 3] - tris[i], e1y = tris[i + 4] - tris[i + 1], e1z = tris[i + 5] - tris[i + 2];
+            const e2x = tris[i + 6] - tris[i], e2y = tris[i + 7] - tris[i + 1], e2z = tris[i + 8] - tris[i + 2];
+            const dx = 0, dy = -1, dz = 0;
+            const pxx = dy * e2z - dz * e2y, pxy = dz * e2x - dx * e2z, pxz = dx * e2y - dy * e2x;
+            const det = e1x * pxx + e1y * pxy + e1z * pxz;
+            if (det > -1e-9 && det < 1e-9) continue;
+            const inv = 1 / det;
+            const tx = pnt.x - tris[i], ty = ay - tris[i + 1], tz = pnt.z - tris[i + 2];
+            const u = (tx * pxx + ty * pxy + tz * pxz) * inv;
+            if (u < 0 || u > 1) continue;
+            const qxx = ty * e1z - tz * e1y, qxy = tz * e1x - tx * e1z, qxz = tx * e1y - ty * e1x;
+            const vv = (dx * qxx + dy * qxy + dz * qxz) * inv;
+            if (vv < 0 || u + vv > 1) continue;
+            const t = (e2x * qxx + e2y * qxy + e2z * qxz) * inv;
+            if (t > 1e-4 && t < 1 - 1e-4) hits++;
+          }
+          return hits % 2 === 1;
+        };
+        const nearest = (pnt: THREE.Vector3, out: THREE.Vector3): number => {
+          let best = Infinity;
+          for (let i = 0; i < tris.length; i += 9) {
+            const cx = (tris[i] + tris[i + 3] + tris[i + 6]) / 3;
+            const cy = (tris[i + 1] + tris[i + 4] + tris[i + 7]) / 3;
+            const cz = (tris[i + 2] + tris[i + 5] + tris[i + 8]) / 3;
+            const dd = (pnt.x - cx) ** 2 + (pnt.y - cy) ** 2 + (pnt.z - cz) ** 2;
+            if (dd > (best + 4) * (best + 4)) continue;
+            // 点到三角形（Ericson）
+            const ax = tris[i], ay2 = tris[i + 1], az = tris[i + 2];
+            const abx = tris[i + 3] - ax, aby = tris[i + 4] - ay2, abz = tris[i + 5] - az;
+            const acx = tris[i + 6] - ax, acy = tris[i + 7] - ay2, acz = tris[i + 8] - az;
+            const apx = pnt.x - ax, apy = pnt.y - ay2, apz = pnt.z - az;
+            const d1 = apx * abx + apy * aby + apz * abz;
+            const d2 = apx * acx + apy * acy + apz * acz;
+            let qx: number, qy: number, qz: number;
+            if (d1 <= 0 && d2 <= 0) { qx = ax; qy = ay2; qz = az; }
+            else {
+              const bpx = pnt.x - tris[i + 3], bpy = pnt.y - tris[i + 4], bpz = pnt.z - tris[i + 5];
+              const d3 = bpx * abx + bpy * aby + bpz * abz;
+              const d4 = bpx * acx + bpy * acy + bpz * acz;
+              if (d3 >= 0 && d4 <= d3) { qx = tris[i + 3]; qy = tris[i + 4]; qz = tris[i + 5]; }
+              else {
+                const vc = d1 * d4 - d3 * d2;
+                if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+                  const t = d1 / (d1 - d3);
+                  qx = ax + abx * t; qy = ay2 + aby * t; qz = az + abz * t;
+                } else {
+                  const cpx = pnt.x - tris[i + 6], cpy = pnt.y - tris[i + 7], cpz = pnt.z - tris[i + 8];
+                  const d5 = cpx * abx + cpy * aby + cpz * abz;
+                  const d6 = cpx * acx + cpy * acy + cpz * acz;
+                  if (d6 >= 0 && d5 <= d6) { qx = tris[i + 6]; qy = tris[i + 7]; qz = tris[i + 8]; }
+                  else {
+                    const vb2 = d5 * d2 - d1 * d6;
+                    if (vb2 <= 0 && d2 >= 0 && d6 <= 0) {
+                      const t = d2 / (d2 - d6);
+                      qx = ax + acx * t; qy = ay2 + acy * t; qz = az + acz * t;
+                    } else {
+                      const va2 = d3 * d6 - d5 * d4;
+                      if (va2 <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+                        const t = (d4 - d3) / (d4 - d3 + (d5 - d6));
+                        qx = tris[i + 3] + (tris[i + 6] - tris[i + 3]) * t;
+                        qy = tris[i + 4] + (tris[i + 7] - tris[i + 4]) * t;
+                        qz = tris[i + 5] + (tris[i + 8] - tris[i + 5]) * t;
+                      } else {
+                        const denom = 1 / (va2 + vb2 + vc);
+                        const v = vb2 * denom, w = vc * denom;
+                        qx = ax + abx * v + acx * w;
+                        qy = ay2 + aby * v + acy * w;
+                        qz = az + abz * v + acz * w;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            const dd2 = (pnt.x - qx) ** 2 + (pnt.y - qy) ** 2 + (pnt.z - qz) ** 2;
+            if (dd2 < best) { best = dd2; out.set(qx, qy, qz); }
+          }
+          return Math.sqrt(best);
+        };
+        const q = new THREE.Vector3();
+        const offs: (THREE.Vector3 | null)[] = pwArr.map(() => null);
+        let pushed = 0;
+        for (let i = 0; i < nv; i++) {
+          const pw = pwArr[i];
+          const d = nearest(pw, q);
+          // 体内检测窗放宽到 12：深嵌体内的发点（时装身体更薄，可距体表
+          // 3~6）在 2×MARGIN 窗外曾被当体外远处漏推（套装场景只推 72 个
+          // 的根因）
+          const ins = d < 12 ? insideOf(pw) : false;
+          if (ins || d < MARGIN) {
+            const dir = new THREE.Vector3();
+            if (ins) dir.subVectors(q, pw); // 体内：从最近表面点指向外
+            else dir.subVectors(pw, q); // 体外近面：沿远离方向
+            if (dir.lengthSq() < 1e-10) continue;
+            dir.normalize();
+            const target = new THREE.Vector3().copy(q).addScaledVector(dir, MARGIN);
+            offs[i] = target.sub(pw);
+            pushed++;
+          }
+        }
+        if (pushed) {
+          // 邻接平滑（三角形边）：offset 向邻居均值靠拢，两轮
+          const nbr: Set<number>[] = Array.from({ length: nv }, () => new Set<number>());
+          for (const sm of model.submeshes) {
+            for (let t = 0; t + 2 < sm.triangles.length; t += 3) {
+              const a = sm.triangles[t], b2 = sm.triangles[t + 1], c2 = sm.triangles[t + 2];
+              nbr[a]?.add(b2); nbr[a]?.add(c2);
+              nbr[b2]?.add(a); nbr[b2]?.add(c2);
+              nbr[c2]?.add(a); nbr[c2]?.add(b2);
+            }
+          }
+          for (let pass = 0; pass < 2; pass++) {
+            const next = offs.map((o, i) => {
+              if (!o) return o;
+              const avg = o.clone();
+              let cnt = 1;
+              for (const j of nbr[i]) {
+                const oj = offs[j];
+                if (oj) { avg.add(oj); cnt++; }
+              }
+              return avg.divideScalar(cnt).lerp(o, 0.4); // 部分回弹保间隙
+            });
+            for (let i = 0; i < nv; i++) offs[i] = next[i];
+          }
+          for (let i = 0; i < nv; i++) {
+            const o = offs[i];
+            if (o) pwArr[i].add(o);
+          }
+        }
+        // 推开后的位置作为最终绑定位置（挂在 model 上的非类型化字段）
+        (model as FsmModel & { __pushedPos?: THREE.Vector3[]; __pushedCount?: number }).__pushedPos = pwArr;
+        (model as FsmModel & { __pushedPos?: THREE.Vector3[]; __pushedCount?: number }).__pushedCount = pushed;
+        (model as FsmModel & { __restPos?: Float64Array }).__restPos = new Float64Array(
+          pwArr.flatMap((w) => [w.x, w.y, w.z])
+        );
+      }
+    }
+    const inv = new THREE.Matrix4();
+    const lpOf = (b: number, pw: THREE.Vector3): number[] => {
+      inv.copy(this.bindWorldMats[b]).invert();
+      const local = pw.clone().applyMatrix4(inv);
+      return [local.x, local.y, local.z];
+    };
+
+    const verts: Vertex[] = [];
+    const v3 = new THREE.Vector3();
+    const boneCount = new Map<number, number>();
+    const nv = model.vertexCount;
+    const pushedPos = (model as FsmModel & { __pushedPos?: THREE.Vector3[] }).__pushedPos;
+    for (let i = 0; i < nv; i++) {
+      const pw = pushedPos
+        ? pushedPos[i].clone()
+        : v3
+            .set(model.vertices[i * 8], model.vertices[i * 8 + 1], model.vertices[i * 8 + 2])
+            .applyMatrix4(mount);
+      let b1 = cand[0];
+      let b2 = cand[1] ?? cand[0];
+      let d1 = Infinity;
+      let d2 = Infinity;
+      for (const b of cand) {
+        const bm = this.bindWorldMats[b].elements;
+        const d = Math.hypot(pw.x - bm[12], pw.y - bm[13], pw.z - bm[14]);
+        if (d < d1) {
+          b2 = b1;
+          d2 = d1;
+          b1 = b;
+          d1 = d;
+        } else if (d < d2) {
+          b2 = b;
+          d2 = d;
+        }
+      }
+      const influences: Influence[] = [];
+      if (d2 < d1 * 1.5) {
+        const w1 = d2 / (d1 + d2);
+        influences.push({ boneIndex: b1, weight: w1, boneLocalPos: lpOf(b1, pw) });
+        influences.push({ boneIndex: b2, weight: 1 - w1, boneLocalPos: lpOf(b2, pw) });
+        boneCount.set(b1, (boneCount.get(b1) ?? 0) + 1);
+        boneCount.set(b2, (boneCount.get(b2) ?? 0) + 1);
+      } else {
+        influences.push({ boneIndex: b1, weight: 1, boneLocalPos: lpOf(b1, pw) });
+        boneCount.set(b1, (boneCount.get(b1) ?? 0) + 1);
+      }
+      const nrm = new THREE.Vector3(
+        model.vertices[i * 8 + 3],
+        model.vertices[i * 8 + 4],
+        model.vertices[i * 8 + 5]
+      ).transformDirection(mount);
+      verts.push({
+        pos: [pw.x, pw.y, pw.z],
+        normal: [nrm.x, nrm.y, nrm.z],
+        uv: [model.vertices[i * 8 + 6], model.vertices[i * 8 + 7]],
+        influences,
+      });
+    }
+
+    const synth: FskinModel = {
+      path: path + "#autohair",
+      version: 1,
+      bboxMax: [...model.bboxMax],
+      bboxMin: [...model.bboxMin],
+      reserved256: [],
+      vertices: verts,
+      submeshes: model.submeshes.map((sm) => ({
+        zero1: (sm.index << 16) >>> 0,
+        zero2: 0,
+        vertexCount2: sm.vertexCount,
+        misc: [0, 0, 0, 0, 0, 0],
+        triangles: [...sm.triangles],
+      })),
+      materials: model.materials.map((mm) => ({
+        lead: mm.index,
+        diffuse: [...mm.diffuse],
+        ambient: [...mm.ambient],
+        emissive: [...mm.emissive],
+        specular: [...mm.specular],
+        specPower: mm.specPower,
+        pre: [...mm.pre],
+        texturePath: mm.texturePath,
+        tail: [],
+      })),
+    };
+    this.addPart(path, synth, mats.map((m) => m.tex), mats.map((m) => m.file));
+    const part = this.parts.get(path);
+    if (part) part.syntheticHair = true;
+    const top = [...boneCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+    const pushedCount = (model as FsmModel & { __pushedCount?: number }).__pushedCount ?? 0;
+    this.dlog(
+      "长发自动绑骨: " +
+        path.replace(/^.*[\/]/, "") +
+        " " +
+        nv +
+        " 顶点(体表外推 " +
+        pushedCount +
+        ") → " +
+        top.map(([b, c]) => (this.skelBones[b]?.name ?? b) + "×" + c).join(" ")
+    );
+  }
+
   removeBoneAttached(path: string) {
+    if (this.parts.has(path) && this.parts.get(path)!.syntheticHair) {
+      this.removePart(path); // 长发自动绑骨合成件
+    }
     const e = this.boneAttached.get(path);
     if (!e) return;
     this.dlog(`帽子卸下: ${path.replace(/^.*[\\/]/, "")} · 剩余 ${this.boneAttached.size - 1}`);
@@ -3606,7 +4439,14 @@ export class Viewer {
 
   setBoneAttachedOffset(path: string, offset: [number, number, number]) {
     const e = this.boneAttached.get(path);
-    if (e) e.inner.position.set(offset[0], offset[1], offset[2]);
+    if (!e) return;
+    e.inner.position.set(offset[0], offset[1], offset[2]);
+    if (e.autoHair) {
+      // 长发合成件把挂接矩阵烘焙进顶点，改 inner 不产生视觉变化——
+      // 必须更新 autoHair.offset 并重建（体表外推+绑骨以新偏移重跑）
+      e.autoHair.offset = [offset[0], offset[1], offset[2]];
+      this.buildAutoHairPart(path);
+    }
   }
 
   /** 骨名列表（帽槽挂点选择用），按骨架当前骨序 */
@@ -3651,6 +4491,13 @@ export class Viewer {
       ? [this.boneAttached.get(path)].filter((e) => !!e)
       : [...this.boneAttached.values()];
     for (const e of entries) {
+      if (e.autoHair) {
+        if (this.parts.has(path ?? "") && this.parts.get(path ?? "")!.syntheticHair) {
+          this.removePart(path!);
+        }
+        this.buildAutoHairPart(path!);
+        continue;
+      }
       const lower = e.boneName.toLowerCase();
       const bone =
         this.skelBones.find((b) => b.name.toLowerCase() === lower) ??
@@ -3720,6 +4567,7 @@ export class Viewer {
   setSkeletonVisible(v: boolean) {
     this.skeletonVisible = v;
     if (this.skelHelper) this.skelHelper.visible = v;
+    if (this.boneLines) this.boneLines.visible = v;
     if (this.jointMesh) this.jointMesh.visible = v;
   }
 

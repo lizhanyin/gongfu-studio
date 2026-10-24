@@ -46,7 +46,7 @@
       <n-collapse
         class="inspector-collapse"
         display-directive="show"
-        :default-expanded-names="['variants', 'tex', 'act', 'fak', 'fsm', 'part']"
+        :default-expanded-names="['variants', 'tex', 'act', 'bones', 'fak', 'fsm', 'part']"
       >
         <n-collapse-item
           v-if="skin.modelSet?.groups.length"
@@ -65,6 +65,9 @@
         </n-collapse-item>
         <n-collapse-item v-if="act.actMeta || skin.hasParts" title="动作" name="act">
           <ActFileInfo :act="act" :act-dir="skin.rootDir + '\\act'" />
+        </n-collapse-item>
+        <n-collapse-item v-if="act.actMeta" title="骨骼" name="bones">
+          <BoneList :act="act" />
         </n-collapse-item>
         <n-collapse-item v-if="fak.fakModel" title="FAK 信息" name="fak">
           <FakFileInfo :fak="fak" />
@@ -110,6 +113,7 @@ import ActFileInfo from "./ActFileInfo.vue";
 import FakFileInfo from "./FakFileInfo.vue";
 import FsmFileInfo from "./FsmFileInfo.vue";
 import PartInspector from "./PartInspector.vue";
+import BoneList from "./BoneList.vue";
 import type { ResourceTreeStore } from "../composables/useResourceTree";
 
 const props = defineProps<{

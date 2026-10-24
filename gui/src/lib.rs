@@ -322,6 +322,334 @@ pub fn dds_decode_for_test(bytes: &[u8]) -> Result<Vec<u8>, String> {
     dds::decode_dds(bytes).map(|t| t.rgba)
 }
 
+/// 诊断探针（fsm_bbox 示例用）：FSM 顶点数/bbox/挂点概览
+pub fn fsm_probe_for_test(path: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+    let m = fsm::parse_fsm(path, &bytes)?;
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for i in 0..m.vertex_count as usize {
+        for k in 0..3 {
+            let v = m.vertices[i * 8 + k];
+            mn[k] = mn[k].min(v);
+            mx[k] = mx[k].max(v);
+        }
+    }
+    Ok(format!(
+        "{}: {}v sub{} bbox y[{:.0},{:.0}] x[{:.0},{:.0}] z[{:.0},{:.0}] dummies[{}]",
+        path.rsplit(['\\', '/']).next().unwrap_or(path),
+        m.vertex_count,
+        m.submeshes.len(),
+        mn[1], mx[1], mn[0], mx[0], mn[2], mx[2],
+        m.dummies.iter().map(|d| d.name.clone()).collect::<Vec<_>>().join(",")
+    ))
+}
+
+/// 诊断探针（sz38_probe 示例用）：时装部件头发链排查——从 system.cpk 提取
+/// shizhuang\SZ_38.fskin，列出 Bone* 链骨使用分布（镜像标志/顶点数/
+/// authored Y 范围/帧0 LBS↔authored 残差）与链根顶点簇（识别马尾/披发链）。
+pub fn sz38_probe_for_test(cpk_path: &str, fskel_path: &str) -> Result<String, String> {
+    use std::collections::BTreeMap;
+
+    let mut cpk = cpk::package::Cpk::open(cpk_path).map_err(|e| format!("打开 cpk 失败: {e:?}"))?;
+    let entry = cpk
+        .entries()
+        .into_iter()
+        .find(|e| e.full_path.to_lowercase().ends_with(r"\shizhuang\sz_38.fskin"))
+        .ok_or(r"CPK 中找不到 shizhuang\SZ_38.fskin")?;
+    let bytes = cpk.read_file(&entry).map_err(|e| format!("读取失败: {e:?}"))?;
+    let m = fskin::parse_fskin("SZ_38.fskin", &bytes)?;
+
+    let fb = std::fs::read(fskel_path).map_err(|e| format!("读 FSKEL 失败: {e}"))?;
+    let f = fskel::parse_fskel(fskel_path, &fb)?;
+    let meta = f.meta();
+    let n = meta.bone_count as usize;
+    let frame0 = f.frames_flat(0, 1);
+    let mir = |b: usize| meta.mirror_first.get(b).copied().unwrap_or(0) != 0;
+
+    // 帧0 世界矩阵：局部 = R(Q)·S(镜像)，世界 = 父世界 × 局部（与引擎合成同构）
+    type M4 = [[f32; 4]; 4];
+    let mul = |a: &M4, b: &M4| -> M4 {
+        let mut o = [[0f32; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                o[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
+            }
+        }
+        o
+    };
+    let mut wm: Vec<M4> = vec![[[0.0; 4]; 4]; n];
+    let mut seen = vec![false; n];
+    loop {
+        let mut added = false;
+        for b in 0..n {
+            if seen[b] {
+                continue;
+            }
+            let p = meta.parents[b];
+            if p < 0 || seen[p as usize] {
+                seen[b] = true;
+                let o = b * 7;
+                let (tx, ty, tz) = (frame0[o], frame0[o + 1], frame0[o + 2]);
+                let (x, y, z, w) = (frame0[o + 3], frame0[o + 4], frame0[o + 5], frame0[o + 6]);
+                let nn = (x * x + y * y + z * z + w * w).sqrt().max(1e-10);
+                let (x, y, z, w) = (x / nn, y / nn, z / nn, w / nn);
+                let s = if mir(b) { -1.0f32 } else { 1.0 };
+                let mut l: M4 = [[0.0; 4]; 4];
+                l[0][0] = (1.0 - 2.0 * (y * y + z * z)) * s;
+                l[0][1] = (2.0 * (x * y + z * w)) * s;
+                l[0][2] = (2.0 * (x * z - y * w)) * s;
+                l[1][0] = (2.0 * (x * y - z * w)) * s;
+                l[1][1] = (1.0 - 2.0 * (x * x + z * z)) * s;
+                l[1][2] = (2.0 * (y * z + x * w)) * s;
+                l[2][0] = (2.0 * (x * z + y * w)) * s;
+                l[2][1] = (2.0 * (y * z - x * w)) * s;
+                l[2][2] = (1.0 - 2.0 * (x * x + y * y)) * s;
+                l[0][3] = tx;
+                l[1][3] = ty;
+                l[2][3] = tz;
+                l[3][3] = 1.0;
+                wm[b] = if (0..n).contains(&(p as usize)) { mul(&wm[p as usize], &l) } else { l };
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    let is_bone_name = |s: &str| s.len() > 4 && s.starts_with("Bone") && s[4..].bytes().all(|c| c.is_ascii_digit());
+    let name = |b: usize| meta.bone_names[b].clone();
+    let mut out = format!("== SZ_38: {} 顶点 · {} 子网格
+", m.vertices.len(), m.submeshes.len());
+    for (i, mat) in m.materials.iter().enumerate() {
+        out += &format!("  材质#{i}: tex={}
+", mat.texture_path);
+    }
+
+    let mut solo_of: BTreeMap<usize, usize> = BTreeMap::new();
+    for v in &m.vertices {
+        for inf in &v.influences {
+            let b0 = inf.bone_index as usize;
+            if b0 < n && is_bone_name(&name(b0)) && (v.influences.len() == 1 || inf.weight >= 0.99) {
+                *solo_of.entry(b0).or_insert(0) += 1;
+            }
+        }
+    }
+    out += &format!("  单影响计数: {}
+", solo_of.iter().map(|(b, c)| format!("{}#{}:{}", name(*b), b, c)).collect::<Vec<_>>().join(" "));
+    let mut stats: BTreeMap<usize, (usize, f32, f32, f64, f32)> = BTreeMap::new();
+    for v in &m.vertices {
+        for inf in &v.influences {
+            let b = inf.bone_index as usize;
+            if b >= n || !is_bone_name(&name(b)) {
+                continue;
+            }
+            let mm = &wm[b];
+            let px = mm[0][0] * inf.bone_local_pos[0] + mm[0][1] * inf.bone_local_pos[1] + mm[0][2] * inf.bone_local_pos[2] + mm[0][3];
+            let py = mm[1][0] * inf.bone_local_pos[0] + mm[1][1] * inf.bone_local_pos[1] + mm[1][2] * inf.bone_local_pos[2] + mm[1][3];
+            let pz = mm[2][0] * inf.bone_local_pos[0] + mm[2][1] * inf.bone_local_pos[1] + mm[2][2] * inf.bone_local_pos[2] + mm[2][3];
+            let res = ((px - v.pos[0]).powi(2) + (py - v.pos[1]).powi(2) + (pz - v.pos[2]).powi(2)).sqrt();
+            let e = stats.entry(b).or_insert((0, f32::MAX, f32::MIN, 0.0, 0.0));
+            e.0 += 1;
+            e.1 = e.1.min(v.pos[1]);
+            e.2 = e.2.max(v.pos[1]);
+            e.3 += res as f64;
+            e.4 = e.4.max(res);
+        }
+    }
+    out += "== Bone* 链骨使用（· 镜像 · 顶点数 · authoredY · LBS残差 avg/max @帧0）
+";
+    let mut roots: Vec<usize> = Vec::new();
+    {
+        let mut root_set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for (&b, _) in &stats {
+            let mut cur = b;
+            loop {
+                let p = meta.parents[cur];
+                if p < 0 || !is_bone_name(&name(p as usize)) {
+                    break;
+                }
+                cur = p as usize;
+            }
+            root_set.insert(cur);
+        }
+        roots = root_set.into_iter().collect();
+        out += &format!("  所属链根: {}
+", roots.iter().map(|&r| format!("{}#{}", name(r), r)).collect::<Vec<_>>().join(" "));
+    }
+    for (&b, s) in &stats {
+        let _ = s;
+        let p = meta.parents[b];
+        let is_root = p < 0 || !is_bone_name(&name(p as usize));
+        if is_root {
+            roots.push(b);
+        }
+        out += &format!(
+            "  #{} {} 镜像={} n={} y[{:.0},{:.0}] res {:.1}/{:.1}{}
+",
+            b, name(b), mir(b), s.0, s.1, s.2, s.3 / s.0 as f64, s.4,
+            if is_root { " ←链根" } else { "" }
+        );
+    }
+    out += "== 链根顶点簇
+";
+    for &r in &roots {
+        let mut members = vec![r];
+        loop {
+            let mut added = false;
+            for b in 0..n {
+                let p = meta.parents[b];
+                if p >= 0 && is_bone_name(&name(b)) && members.contains(&(p as usize)) && !members.contains(&b) {
+                    members.push(b);
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        let (mut ymin, mut ymax, mut cnt) = (f32::MAX, f32::MIN, 0usize);
+        for v in &m.vertices {
+            for inf in &v.influences {
+                if members.contains(&(inf.bone_index as usize)) {
+                    ymin = ymin.min(v.pos[1]);
+                    ymax = ymax.max(v.pos[1]);
+                    cnt += 1;
+                }
+            }
+        }
+        let names: Vec<String> = members.iter().map(|&b| format!("{}#{}", name(b), b)).collect();
+        out += &format!(
+            "  根 {}#{} 镜像={} 成员[{}] 影响{}次 authoredY[{:.0},{:.0}]
+",
+            name(r), r, mir(r), names.join(","), cnt, ymin, ymax
+        );
+    }
+    // ---- 扩展：基础发型件的链使用 / 镜像变体 / wlk 摆动 ----
+    let chains: Vec<usize> = vec![90, 91, 92, 103, 104];
+    let base_dir = std::path::Path::new(fskel_path).parent().unwrap().parent().unwrap();
+    out += "== 基础发型件的 Bone* 链使用\n";
+    let mut hair_files: Vec<std::path::PathBuf> = vec![];
+    if let Ok(rd) = std::fs::read_dir(base_dir.join("MHair")) {
+        for e2 in rd.flatten() {
+            if e2.path().extension().map(|x| x.to_string_lossy().eq_ignore_ascii_case("fskin")).unwrap_or(false) {
+                hair_files.push(e2.path());
+            }
+        }
+    }
+    hair_files.push(base_dir.join("girl_Hair01.fskin"));
+    hair_files.sort();
+    for hp in hair_files {
+        let Ok(b2) = std::fs::read(&hp) else { continue };
+        let Ok(m2) = fskin::parse_fskin(&hp.to_string_lossy(), &b2) else { continue };
+        let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for v in &m2.vertices {
+            for inf in &v.influences {
+                let bi = inf.bone_index as usize;
+                if bi < n && chains.contains(&bi) {
+                    used.insert(format!("{}#{}", name(bi), bi));
+                }
+            }
+        }
+        if !used.is_empty() {
+            out += &format!("  {} 使用 {}\n", hp.file_name().unwrap().to_string_lossy(), used.into_iter().collect::<Vec<_>>().join(","));
+        }
+    }
+    // 镜像变体残差（帧0）：逐链根试镜像
+    for &r in &roots {
+        let members: Vec<usize> = {
+            let mut members = vec![r];
+            loop {
+                let mut added = false;
+                for b in 0..n {
+                    let pp = meta.parents[b];
+                    if pp >= 0 && is_bone_name(&name(b)) && members.contains(&(pp as usize)) && !members.contains(&b) {
+                        members.push(b);
+                        added = true;
+                    }
+                }
+                if !added { break; }
+            }
+            members
+        };
+        let mut wm2: Vec<M4> = wm.clone();
+        {
+            let mut seen2 = vec![false; n];
+            loop {
+                let mut added = false;
+                for b in 0..n {
+                    if seen2[b] { continue; }
+                    let pp = meta.parents[b];
+                    if pp < 0 || seen2[pp as usize] {
+                        seen2[b] = true;
+                        let o = b * 7;
+                        let (tx, ty, tz) = (frame0[o], frame0[o + 1], frame0[o + 2]);
+                        let (x, y, z, w) = (frame0[o + 3], frame0[o + 4], frame0[o + 5], frame0[o + 6]);
+                        let nn = (x * x + y * y + z * z + w * w).sqrt().max(1e-10);
+                        let (x, y, z, w) = (x / nn, y / nn, z / nn, w / nn);
+                        let sc = if mir(b) || members.contains(&b) { -1.0f32 } else { 1.0 };
+                        let mut l: M4 = [[0.0; 4]; 4];
+                        l[0][0] = (1.0 - 2.0 * (y * y + z * z)) * sc;
+                        l[0][1] = (2.0 * (x * y + z * w)) * sc;
+                        l[0][2] = (2.0 * (x * z - y * w)) * sc;
+                        l[1][0] = (2.0 * (x * y - z * w)) * sc;
+                        l[1][1] = (1.0 - 2.0 * (x * x + z * z)) * sc;
+                        l[1][2] = (2.0 * (y * z + x * w)) * sc;
+                        l[2][0] = (2.0 * (x * z + y * w)) * sc;
+                        l[2][1] = (2.0 * (y * z - x * w)) * sc;
+                        l[2][2] = (1.0 - 2.0 * (x * x + y * y)) * sc;
+                        l[0][3] = tx;
+                        l[1][3] = ty;
+                        l[2][3] = tz;
+                        l[3][3] = 1.0;
+                        wm2[b] = if (0..n).contains(&(pp as usize)) { mul(&wm2[pp as usize], &l) } else { l };
+                        added = true;
+                    }
+                }
+                if !added { break; }
+            }
+        }
+        let mut sum = 0.0f64;
+        let mut cnt = 0usize;
+        for v in &m.vertices {
+            for inf in &v.influences {
+                if !members.contains(&(inf.bone_index as usize)) { continue; }
+                let mm = &wm2[inf.bone_index as usize];
+                let px = mm[0][0] * inf.bone_local_pos[0] + mm[0][1] * inf.bone_local_pos[1] + mm[0][2] * inf.bone_local_pos[2] + mm[0][3];
+                let py = mm[1][0] * inf.bone_local_pos[0] + mm[1][1] * inf.bone_local_pos[1] + mm[1][2] * inf.bone_local_pos[2] + mm[1][3];
+                let pz = mm[2][0] * inf.bone_local_pos[0] + mm[2][1] * inf.bone_local_pos[1] + mm[2][2] * inf.bone_local_pos[2] + mm[2][3];
+                sum += ((px - v.pos[0]).powi(2) + (py - v.pos[1]).powi(2) + (pz - v.pos[2]).powi(2)).sqrt() as f64;
+                cnt += 1;
+            }
+        }
+        if cnt > 0 {
+            out += &format!("  链根 {}#{} 镜像变体残差 avg {:.1}\n", name(r), r, sum / cnt as f64);
+        }
+    }
+    if let Some(a) = meta.actions.iter().find(|a| a.name == "wlk1") {
+        let (f0, f1) = ((a.first_frame as usize).max(1), (a.first_frame as usize + a.frame_count as usize).min(f.frame_count() as usize));
+        out += &format!("== wlk1 帧[{f0},{f1}) 链动态（局部平移摆动粗测）\n");
+        for &r in &roots {
+            let mut base: Option<[f64; 3]> = None;
+            let mut swing = 0.0f64;
+            for fi in (f0..f1).step_by(3) {
+                let fr = f.frames_flat(fi as u32, fi as u32 + 1);
+                let o = r * 7;
+                let p = [fr[o] as f64, fr[o + 1] as f64, fr[o + 2] as f64];
+                if let Some(b) = base {
+                    let d = ((p[0] - b[0]).powi(2) + (p[1] - b[1]).powi(2) + (p[2] - b[2]).powi(2)).sqrt();
+                    swing = swing.max(d);
+                } else {
+                    base = Some(p);
+                }
+            }
+            out += &format!("  {}#{} 摆动 {:.2} · 帧根世界[{:.0},{:.0},{:.0}]\n", name(r), r, swing, wm[r][0][3], wm[r][1][3], wm[r][2][3]);
+        }
+    }
+    Ok(out)
+}
+
 /// 诊断探针（skirt_probe 示例用）：裙摆防穿模/布料链排查——FSKEL 骨名、
 /// 腿胶囊长度（与 viewer setupSkirtRig 同口径：len=子骨帧0局部平移长度，
 /// r=0.18×len），以及各 FSKIN 部件中 Bone* 链骨的顶点影响分布

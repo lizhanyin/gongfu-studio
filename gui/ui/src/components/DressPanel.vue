@@ -133,12 +133,12 @@
           />
         </div>
         <div class="row">
-          <span class="dress-label">偏移</span>
+          <span class="dress-label" title="点击 ± 步进 0.1，按住 Ctrl 步进 1">偏移</span>
           <n-input-number
             v-for="(ax, i) in (['X', 'Y', 'Z'] as const)"
             :key="ax"
             size="tiny"
-            :step="1"
+            :step="hatStep"
             :value="dress.hatOffset[i]"
             @update:value="(v: number | null) => setHatOffset(i, v)"
           />
@@ -149,7 +149,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { DressStore } from "../composables/useDressMode";
 import type { EquipItem } from "../types";
 import { shortName } from "../utils";
@@ -193,9 +193,30 @@ const boneOptions = computed(() => [
   ...props.actDirSkeleton.map((n) => ({ label: n, value: n })),
 ]);
 
+// 帽子偏移步长：普通点击 0.1，按住 Ctrl 为 1
+const ctrlHeld = ref(false);
+const onCtrlDown = (e: KeyboardEvent) => {
+  if (e.key === "Control") ctrlHeld.value = true;
+};
+const onCtrlUp = (e: KeyboardEvent) => {
+  if (e.key === "Control") ctrlHeld.value = false;
+};
+const resetCtrl = () => (ctrlHeld.value = false);
+onMounted(() => {
+  window.addEventListener("keydown", onCtrlDown);
+  window.addEventListener("keyup", onCtrlUp);
+  window.addEventListener("blur", resetCtrl);
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onCtrlDown);
+  window.removeEventListener("keyup", onCtrlUp);
+  window.removeEventListener("blur", resetCtrl);
+});
+const hatStep = computed(() => (ctrlHeld.value ? 1 : 0.1));
+
 function setHatOffset(i: number, v: number | null) {
   const off = [...props.dress.hatOffset] as [number, number, number];
-  off[i] = v ?? 0;
+  off[i] = v == null ? 0 : Math.round(v * 1000) / 1000;
   props.dress.hatOffset = off;
 }
 </script>

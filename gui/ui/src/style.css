@@ -291,3 +291,18 @@ body.panel-dragging .viewport canvas { pointer-events: none; }
 .action-row.active { background: #2a3a5e; color: #fff; }
 .action-meta { font-size: 11px; color: #889; font-variant-numeric: tabular-nums; flex-shrink: 0; }
 .action-row.active .action-meta { color: #aac; }
+
+/* viewer 骨名浮标（点击骨线条显示，随骨骼投影跟随） */
+.bone-label {
+  position: absolute;
+  display: none;
+  pointer-events: none;
+  z-index: 6;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(20, 20, 24, 0.82);
+  color: #ffb0b0;
+  font: 12px/18px Consolas, monospace;
+  white-space: nowrap;
+  border: 1px solid rgba(255, 77, 77, 0.45);
+}

@@ -12,7 +12,7 @@
 use cloth::{ClothDiag, ClothSim, ClothState};
 use depen::{DepenDiag, LegCapDef, PushRec, SkirtRig, TriRef};
 use fak::FakState;
-use mat::{local_from_pose, mat4_mul, Mat16, IDENTITY};
+use mat::{local_from_pose, mat4_inverse, mat4_mul, Mat16, IDENTITY};
 use skin::{lbs_residual, skin_part, BoneMats, PartSkin};
 use wasm_bindgen::prelude::*;
 
@@ -33,17 +33,24 @@ struct AnchoredChain {
 struct AnchoredState {
     chains: Vec<AnchoredChain>,
     mats: BoneMats,
+    /// 增量锚定：帧 0 世界矩阵的逆（按骨索引；空 = 退回纯锚定）。
+    /// A_b(t) = 载体(t)·Tp⁻¹·M_bind(b)·(W₀(b)⁻¹·W_t(b))——基准贴 authored
+    /// 摆放、链自身的 FSKEL 动画以帧 0 骨姿态为原点叠加。配套链上
+    /// M_bind ≈ W₀，公式退化为纯 LBS；脱节链（SZ_38 披发/ qmw 错位裙）
+    /// 基准被拉回绑定摆放。
+    w0_inv: Vec<Mat16>,
 }
 
 impl AnchoredState {
     fn new() -> Self {
-        AnchoredState { chains: vec![], mats: vec![] }
+        AnchoredState { chains: vec![], mats: vec![], w0_inv: vec![] }
     }
 
     fn update(&mut self, world: &[f64]) {
         if self.chains.is_empty() || world.is_empty() {
             return;
         }
+        let incremental = !self.w0_inv.is_empty();
         for ch in &self.chains {
             let c = ch.carrier as usize;
             if world.len() < (c + 1) * 16 {
@@ -52,9 +59,20 @@ impl AnchoredState {
             let carrier: &[f64; 16] = world[c * 16..c * 16 + 16].try_into().unwrap();
             let carry = mat4_mul(carrier, &ch.tp_inv);
             for (b, bind) in &ch.binds {
-                let m = mat4_mul(&carry, bind);
-                if (*b as usize) < self.mats.len() {
-                    self.mats[*b as usize] = Some(m);
+                let bu = *b as usize;
+                let base = mat4_mul(&carry, bind);
+                let m = if incremental
+                    && bu < self.w0_inv.len()
+                    && world.len() >= (bu + 1) * 16
+                {
+                    let wt: &[f64; 16] = world[bu * 16..bu * 16 + 16].try_into().unwrap();
+                    let delta = mat4_mul(&self.w0_inv[bu], wt);
+                    mat4_mul(&base, &delta)
+                } else {
+                    base
+                };
+                if bu < self.mats.len() {
+                    self.mats[bu] = Some(m);
                 }
             }
         }
@@ -373,9 +391,26 @@ impl Gfm {
             }
             chains.push(AnchoredChain { carrier: *carrier, tp_inv: tp, binds });
         }
+        // 增量锚定基準：帧 0 世界矩阵（poses 已上传时计算；否则退回纯锚定）
+        let w0_inv = if let Some(p) = self.poses.as_mut() {
+            let w0 = p.compose_worlds(0, MirrorOverride::Stored).to_vec();
+            (0..bone_count as usize)
+                .map(|b| {
+                    if w0.len() >= (b + 1) * 16 {
+                        let m: &[f64; 16] = w0[b * 16..b * 16 + 16].try_into().unwrap();
+                        mat4_inverse(m).unwrap_or(IDENTITY)
+                    } else {
+                        IDENTITY
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        };
         self.anchored = AnchoredState {
             chains,
             mats: vec![None; bone_count as usize],
+            w0_inv,
         };
     }
 

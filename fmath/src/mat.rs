@@ -19,6 +19,39 @@ pub fn mat4_mul(a: &Mat16, b: &Mat16) -> Mat16 {
     out
 }
 
+/// 列主序 4×4 通用逆（余子式法；奇异返回 None）
+pub fn mat4_inverse(m: &Mat16) -> Option<Mat16> {
+    // 以行主序视角取元素：r 行 c 列 = m[c*4 + r]
+    let at = |r: usize, c: usize| m[c * 4 + r];
+    let mut inv = [[0.0f64; 4]; 4];
+    for r in 0..4 {
+        for cc in 0..4 {
+            // 3×3 子式（去掉 r 行 cc 列）
+            let rows: Vec<usize> = (0..4).filter(|x| *x != r).collect();
+            let cols: Vec<usize> = (0..4).filter(|x| *x != cc).collect();
+            let sub = |i: usize, j: usize| at(rows[i], cols[j]);
+            let det3 = sub(0, 0) * (sub(1, 1) * sub(2, 2) - sub(1, 2) * sub(2, 1))
+                - sub(0, 1) * (sub(1, 0) * sub(2, 2) - sub(1, 2) * sub(2, 0))
+                + sub(0, 2) * (sub(1, 0) * sub(2, 1) - sub(1, 1) * sub(2, 0));
+            inv[r][cc] = det3 * if (r + cc) % 2 == 0 { 1.0 } else { -1.0 };
+        }
+    }
+    // det 沿第 0 行展开 = Σ at(0,j)·C[0][j]（inv[i][j] 存的是余子式 C[i][j]）
+    let det = at(0, 0) * inv[0][0] + at(0, 1) * inv[0][1] + at(0, 2) * inv[0][2] + at(0, 3) * inv[0][3];
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let s = 1.0 / det;
+    let mut out = [0.0f64; 16];
+    for r in 0..4 {
+        for cc in 0..4 {
+            // inverse 元素 (r,cc) = C[cc][r]/det（伴随矩阵 = 余子式阵转置）
+            out[cc * 4 + r] = inv[cc][r] * s;
+        }
+    }
+    Some(out)
+}
+
 /// 3×3 行列式（行主序）
 fn mat3_det(m: &[f64; 9]) -> f64 {
     m[0] * (m[4] * m[8] - m[5] * m[7])
@@ -158,6 +191,31 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn mat4_inverse_roundtrip() {
+        // 平移×旋转矩阵的逆：M·M⁻¹ = I
+        let m = mat4_mul(
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 5.0, -3.0, 2.0, 1.0],
+            &[0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        );
+        let mi = mat4_inverse(&m).unwrap();
+        let prod = mat4_mul(&m, &mi);
+        for k in 0..16 {
+            let expect = IDENTITY[k];
+            assert!((prod[k] - expect).abs() < 1e-9, "prod[{k}]={}", prod[k]);
+        }
+        // 一般矩阵：M⁻¹⁻¹ = M
+        let g: Mat16 = [1.0, 2.0, 0.5, 0.0, 0.3, 1.0, -0.2, 0.0, 0.0, 0.4, 1.0, 0.0, 3.0, -1.0, 2.0, 1.0];
+        let gi = mat4_inverse(&g).unwrap();
+        let back = mat4_inverse(&gi).unwrap();
+        for k in 0..16 {
+            assert!((back[k] - g[k]).abs() < 1e-9);
+        }
+        // 奇异矩阵
+        let sing: Mat16 = [1.0; 16];
+        assert!(mat4_inverse(&sing).is_none());
+    }
+
     fn mat4_mul_identity() {
         let m = [
             1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0, 7.0, 8.0, 9.0, 0.0, 10.0, 11.0, 12.0, 1.0,

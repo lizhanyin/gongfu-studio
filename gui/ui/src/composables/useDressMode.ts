@@ -590,11 +590,21 @@ export function useDressMode(
     const path = equipPath.get("hat");
     if (path && equipOn.get("hat")) await addHat(path);
   });
+  // 偏移连击（步进按钮/逐键输入）做短去抖：长发合成件重建含体表外推较重
+  let hatOffsetTimer: ReturnType<typeof setTimeout> | undefined;
   watch(
     hatOffset,
     () => {
-      const path = equipPath.get("hat");
-      if (path) viewer.value?.setBoneAttachedOffset(path, hatOffset.value);
+      clearTimeout(hatOffsetTimer);
+      hatOffsetTimer = setTimeout(() => {
+        const path = equipPath.get("hat");
+        if (path)
+          viewer.value?.setBoneAttachedOffset(path, [
+            hatOffset.value[0],
+            hatOffset.value[1],
+            hatOffset.value[2],
+          ]);
+      }, 180);
     },
     { deep: true }
   );

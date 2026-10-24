@@ -166,6 +166,7 @@ target\release\gongfu-studio.exe
 ```
 run.bat                # 发布式：npm build 前端 → cargo build → 直跑 exe（嵌入 ui/dist）
 run-dev.bat            # 开发式：vite dev (HMR) + cargo build --no-default-features → 运行
+clean.bat / clean.sh   # 清理构建产物（target / ui/dist / src/wasm；--deps 连 node_modules 一起删）
 npm --prefix gui/ui install    # 首次
 npm --prefix gui/ui run tauri dev      # 开发运行（等价 run-dev.bat，由 tauri CLI 托管并监听 Rust 改动）
 npm --prefix gui/ui run tauri build    # 生成 NSIS 安装包
@@ -221,8 +222,36 @@ ViewerHost.vue 对 viewer.ts 做依赖级 accept，把存活实例的原型换�
 客户端对 FSM 帽子调 `SGAvatarAttachment::BindToTagNode("tag_Hat")`，引擎每帧
 `骨矩阵(tag) × 节点世界矩阵` 直接设为网格世界矩阵——无逐帽偏移、无去穿透，
 顶点原样渲染（Hat 目录 78 个 FSM 全为刚体，长发型下段与衣领相交属游戏原貌）。
+**骨骼点击拾取（2026-10-24）**：开骨架显示后点击骨线条/关节球——整段线条与关节
+高亮变色、浮标显示 `#序号 骨名`（随骨骼投影跟随），点空处清除；检查器新增
+「骨骼」折叠项列出全部骨名（支持过滤），列表点击与 3D 拾取双向联动高亮。
+
 查看器等效实现：`viewer.ts` 挂 tag 骨（零偏移 + 内旋 Ry(π) + 锚点补偿
 `TAG_MOUNT_OFFSET`，面板实测折算），无 tag 骨的骨架回落 Head01+固定偏移。
+
+**长发 FSM 帽自动绑骨（2026-10-24）**：部分套装的长发在帽槽是静态 `.FSM`
+（如旧包 FM38，492 顶点 Y 跨 87；引擎对 FSM 帽 = SGAvatarAttachment 刚挂，
+客户端仅 tag_* 五挂点——原版同样刚体穿模）。查看器对 Y 跨 >50 的 FSM 帽件
+自动转合成蒙皮件：顶点按 tag 挂接姿态入数据空间、**先对身体网格外推出
+1.5 单位间隙**（原厂姿态贴背/嵌背；体内点射线奇偶判定推出+邻接松弛防皱）、
+再最近分配到 头/颈骨+Bone* 发链骨（前二骨距离加权），走 LBS——近头随头、
+发束随链动画（舞蹈大幅摆动）。
+合成件 lp 按绑定帧生成、数据自洽，链诊断/锚定体系对其跳过（纯 LBS 即正确）。
+
+**时装长发链锚定（2026-10-24）**：整体时装（shizhuang，如套装38 披发）与发型类
+部件的 Bone* 链走**增量锚定**：`A_b(t) = 载体(t)·W₀(载)⁻¹·C·W_t(b)`（C = 链全部
+影响点 帧0 LBS→authored 的链级刚体修正，残差>8 回退纯 LBS）——基准贴 authored
+绑定价、链动画增量叠加。裙槽部件（Lower/Boot）保持纯 LBS 不变；错位链仍可经
+失配>25 门槛锚定（qmw 系）。背景：时装资产普遍对非绑定姿态导出（FK38 裙链帧0
+失配 12~17 与披发 12.6 同区间，数值不可分），裙的偏移在宽松裙容差内无害、长发
+贴体穿模，故按部件语义分流。
+
+装配层级（2026-10-24 IDA 定案）：一个 AvatarNode（.fskel + SkeletonAniCtrl，
+world 由游戏逻辑显式设定）下挂两类子节点——`SGSkinNode`（蒙皮件：身体/头/
+发/上衣/裤子等全部 .fskin，LBS 直接用父 AvatarNode 的骨矩阵，自身世界矩阵
+原样转发父节点）与 `SGAvatarAttachment`（刚体挂件：帽/武器/特效，上式直挂）。
+引擎无层级世界自动合成、无逐顶点去穿透；裤子等形变全部来自 FSKEL 烘焙 LBS
+（含镜像骨修正），裙摆-腿穿插在原版即存在。
 
 **动态加载问题与修复**（换装稳定性，两条）：
 
@@ -278,13 +307,18 @@ GLB 四元数/平移与源逐帧相等（0.0000°）。
      [magic][01][f32帧间隔][u32][NUL动作名][u32骨数] [0][-1][1][1]根记录头
      + 整棵骨骼树(链式序列化) 直至下一帧
 EOF  [magic][01][f32 1/30][u32 0]
-节点记录 [u32 id][u32 父id][u32 子数]:
-     子数=0: [T3][Qxyz]               — Qw=+0.0 时省略
-     子数≥1: [u32链子id][子数-1×附加子链根][T3][Q4][u8 00 可选]
-链间分隔符: [magic][01] / 裸 01 / f32 1.0 / 00
-坐标系 Y-up，骨骼世界矩阵 = 父 × T × R(Q)，30 FPS（帧数 = round(ActTime.csv毫秒×30/1000)，
+节点记录 [u32 id][u32 父id][u32 链子数][链子id×链子数][T3][Q4][u8 镜像标志]:
+     Q 恒 16B —— w=+0.0 时导出器存 4 字节 sentinel(0xB33BBD2E, 作 float ≈ -0.0002,
+     引擎原值使用; 旧解析误当 [magic] 分隔符, 净推进字节相同所以姿态一直正确);
+     镜像标志 1 = 引擎对该骨世界矩阵追加 Scale(-1,-1,-1)(IDA sub_1004C290 确证
+     = 引擎骨记录 +52; 旧解析把 00/01 当"可选终止符/裸 01 分隔符"吞掉)
+     girl.FSKEL 首帧镜像骨(跨动作文件稳定): tag_LWeapon/tag_LWrist、Bone37/33/43/
+     26/55 链根、右手指 Nub×5、左趾 Nub; tag_LWeapon 标志帧间翻转(持械/空手)
+残留链间分隔符: [magic][01] / 00
+坐标系 Y-up，骨骼世界矩阵 = 父 × T × R(Q) × S(镜像骨)，30 FPS（帧数 = round(ActTime.csv毫秒×30/1000)，
 与 ActTime.csv / girl.csv 完全对应）。AvatarGirl 骨架 = 3ds Max Biped（135 骨）+ Bone01-66
 裙摆物理骨 + tag_* 挂点；girl.FSKEL 为主库（1633 帧 = std/wlk/run ×9 武具变体 + ze09）。
+查看器镜像骨数据驱动（fskel.rs 解析标志位 → mirrorBones），残差推导仅作回退。
 ```
 
 ### FAK 怪物顶点动画（`gui/src/fak.rs`）
