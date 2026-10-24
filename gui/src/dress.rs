@@ -166,6 +166,17 @@ fn tex_stem_of(texture_path: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 材质/文件的游戏相对路径键：小写、\ 分隔、去扩展名（system\hat\mk38_3）。
+/// 材质路径自带目录信息，引擎按路径取贴图——跨目录同名 stem（Hat 与 Lower
+/// 各有 mk38_3）只按 stem 会解析到错误目录的副本
+fn tex_path_key(p: &str) -> String {
+    let norm = p.replace('/', "\\").to_lowercase();
+    match norm.rsplit_once('.') {
+        Some((stem, _)) => stem.to_string(),
+        None => norm,
+    }
+}
+
 /// act 目录的默认骨架选取见 fskel::default_fskel_of（与皮肤模式共用）
 
 /// 扫描装备/时装目录：逐文件解析统计与材质贴图。
@@ -174,6 +185,7 @@ fn scan_equip_dir(
     dir: &str,
     kind: &str,
     tex_index: &BTreeMap<String, String>,
+    path_index: &BTreeMap<String, String>,
 ) -> Vec<EquipItem> {
     let files = vfs::walk_files(dir, &[kind]);
     let mut items = Vec::new();
@@ -198,9 +210,16 @@ fn scan_equip_dir(
             )
         };
         let (gender, number) = parse_gender_number(&f.name);
+        // 路径优先：材质路径自带目录（system\hat\MK38_3.tga），跨目录同名 stem
+        // 只按 stem 会取错副本（男帽38 的 mk38_3 曾解析到 Lower\mk38_3.dds）
         let texture_files = tex_paths
             .iter()
-            .map(|p| tex_stem_of(p).and_then(|stem| tex_index.get(&stem).cloned()))
+            .map(|p| {
+                path_index
+                    .get(&tex_path_key(p))
+                    .cloned()
+                    .or_else(|| tex_stem_of(p).and_then(|stem| tex_index.get(&stem).cloned()))
+            })
             .collect();
         items.push(EquipItem {
             name: f.name.clone(),
@@ -225,12 +244,30 @@ fn scan_equip_dir(
 pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
     let root = find_character_root(input)?;
 
-    // 全根贴图索引：小写 stem → 路径（同 stem 取路径序首个）
+    // 全根贴图索引 ×2：stem（同名取路径序首个，兜底用）与游戏相对路径（精确，
+    // 含目录）。textures 列表保留每个文件一条，前端可做路径优先匹配
     let mut tex_index: BTreeMap<String, String> = BTreeMap::new();
+    let mut path_index: BTreeMap<String, String> = BTreeMap::new();
+    let mut tex_infos: Vec<fskin::TexInfo> = Vec::new();
     for t in vfs::walk_files(&root, &["dds", "tga", "png", "jpg", "bmp"]) {
-        if let Some(stem) = tex_stem_of(&t.name) {
-            tex_index.entry(stem).or_insert_with(|| t.path.clone());
-        }
+        let Some(stem) = tex_stem_of(&t.name) else {
+            continue;
+        };
+        let rel = t
+            .path
+            .strip_prefix(&root)
+            .map(|r| r.trim_start_matches(['\\', '/']))
+            .unwrap_or(&t.name);
+        path_index
+            .entry(tex_path_key(rel))
+            .or_insert_with(|| t.path.clone());
+        tex_index
+            .entry(stem.clone())
+            .or_insert_with(|| t.path.clone());
+        tex_infos.push(fskin::TexInfo {
+            stem,
+            path: t.path.clone(),
+        });
     }
 
     let mut bases = Vec::new();
@@ -262,7 +299,7 @@ pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
     for (dir_name, label, kind) in SLOT_DIRS {
         let dir = vfs::join_vpath(&root, dir_name);
         let items = if vfs::exists(&dir) {
-            scan_equip_dir(&dir, kind, &tex_index)
+            scan_equip_dir(&dir, kind, &tex_index, &path_index)
         } else {
             Vec::new()
         };
@@ -278,7 +315,7 @@ pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
     for dir_name in FASHION_DIRS {
         let dir = vfs::join_vpath(&root, dir_name);
         if vfs::exists(&dir) {
-            fashions.extend(scan_equip_dir(&dir, "fskin", &tex_index));
+            fashions.extend(scan_equip_dir(&dir, "fskin", &tex_index, &path_index));
         }
     }
 
@@ -294,10 +331,7 @@ pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
         bases,
         slots,
         fashions,
-        textures: tex_index
-            .into_iter()
-            .map(|(stem, path)| fskin::TexInfo { stem, path })
-            .collect(),
+        textures: tex_infos,
     })
 }
 

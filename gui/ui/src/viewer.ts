@@ -510,16 +510,17 @@ export class Viewer {
     this.camera.updateProjectionMatrix();
   }
 
-  getTexture(file: string, tex: TexData): THREE.DataTexture {
-    let t = this.texCache.get(file);
+  getTexture(file: string, tex: TexData, flipY = false): THREE.DataTexture {
+    const key = `${file}|${flipY ? "VF" : "N"}`;
+    let t = this.texCache.get(key);
     if (!t) {
       t = new THREE.DataTexture(
-        tex.rgba,
+        Viewer.dilateMaskPadding(tex.rgba, tex.width, tex.height),
         tex.width,
         tex.height,
         THREE.RGBAFormat
       );
-      t.flipY = false;
+      t.flipY = flipY;
       // 游戏引擎用重复寻址，手臂等条带 UV 环绕 u=0/1 接缝，必须 Repeat
       t.wrapS = THREE.RepeatWrapping;
       t.wrapT = THREE.RepeatWrapping;
@@ -527,9 +528,164 @@ export class Viewer {
       t.minFilter = THREE.LinearMipmapLinearFilter;
       t.generateMipmaps = true;
       t.needsUpdate = true;
-      this.texCache.set(file, t);
+      this.texCache.set(key, t);
     }
     return t;
+  }
+
+  /**
+   * 图集垫底色扩张（BFS 最近不透明邻色填充 alpha=0 区的 RGB）：mip 链生成时
+   * 透明垫底的 RGB=0 会被箱式滤波混进可见色——RGB 被稀释到≈0 而 alpha 仍
+   * 高于 alphaTest 阈值，渲染成纯黑刃片（FM38 装饰黑刃实测根因；mip0 逐
+   * 三角形采样 0 黑命中、禁 mip 后黑刃全消）。只改透明区 RGB，alpha 原样
+   * 保留，mip0 采样与 alphaTest 行为不变
+   */
+  private static dilateMaskPadding(
+    rgba: Uint8Array,
+    w: number,
+    h: number
+  ): Uint8Array {
+    const out = new Uint8Array(rgba);
+    const n = w * h;
+    const src = new Int32Array(n).fill(-1);
+    const q = new Int32Array(n);
+    let head = 0;
+    let tail = 0;
+    for (let i = 0; i < n; i++) {
+      if (out[i * 4 + 3] >= 40) {
+        src[i] = i;
+        q[tail++] = i;
+      }
+    }
+    while (head < tail) {
+      const i = q[head++];
+      const x = i % w;
+      const y = (i / w) | 0;
+      if (x > 0 && src[i - 1] < 0) {
+        src[i - 1] = src[i];
+        out.set(out.subarray(src[i] * 4, src[i] * 4 + 3), (i - 1) * 4);
+        q[tail++] = i - 1;
+      }
+      if (x < w - 1 && src[i + 1] < 0) {
+        src[i + 1] = src[i];
+        out.set(out.subarray(src[i] * 4, src[i] * 4 + 3), (i + 1) * 4);
+        q[tail++] = i + 1;
+      }
+      if (y > 0 && src[i - w] < 0) {
+        src[i - w] = src[i];
+        out.set(out.subarray(src[i] * 4, src[i] * 4 + 3), (i - w) * 4);
+        q[tail++] = i - w;
+      }
+      if (y < h - 1 && src[i + w] < 0) {
+        src[i + w] = src[i];
+        out.set(out.subarray(src[i] * 4, src[i] * 4 + 3), (i + w) * 4);
+        q[tail++] = i + w;
+      }
+    }
+    return out;
+  }
+
+  /** 材质 pre 三字节判翻转类：pre[2]≠0xFF（引擎挂 MMAlphaMask 的毛发类）→ 需要 UV 岛修复 */
+  private static texFlip(pre: number[] | undefined): boolean {
+    return !!pre && pre.length > 2 && pre[2] !== 0xff;
+  }
+
+  /**
+   * UV 岛修复（mask 类材质的图集行序混排，FM38 用户终裁）：只翻"恒等采样
+   * 命中 authored 不透明纯黑垫底（alpha≥200 且 RGB≈0，任何 alphaTest 裁不
+   * 掉）且翻转后命中减少"的连通簇——整簇 v→1-v。FM38 恰好只有 2×17 花件
+   * 簇（恒等落右上紫花+黑垫底=黑块来源，翻转→绿岛绿外瓣紫红花心的圆花）。
+   * 其余一切簇（绿羽扇宽簇按 authored 原样、金弧条带对、紫点簇、藏青底衬、
+   * 发帘）恒等即正确——花件豁免/绿/金/邻接/条带/总括翻转全部经用户逐轮
+   * 实拍否决撤除。
+   */
+  static repairMaskUvIslands(uv: Float32Array, tris: number[], tex: TexData): number {
+    const w = tex.width;
+    const h = tex.height;
+    const px = tex.rgba;
+    const texel = (u: number, v: number) => {
+      const x = ((Math.floor(u * w) % w) + w) % w;
+      const y = ((Math.floor(v * h) % h) + h) % h;
+      return (y * w + x) * 4;
+    };
+    const nbr = new Map<number, number[]>();
+    const push = (a: number, b: number) => {
+      const l = nbr.get(a);
+      if (l) l.push(b);
+      else nbr.set(a, [b]);
+    };
+    for (let t = 0; t + 2 < tris.length; t += 3) {
+      const a = tris[t], b = tris[t + 1], c = tris[t + 2];
+      push(a, b); push(a, c); push(b, a); push(b, c); push(c, a); push(c, b);
+    }
+    const seen = new Set<number>();
+    type Cl = { comp: number[]; idOp: number; idPurple: number; idGreen: number; flGreen: number; b0: number; b1: number };
+    const cls: Cl[] = [];
+    for (const seed of nbr.keys()) {
+      if (seen.has(seed)) continue;
+      const comp: number[] = [];
+      const q = [seed];
+      seen.add(seed);
+      while (q.length) {
+        const x = q.pop()!;
+        comp.push(x);
+        for (const y of nbr.get(x) ?? []) {
+          if (!seen.has(y)) {
+            seen.add(y);
+            q.push(y);
+          }
+        }
+      }
+      const cs = new Set(comp);
+      let idOp = 0, idPurple = 0, idGreen = 0, flGreen = 0, b0 = 0, b1 = 0;
+      for (let t = 0; t + 2 < tris.length; t += 3) {
+        if (!cs.has(tris[t])) continue;
+        const a = tris[t], b = tris[t + 1], c = tris[t + 2];
+        for (let k = 0; k <= 4; k++) {
+          for (let m = 0; m + k <= 4; m++) {
+            const q2 = 4 - k - m;
+            const uu = (k * uv[a * 2] + m * uv[b * 2] + q2 * uv[c * 2]) / 4;
+            const vv = (k * uv[a * 2 + 1] + m * uv[b * 2 + 1] + q2 * uv[c * 2 + 1]) / 4;
+            const o = texel(uu, vv);
+            if (px[o + 3] >= 150) {
+              idOp++;
+              const r = px[o], g = px[o + 1], b2 = px[o + 2];
+              if (r > 60 && b2 > 50 && g < r * 0.72 && g < b2 * 0.8) idPurple++;
+              if (g > r + 15 && g > b2 + 15) idGreen++;
+              if (px[o + 3] >= 200 && r + g + b2 < 30) b0++;
+            }
+            const of2 = texel(uu, 1 - vv);
+            if (px[of2 + 3] >= 150) {
+              const r = px[of2], g = px[of2 + 1], b2 = px[of2 + 2];
+              if (g > r + 15 && g > b2 + 15) flGreen++;
+              if (px[of2 + 3] >= 200 && r + g + b2 < 30) b1++;
+            }
+          }
+        }
+      }
+      cls.push({ comp, idOp, idPurple, idGreen, flGreen, b0, b1 });
+    }
+    let flippedVerts = 0;
+    for (const cl of cls) {
+      const wantFlip = cl.b0 > 0 && cl.b1 < cl.b0;
+      if (wantFlip) {
+        for (const i of cl.comp) uv[i * 2 + 1] = 1 - uv[i * 2 + 1];
+        flippedVerts += cl.comp.length;
+      }
+    }
+    return flippedVerts;
+  }
+
+  /** 按材质分组子网格三角形（材质 index 即下标），供 UV 岛修复逐材质喂图 */
+  private static trisByMaterial(model: FsmModel): Map<number, number[]> {
+    const byMat = new Map<number, number[]>();
+    for (const s of model.submeshes) {
+      const mi = Math.min(s.index, model.materials.length - 1);
+      const arr = byMat.get(mi) ?? [];
+      for (const t of s.triangles) arr.push(t);
+      byMat.set(mi, arr);
+    }
+    return byMat;
   }
 
   // ---------------- fmath wasm 桥 ----------------
@@ -737,11 +893,11 @@ export class Viewer {
       });
       const tex = texes[k] ?? null;
       const texFile = texFiles[k] ?? null;
+      const md = model.materials[k];
       if (tex && texFile) {
         mat.map = this.getTexture(texFile, tex);
         (mat as any).customColorAttribute = "color";
       }
-      const md = model.materials[k];
       if (md) {
         mat.color.setRGB(md.diffuse[0], md.diffuse[1], md.diffuse[2]);
         mat.emissive.setRGB(md.emissive[0], md.emissive[1], md.emissive[2]);
@@ -3764,6 +3920,13 @@ export class Viewer {
       uv[i * 2] = model.vertices[b + 6];
       uv[i * 2 + 1] = model.vertices[b + 7];
     }
+    // mask 类材质（pre[2]≠0xFF）的 UV 岛修复：图集行序混排（发帘恒等/装饰
+    // 翻转），黑垫底簇整簇 v→1-v（FM38 装饰：黑 4→0），干净簇不动
+    for (const [mi, tris] of Viewer.trisByMaterial(model)) {
+      const m = mats[mi];
+      if (!Viewer.texFlip(model.materials[mi]?.pre) || !m?.tex) continue;
+      Viewer.repairMaskUvIslands(uv, tris, m.tex);
+    }
 
     const meshes: THREE.Mesh[] = [];
     const geoms: THREE.BufferGeometry[] = [];
@@ -4325,6 +4488,19 @@ export class Viewer {
       return [local.x, local.y, local.z];
     };
 
+    // UV 岛修复（与 buildFsmMeshes 同口径）：mask 类图集行序混排按簇色判据
+    // 分流；合成发顶点取修复后的 UV
+    const uvFix = new Float32Array(model.vertexCount * 2);
+    for (let i = 0; i < model.vertexCount; i++) {
+      uvFix[i * 2] = model.vertices[i * 8 + 6];
+      uvFix[i * 2 + 1] = model.vertices[i * 8 + 7];
+    }
+    for (const [mi, tris] of Viewer.trisByMaterial(model)) {
+      const mt = mats[mi];
+      if (!Viewer.texFlip(model.materials[mi]?.pre) || !mt?.tex) continue;
+      Viewer.repairMaskUvIslands(uvFix, tris, mt.tex);
+    }
+
     const verts: Vertex[] = [];
     const v3 = new THREE.Vector3();
     const boneCount = new Map<number, number>();
@@ -4372,7 +4548,7 @@ export class Viewer {
       verts.push({
         pos: [pw.x, pw.y, pw.z],
         normal: [nrm.x, nrm.y, nrm.z],
-        uv: [model.vertices[i * 8 + 6], model.vertices[i * 8 + 7]],
+        uv: [uvFix[i * 2], uvFix[i * 2 + 1]],
         influences,
       });
     }

@@ -252,7 +252,8 @@ async function rerenderViewport() {
     act.currentAction = action;
     return;
   }
-  await scanWithSkeleton(skin.rootDir);
+  // 开箱默认不渲染模型：从未扫描装配过（modelSet 为 null）时保持空场景
+  if (skin.modelSet) await scanWithSkeleton(skin.rootDir);
 }
 
 // ---------------- 预览路由 ----------------
@@ -431,9 +432,7 @@ async function overlayAdd(e: ResEntry) {
 
 onMounted(async () => {
   // 视口实例与拾取接线由 ViewerHost 的 ready 回调负责
+  // 开箱只初始化资源树，不自动渲染模型；角色装扮/整体预览由用户在树上进入
   res.init();
-  // 开箱默认进入角色装扮（资源根含 AvatarGirl/装备目录时），失败回落整体预览
-  const ok = await dress.open(res.rootDir);
-  if (!ok) await scanWithSkeleton(skin.rootDir);
 });
 </script>

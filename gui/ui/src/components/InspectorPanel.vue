@@ -44,9 +44,9 @@
     </div>
     <div v-show="!inspectorCollapsed" class="inspector-body">
       <n-collapse
+        v-model:expanded-names="expandedNames"
         class="inspector-collapse"
         display-directive="show"
-        :default-expanded-names="['variants', 'tex', 'act', 'bones', 'fak', 'fsm', 'part']"
       >
         <n-collapse-item
           v-if="skin.modelSet?.groups.length"
@@ -100,7 +100,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import type { SkinStore } from "../composables/useSkinMode";
 import type { ActStore } from "../composables/useActMode";
 import type { FakStore } from "../composables/useFakMode";
@@ -137,6 +137,23 @@ const fashionBrowsing = computed(() => {
 });
 
 const inspectorCollapsed = ref(false);
+
+/** 首个可见分区（各项按文件类型 v-if，加载内容变了「第一项」随之变） */
+const firstSection = computed(() => {
+  if (props.skin.modelSet?.groups.length) return "variants";
+  if (props.skin.modelSet?.texSlots.length || props.skin.partTexVariants.length) return "tex";
+  if (props.act.actMeta || props.skin.hasParts) return "act";
+  if (props.act.actMeta) return "bones";
+  if (props.fak.fakModel) return "fak";
+  if (props.fsm.fsmModel) return "fsm";
+  if (props.skin.selectedPart) return "part";
+  return null;
+});
+/** 默认只展开第一项、其余收起；切换文件类型导致首项变化时重置回来 */
+const expandedNames = ref<string[]>([]);
+watch(firstSection, (n) => {
+  expandedNames.value = n ? [n] : [];
+}, { immediate: true });
 
 // ---------------- 宽度拖拽（左缘把手，提示浮标跟随光标，松手持久化） ----------------
 

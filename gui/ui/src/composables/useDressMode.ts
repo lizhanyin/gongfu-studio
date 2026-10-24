@@ -87,8 +87,19 @@ export function useDressMode(
     return d;
   }
 
-  /** 材质路径 → 贴图文件：全根索引优先，回落基础目录索引 */
+  /** 材质路径 → 贴图文件：路径优先（材质自带 system\hat 等目录信息，跨目录
+   *  同名 stem 只按 stem 会取错副本，如男帽38 的 mk38_3 曾解析到 Lower\mk38_3），
+   *  回落 stem 全根匹配，再回落基础目录索引 */
   function resolveTexPath(texturePath: string): string | null {
+    const norm = (p: string) =>
+      p.toLowerCase().replace(/\.[^.]*$/, "").replace(/[\\/]+/g, "\\");
+    const key = norm(texturePath);
+    if (key) {
+      const byPath = catalog.value?.textures.find((t) =>
+        norm(t.path).endsWith("\\" + key)
+      );
+      if (byPath) return byPath.path;
+    }
     const stem = stemOf(texturePath);
     if (!stem) return null;
     return (

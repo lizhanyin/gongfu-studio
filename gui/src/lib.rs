@@ -322,6 +322,22 @@ pub fn dds_decode_for_test(bytes: &[u8]) -> Result<Vec<u8>, String> {
     dds::decode_dds(bytes).map(|t| t.rgba)
 }
 
+/// 诊断探针（dress_scan 示例用）：装扮目录扫描结果
+pub fn dress_scan_for_test(root: &str) -> Result<dress::CharacterCatalog, String> {
+    dress::scan_character(root)
+}
+
+/// 诊断探针（fsm_mat 示例用）：FSM 材质贴图路径列表（index, path）
+pub fn fsm_materials_for_test(path: &str) -> Result<Vec<(u32, String)>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+    let m = fsm::parse_fsm(path, &bytes)?;
+    Ok(m
+        .materials
+        .iter()
+        .map(|md| (md.index, md.texture_path.clone()))
+        .collect())
+}
+
 /// 诊断探针（fsm_bbox 示例用）：FSM 顶点数/bbox/挂点概览
 pub fn fsm_probe_for_test(path: &str) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
