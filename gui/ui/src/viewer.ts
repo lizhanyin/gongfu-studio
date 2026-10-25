@@ -513,8 +513,23 @@ export class Viewer {
     this.camera.updateProjectionMatrix();
   }
 
-  getTexture(file: string, tex: TexData, flipY = false): THREE.DataTexture {
-    const key = `${file}|${flipY ? "VF" : "N"}`;
+  /** mask=true 为 mask 类材质（pre[2]≠0xFF，MMAlphaMask 毛发/帽图集）变体：
+   *  禁 mipmap——图集不透明暗色 art（发帘/藏青底衬）紧贴装饰岛，mip 混合把
+   *  邻岛暗色混进羽翼边缘成黑线（FM38 实测禁 mip 全消；dilateMaskPadding
+   *  只治 RGB=0 垫底，治不了暗色 art 渗色）。minFilter 退 Linear 无 mip，
+   *  远距轻微闪烁可接受 */
+  /** mask 类材质（pre[2]≠0xFF，引擎 MMAlphaMask）的 alpha-test 参照：
+   *  引擎 CreateObj 硬编码 ALPHAREF=0xF0(240/255)，随淡入透明度缩放——
+   *  高出切把边缘双线性混合的暗色像素全部裁掉（羽翼边黑线根因）。
+   *  非 mask 材质维持 0.1（须低于 highlight 压暗 opacity 0.28） */
+  private static readonly MASK_ALPHA_REF = 240 / 255;
+
+  private baseAlphaTestOf(mask: boolean): number {
+    return mask ? Viewer.MASK_ALPHA_REF : 0.1;
+  }
+
+  getTexture(file: string, tex: TexData, flipY = false, mask = false): THREE.DataTexture {
+    const key = `${file}|${flipY ? "VF" : "N"}${mask ? "|M" : ""}`;
     let t = this.texCache.get(key);
     if (!t) {
       t = new THREE.DataTexture(
@@ -528,8 +543,8 @@ export class Viewer {
       t.wrapS = THREE.RepeatWrapping;
       t.wrapT = THREE.RepeatWrapping;
       t.magFilter = THREE.LinearFilter;
-      t.minFilter = THREE.LinearMipmapLinearFilter;
-      t.generateMipmaps = true;
+      t.minFilter = mask ? THREE.LinearFilter : THREE.LinearMipmapLinearFilter;
+      t.generateMipmaps = !mask;
       t.needsUpdate = true;
       this.texCache.set(key, t);
     }
@@ -739,7 +754,7 @@ export class Viewer {
     model: FskinModel,
     texes: (TexData | null)[],
     texFiles: (string | null)[],
-    opts?: { uvSeamSplit?: boolean }
+    opts?: { uvSeamSplit?: boolean; texMask?: boolean[] }
   ) {
     if (this.parts.has(path)) this.removePart(path);
 
@@ -888,23 +903,27 @@ export class Viewer {
     geom.setAttribute("color2", new THREE.BufferAttribute(Float32Array.from(uvCol), 3));
     geom.setIndex(tri);
 
-    // 每子网格一个材质（护甲类多节网格各有贴图），groups 对应拼接区间
+    // 每子网格一个材质（护甲类多节网格各有贴图），groups 对应拼接区间。
+    // mask 类（FSM 毛发/帽图集）按引擎 ALPHAREF=240 裁切；基础阈值记入
+    // userData 供 highlight 压暗后还原
     const mats: THREE.MeshStandardMaterial[] = model.submeshes.map((_s, k) => {
+      const base = this.baseAlphaTestOf(!!opts?.texMask?.[k]);
       const mat = new THREE.MeshStandardMaterial({
         side: THREE.DoubleSide,
         roughness: 0.75,
         metalness: 0.0,
         vertexColors: false,
         // 贴图镂空区（发丝/帽檐 alpha=0）按引擎同款 alpha-test 裁掉，
-        // 否则 RGB=0 的透明 texel 渲染成黑块。阈值须低于 highlight 的
+        // 否则 RGB=0 的透明 texel 渲染成黑块。基础阈值须低于 highlight 的
         // 压暗 opacity 0.28，避免未选中件被整件裁没
-        alphaTest: 0.1,
+        alphaTest: base,
       });
+      mat.userData.baseAlphaTest = base;
       const tex = texes[k] ?? null;
       const texFile = texFiles[k] ?? null;
       const md = model.materials[k];
       if (tex && texFile) {
-        mat.map = this.getTexture(texFile, tex);
+        mat.map = this.getTexture(texFile, tex, false, opts?.texMask?.[k]);
         (mat as any).customColorAttribute = "color";
       }
       if (md) {
@@ -1015,13 +1034,18 @@ export class Viewer {
     for (const m of this.fsmMats) m.wireframe = on;
   }
 
-  /** 高亮选中部件：其余半透明（饰品叠层随之） */
+  /** 高亮选中部件：其余半透明（饰品叠层随之）。压暗 opacity 0.28 会把
+   *  alpha 拉到 mask 类阈值（240/255≈0.94）之下致整件被裁没，压暗期间
+   *  同步降到 0.05，恢复时还原各自基础阈值 */
   highlight(path: string | null) {
     for (const [k, p] of this.parts) {
       const sel = path === null || k === path;
       for (const m of p.mats) {
         m.transparent = !sel;
         m.opacity = sel ? 1.0 : 0.28;
+        m.alphaTest = sel
+          ? (m.userData.baseAlphaTest as number | undefined) ?? 0.1
+          : 0.05;
         m.depthWrite = true;
         m.needsUpdate = true;
       }
@@ -1088,7 +1112,9 @@ export class Viewer {
     const p = this.parts.get(path);
     const mat = p?.mats[matIndex];
     if (!mat) return;
-    mat.map = this.getTexture(texFile, tex);
+    // 换贴图保留原材质的 mask 态（禁 mip 变体），FSM 合成件刷新不回退渗色
+    const mask = mat.map ? mat.map.generateMipmaps === false : false;
+    mat.map = this.getTexture(texFile, tex, false, mask);
     mat.needsUpdate = true;
   }
 
@@ -3963,21 +3989,26 @@ export class Viewer {
       // 材质按记录自带序号（c30 两节共用材质 0；序号即材质下标）
       const matIdx = Math.min(s.index, model.materials.length - 1);
       const fm = model.materials[matIdx];
+      const mask = Viewer.texFlip(fm?.pre);
+      const base = this.baseAlphaTestOf(mask);
       const mat = new THREE.MeshStandardMaterial({
         side: THREE.DoubleSide,
         roughness: 0.75,
         metalness: 0.0,
         // 帽/长发 FSM 贴图带 alpha 镂空（发帘边缘、帽檐），透明 texel 需
-        // 裁掉——引擎按 alpha-test 处理，RGB=0 的镂空区不透明渲染即黑块
-        alphaTest: 0.1,
+        // 裁掉——mask 类按引擎 MMAlphaMask ALPHAREF=240 高出切（边缘
+        // 混合暗像素一并裁掉），普通类 0.1 兜底
+        alphaTest: base,
       });
+      mat.userData.baseAlphaTest = base;
       if (fm) {
         mat.color.setRGB(fm.diffuse[0], fm.diffuse[1], fm.diffuse[2]);
         mat.emissive.setRGB(fm.emissive[0], fm.emissive[1], fm.emissive[2]);
         mat.roughness = Math.max(0.05, Math.min(1, 1 - fm.specPower / 60));
       }
       const m = mats[matIdx];
-      if (m?.tex && m.file) mat.map = this.getTexture(m.file, m.tex);
+      if (m?.tex && m.file)
+        mat.map = this.getTexture(m.file, m.tex, false, Viewer.texFlip(fm?.pre));
       meshes.push(new THREE.Mesh(geom, mat));
       geoms.push(geom);
       matsOut.push(mat);
@@ -4528,6 +4559,7 @@ export class Viewer {
     );
     this.addPart(path, synth.model, synth.texes, synth.texFiles, {
       uvSeamSplit: false, // FSM 图集无平铺接缝，拆分会误改 authored 大跨度采样弧
+      texMask: synth.texMask, // mask 类图集禁 mip，羽翼边缘暗色渗色
     });
     const part = this.parts.get(path);
     if (part) part.syntheticHair = true;
@@ -4555,7 +4587,12 @@ export class Viewer {
     const { model, mats, offset, boneName } = e;
     const bone = this.resolveMountBone(boneName);
     e.bone = bone;
-    let synth: { model: FskinModel; texes: (TexData | null)[]; texFiles: (string | null)[] };
+    let synth: {
+      model: FskinModel;
+      texes: (TexData | null)[];
+      texFiles: (string | null)[];
+      texMask: boolean[];
+    };
     if (bone && this.bindWorldMats.length) {
       const idx = this.skelBones.indexOf(bone);
       const { mount, origin } = this.mountOf(bone, offset);
@@ -4571,6 +4608,7 @@ export class Viewer {
     }
     this.addPart(path, synth.model, synth.texes, synth.texFiles, {
       uvSeamSplit: false, // FSM 图集无平铺接缝，拆分会误改 authored 大跨度采样弧
+      texMask: synth.texMask, // mask 类图集禁 mip，羽翼边缘暗色渗色
     });
     const part = this.parts.get(path);
     if (part) part.syntheticMount = true;
@@ -4597,6 +4635,8 @@ export class Viewer {
     model: FskinModel;
     texes: (TexData | null)[];
     texFiles: (string | null)[];
+    /** 每子网格材质的 mask 类标记（pre[2]≠0xFF）：纹理禁 mip，防暗色邻岛渗色 */
+    texMask: boolean[];
   } {
     const inv = new THREE.Matrix4();
     const lpOf = (b: number, pw: THREE.Vector3): number[] => {
@@ -4673,6 +4713,9 @@ export class Viewer {
       },
       texes: model.submeshes.map((sm) => mats[matIdxOf(sm)]?.tex ?? null),
       texFiles: model.submeshes.map((sm) => mats[matIdxOf(sm)]?.file ?? null),
+      texMask: model.submeshes.map((sm) =>
+        Viewer.texFlip(model.materials[matIdxOf(sm)]?.pre)
+      ),
     };
   }
 
