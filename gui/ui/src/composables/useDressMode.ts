@@ -6,7 +6,7 @@ import type {
   FskinModel,
   FsmModel,
 } from "../types";
-import { texDataFromDto, b64ToBytes, decodeTga } from "../tex";
+import { loadTexData } from "../tex";
 import type { TexData, Viewer } from "../viewer";
 import type { SkinStore } from "./useSkinMode";
 import type { ActStore } from "./useActMode";
@@ -159,13 +159,7 @@ export function useDressMode(
     if (texCache.has(file)) return texCache.get(file) ?? null;
     let d: TexData | null = null;
     try {
-      if (/\.dds$/i.test(file)) {
-        d = texDataFromDto(await api.loadTexture(file));
-      } else if (/\.tga$/i.test(file)) {
-        d = decodeTga(b64ToBytes(await api.readFileB64(file)));
-      } else {
-        message.warning(`暂不支持解码该格式贴图: ${shortName(file)}`);
-      }
+      d = await loadTexData(file);
     } catch (e) {
       message.error(`纹理解码失败 ${shortName(file)}: ${e}`);
     }

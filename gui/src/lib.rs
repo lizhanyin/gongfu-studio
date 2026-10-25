@@ -336,6 +336,39 @@ pub fn dress_scan_for_test(root: &str) -> Result<dress::CharacterCatalog, String
     dress::scan_character(root, None, None)
 }
 
+/// 诊断探针（npc_tex_probe 示例用）：vfs 路径下全部 FAK 的材质贴图路径
+/// （模型路径 → 各材质贴图引用）
+pub fn npc_fak_materials_for_test(root: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut out = Vec::new();
+    for f in vfs::walk_files(root, &["fak"]) {
+        let Ok(bytes) = vfs::read_file(&f.path) else {
+            continue;
+        };
+        let Ok(m) = fak::parse_fak(&f.path, &bytes) else {
+            continue;
+        };
+        out.push((
+            f.path,
+            m.materials.iter().map(|x| x.texture_path.clone()).collect(),
+        ));
+    }
+    Ok(out)
+}
+
+/// 诊断探针（npc_tex_probe 示例用）：vfs 目录树贴图/模型文件列举
+pub fn vfs_walk_for_test(root: &str, exts: &[&str]) -> Vec<(String, String)> {
+    vfs::walk_files(root, exts)
+        .into_iter()
+        .map(|e| (e.path, e.name))
+        .collect()
+}
+
+/// 诊断探针（npc_tex_probe 示例用）：vfs 读取（cpk: 寻址含内），
+/// 供验证前端祖先拼接候选路径能否命中
+pub fn vfs_read_for_test(vpath: &str) -> Result<Vec<u8>, String> {
+    vfs::read_file(vpath)
+}
+
 /// 诊断探针（fsm_mat 示例用）：FSM 材质贴图路径列表（index, path）
 pub fn fsm_materials_for_test(path: &str) -> Result<Vec<(u32, String)>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;

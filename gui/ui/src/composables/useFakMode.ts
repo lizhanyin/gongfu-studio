@@ -1,13 +1,11 @@
 import { computed, onMounted, onUnmounted, reactive, ref, type ShallowRef } from "vue";
 import { api } from "../api";
-import type { FakModel, ResEntry } from "../types";
-import { texDataFromDto } from "../tex";
+import type { FakModel } from "../types";
+import { resolveModelTextures } from "../tex";
 import type { TexData, Viewer } from "../viewer";
 import { message } from "../message";
 import { shortName } from "../utils";
-
-/** 同目录内可作贴图的扩展名 */
-const TEX_KINDS = /^(dds|tga|png|jpg|bmp)$/;
+import { useTexPanelState } from "./useTexPanel";
 
 /**
  * FAK 顶点动画：加载/播放（rAF 按每帧自身时长推进）、动作分段切换、贴图解析。
@@ -24,6 +22,11 @@ export function useFakMode(viewer: ShallowRef<Viewer | null>) {
   const texCache = reactive(new Map<string, TexData | null>());
   let playRaf = 0;
   let lastTs = 0;
+
+  /** 检查器贴图面板：绑定清单 / 同目录可选 / 预览 / 热替换（FAK/FSM 共用） */
+  const texPanel = useTexPanelState(texCache, (mi, f, t) =>
+    viewer.value?.setFakTexture(mi, f, t)
+  );
 
   const currentActionInfo = computed(
     () => fakModel.value?.actions[currentAction.value] ?? null
@@ -48,39 +51,14 @@ export function useFakMode(viewer: ShallowRef<Viewer | null>) {
     return sum > 0 ? (t - f) / sum : 30;
   });
 
-  /** 按材质路径 stem 在 FAK 同目录解析贴图（g080.dds / g080+.dds 等） */
-  async function resolveMaterials(model: FakModel): Promise<{ tex: TexData | null; file: string | null }[]> {
-    const dir = model.path.replace(/[\\/][^\\/]*$/, "");
-    let entries: ResEntry[] = [];
-    try {
-      entries = await api.listResDir(dir);
-    } catch {
-      // 目录列举失败仅意味着无贴图
-    }
-    const out: { tex: TexData | null; file: string | null }[] = [];
-    for (const mat of model.materials) {
-      const stem = (mat.texturePath.split(/[\\/]/).pop() ?? "")
-        .replace(/\.[^.]*$/, "")
-        .toLowerCase();
-      const entry = entries.find(
-        (e) =>
-          TEX_KINDS.test(e.kind) &&
-          e.name.replace(/\.[^.]*$/, "").toLowerCase() === stem
-      );
-      let tex: TexData | null = null;
-      const file = entry?.path ?? null;
-      if (file && !texCache.has(file)) {
-        try {
-          texCache.set(file, texDataFromDto(await api.loadTexture(file)));
-        } catch (e) {
-          message.error(`纹理解码失败 ${shortName(file)}: ${e}`);
-          texCache.set(file, null);
-        }
-      }
-      if (file) tex = texCache.get(file) ?? null;
-      out.push({ tex, file });
-    }
-    return out;
+  /** 材质贴图解析共用：路径优先（引用自带 system\npc\… 目录）+ 同目录 stem 回落 */
+  function resolveMaterials(model: FakModel) {
+    return resolveModelTextures(
+      model.path,
+      model.materials.map((m) => m.texturePath),
+      texCache,
+      (file, e) => message.error(`纹理解码失败 ${shortName(file)}: ${e}`)
+    );
   }
 
   async function openFakFile(path: string) {
@@ -92,6 +70,8 @@ export function useFakMode(viewer: ShallowRef<Viewer | null>) {
       currentAction.value = 0;
       playTime.value = 0;
       const mats = await resolveMaterials(model);
+      texPanel.matFiles.value = mats.map((s) => s.file);
+      texPanel.loadDirOptions(model.path);
       viewer.value?.setFak(model, mats);
       playing.value = true;
       viewer.value?.frameAll();
@@ -105,6 +85,8 @@ export function useFakMode(viewer: ShallowRef<Viewer | null>) {
   function closeFak() {
     playing.value = false;
     fakModel.value = null;
+    texPanel.matFiles.value = [];
+    texPanel.dirTexFiles.value = [];
     viewer.value?.clearFak();
   }
 
@@ -168,6 +150,7 @@ export function useFakMode(viewer: ShallowRef<Viewer | null>) {
     closeFak,
     selectAction,
     scrub,
+    texPanel,
   });
 }
 

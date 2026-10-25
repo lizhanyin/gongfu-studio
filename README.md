@@ -151,7 +151,8 @@ MD5 校验跳过空文件（原工具对空内容记录的是打包机磁盘路�
   - 文件：按当前顶点重算包围盒；
 - **保存**：序列化器对全部 30 个 fskin 做过字节级往返测试（解析→序列化→与原文件逐字节相同），
   未修改字段（哈希、保留区、尾部填充）原样写回。
-- **导出**：当前可见部件合并导出为 OBJ + MTL，纹理一并拷贝。
+- **导出**：当前可见部件合并导出为 OBJ + MTL，纹理一并拷贝；蒙皮网格 + 动作一次
+  带走的 glTF 全量导出已定案可行性，见下文「glTF 全量导出可行性」节。
 
 ### 运行
 
@@ -320,6 +321,75 @@ EOF  [magic][01][f32 1/30][u32 0]
 裙摆物理骨 + tag_* 挂点；girl.FSKEL 为主库（1633 帧 = std/wlk/run ×9 武具变体 + ze09）。
 查看器镜像骨数据驱动（fskel.rs 解析标志位 → mirrorBones），残差推导仅作回退。
 ```
+
+### glTF 全量导出可行性（蒙皮网格 + 动作，2026-10-26 定案，未实施）
+
+现状两条导出路线各自缺一半：OBJ（`gui/src/obj.rs`）只有静态网格——合并导出对
+每部件仅取首材质槽，MTL 无 alphaTest 等价物，镂空材质在编辑器里糊成实心；
+FSKEL 的 GLB 导出（`fskel.rs export_glb`）只有骨架节点动画，不含皮肤/网格。
+要把「网格 + 蒙皮 + 材质 + 贴图 + 动作」一次带进 Blender / three.js，glTF 2.0
+是最贴合的目标格式——逐项映射基本直接，缺的只是写出器。
+
+映射关系：
+
+| 游戏数据 | glTF 对应 | 匹配度 |
+|---|---|---|
+| fskin 顶点 pos/normal/uv | POSITION / NORMAL / TEXCOORD_0 | 直接 |
+| FSKEL 骨树（局部 T×R，父乘合成，Y-up） | nodes 层级 + TRS（glTF 同 Y-up、同序局部合成） | 直接 |
+| FSKEL 动作分段 × 30FPS | 多个命名 animation，步长 1/30s（export_glb 已实现此半） | 直接 |
+| 镜像骨 Scale(-1,-1,-1) | node.scale=(-1,-1,-1)；逐帧翻转的（tag_LWeapon 持械/空手）进动画 scale 通道 | 可表达 |
+| mask 类材质 alphaTest（查看器口径 0.1） | `alphaMode:"MASK"` + `alphaCutoff:0.1` | 精确对应 |
+| 多子网格多材质 | 每 submesh 一个 primitive、各配材质 | 优于 OBJ 合并导出（首槽问题的根治） |
+| tag_Hat / tag_Weapon 挂点骨 | 节点树上的普通空节点，帽/武器可直接挂子节点 | 自然保留 |
+| DDS 贴图 | 核心规范仅 PNG/JPG；`dds.rs` 已解 DXT1/3/5→RGBA8，补 PNG 编码即可 | 半成品 |
+
+两个必须处理的技术点：
+
+1. **蒙皮口径差异**：引擎每顶点存变长 influences，每个影响自带
+   `(bone_index, weight, bone_local_pos)`（F3D 确证 Σ w·M·boneLocalPos）；
+   glTF 是共享一个 POSITION + 每关节 inverseBindMatrices。两者在
+   `bone_local_pos = 逆(绑定姿态骨世界矩阵) × pos` 时严格等价——单影响（刚性）
+   顶点必然精确；混合顶点用 fskin.rs 现成的残差分桶（exact/approx）验证等价性，
+   不等价的个别顶点取近似 IBM，代价为亚毫米级偏移。
+2. **影响数截断**：glTF 常规蒙皮通道每顶点 4 影响（JOINTS_0/WEIGHTS_0），引擎
+   为变长。统计全量 fskin 的 influences 上限，>4 的顶点取权重前四归一化；角色
+   资产预期 ≤4，基本无损。
+
+近似项与风险：固定管线材质→PBR metallic-roughness 只能近似（diffuse→
+baseColorTexture 直接；高光强度 Ns→roughness 经验映射；ambient 丢失）；负
+scale 骨骼在个别 DCC 里可能翻背面（Blender 无碍）；FAK 逐帧顶点快照若要带
+动画须走 morph target（文件显著变大）或只导首帧静态网格。
+
+实施判断：数据链路全部现成（fskel/fskin 解析、蒙皮矩阵计算、DDS 解码，GLB
+容器与动画通道写法已在 export_glb 验证过），剩余工作 = 新增 `gui/src/gltf.rs`
+（网格 primitive、skin 的 joints/weights/IBM、材质含 MASK、PNG 编码），量级与
+obj.rs 相当。Blender 官方 glTF 插件对蒙皮 + 多动画导入成熟。
+
+#### 装备部位拆分 vs「完整模型」（2026-10-26 架构对照定案）
+
+现代游戏并未淘汰部位拆分——装备显示在 UE5 里本质仍是拆件组合：一个
+`USkeleton` + 每槽位一个共享骨架的 `SkeletalMesh`，从属组件用 Copy Pose from
+Mesh 复制主网格姿态；硬挂件（武器等）走 Socket（选骨 + 相对变换）；时装遮体
+用 Section 显隐 / morph 收缩。「一张完整模型装下所有装备」在商业游戏里不存
+在：男女 × 套装号 × 8 槽是组合爆炸，拆件 = 每件资产只存一份、运行时组合。
+
+本作架构与 UE5 概念一一对应（部位拆分是换装系统在任何引擎的唯一可行解）：
+
+| 本作（vEngine） | UE5 等价物 | glTF 表达 |
+|---|---|---|
+| AvatarNode（FSKEL 骨架驱动） | USkeleton + 主 SkeletalMeshComponent | nodes 骨树 + skin |
+| SGSkinNode 共用父节点骨矩阵的 fskin | 从属 SkeletalMeshComponent + Copy Pose | 共用同一 skin 的多个 mesh |
+| SGAvatarAttachment 刚挂 tag_Hat | Attach to Socket | 普通子节点挂网格 |
+| 时装隐藏基础头/身体 | Section Hide / morph 收缩 | 节点显隐 |
+| FSKEL 烘焙布料回放 | Chaos Cloth 实时布料 | 无（动画通道近似） |
+
+glTF 单文件可装完整人物（一个骨架 + N 个部件 mesh 各带多材质 primitive +
+全部动作 + 贴图），切装备 = 显隐对应 mesh 节点——正是上节导出方案的自然形
+态。glTF 没有的：槽位语义、Socket 标准、布料/物理、LOD——装备组合逻辑永远
+留在引擎侧。UE5 经 Interchange/glTF 导入器消费到**资产层**（蒙皮/动画/
+morph 支持，PBR 材质映射良好），装配仍是引擎内蓝图/组件逻辑；Merge Actors
+合并整网格是发布期优化而非创作形态。与 UE5 的差距不在拆分架构，在配套：
+重定向 / 实时布料 / LOD / Nanite / 形变器，对应本作只有 FSKEL 烘焙回放。
 
 ### FAK 怪物顶点动画（`gui/src/fak.rs`）
 

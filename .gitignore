@@ -1,3 +1,5 @@
+#
+.spec-workflow
 # Node / Vite（gui/ui）
 gui/ui/node_modules/
 gui/ui/dist/

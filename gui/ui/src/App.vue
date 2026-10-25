@@ -200,6 +200,8 @@ const res = useResourceTree();
 ;(window as unknown as {
   __e2e?: {
     openScene(root: string, suitNo: number, action: string): Promise<string>;
+    openModel(path: string): Promise<string>;
+    setModelTexture(kind: "fak" | "fsm", matIdx: number, file: string): Promise<string>;
   };
 }).__e2e = {
   async openScene(root, suitNo, action) {
@@ -214,6 +216,21 @@ const res = useResourceTree();
     const i = names.indexOf(action);
     if (i >= 0) act.selectAction(i);
     return `ok actions=${names.length} picked=${names[i] ?? "?"}`;
+  },
+  /** 单模型预览（fak/fsm/fskin）：走与网格点击同一条路由，供贴图链路 CDP 验证 */
+  async openModel(path) {
+    const kind = path.split(".").pop()?.toLowerCase();
+    if (kind === "fak") await openFakPreview(path);
+    else if (kind === "fsm") await openFsmPreview(path);
+    else return `unsupported ${kind}`;
+    await new Promise((r) => setTimeout(r, 800));
+    return `ok ${path.split(/[\\/]/).pop()}`;
+  },
+  /** 检查器换图（真实链路：解码 + 热替换 + 面板状态），供 CDP 验证 */
+  async setModelTexture(kind, matIdx, file) {
+    const store = kind === "fak" ? fak : fsm;
+    await store.texPanel.setTexture(matIdx, file);
+    return `ok mat${matIdx} -> ${file.split(/[\\/]/).pop()}`;
   },
 };
 

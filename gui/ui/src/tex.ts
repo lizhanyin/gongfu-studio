@@ -1,3 +1,4 @@
+import { api } from "./api";
 import type { TexData } from "./viewer";
 
 // 从 viewer.ts 剥出的纹理解码 helper：App 与 3 个模式 composable 需要运行时引用它。
@@ -36,6 +37,144 @@ export function imageUrlFromB64(
     img.onerror = () => reject(new Error(`webview 无法解码 .${ext} 图片`));
     img.src = url;
   });
+}
+
+/**
+ * 按扩展名加载贴图为 RGBA：DDS 走 Rust 解码，TGA 前端解，其余不支持。
+ * 各模式（皮肤/FAK/FSM/装扮）的材质贴图加载统一走此口径——
+ * 曾有 FAK/FSM 模式把 .tga 也交给 Rust DDS 解码导致贴图全黑/缺失
+ * （system.cpk 的 NPC 模型材质引用 813 条为 .tga）。
+ */
+export async function loadTexData(file: string): Promise<TexData> {
+  if (/\.dds$/i.test(file)) {
+    return texDataFromDto(await api.loadTexture(file));
+  }
+  if (/\.tga$/i.test(file)) {
+    return decodeTga(b64ToBytes(await api.readFileB64(file)));
+  }
+  const name = file.split(/[\\/]/).pop() ?? file;
+  throw new Error(`暂不支持解码该格式贴图: ${name}`);
+}
+
+/** 同目录内可作贴图的扩展名（目录列举条目按 kind 过滤） */
+export const TEX_KINDS = /^(dds|tga|png|jpg|bmp)$/;
+
+/** TexData → canvas dataURL（检查器贴图预览缩略图用） */
+export function texCanvasUrl(d: TexData): string {
+  const cv = document.createElement("canvas");
+  cv.width = d.width;
+  cv.height = d.height;
+  const ctx = cv.getContext("2d")!;
+  const img = ctx.createImageData(d.width, d.height);
+  img.data.set(d.rgba);
+  ctx.putImageData(img, 0, 0);
+  return cv.toDataURL();
+}
+
+/** 路径的祖先目录序列（含自身目录）：a\b\c.FAK → [a\b, a] */
+function ancestorsOf(path: string): string[] {
+  const out: string[] = [];
+  let cur = path.replace(/[\\/][^\\/]*$/, "");
+  while (cur && !out.includes(cur)) {
+    out.push(cur);
+    const up = cur.replace(/[\\/][^\\/]*$/, "");
+    if (up === cur) break;
+    cur = up;
+  }
+  return out;
+}
+
+export type ModelTexSlot = { tex: TexData | null; file: string | null };
+
+/**
+ * FAK/FSM 单模型材质贴图解析（FAK 与 FSM 模式共用，与装扮模式同「路径优先」口径）：
+ * 1. 材质引用自带目录（system\npc\N302_3.tga）时按模型路径祖先逐级拼接试读
+ *    （CPK 内即 包根+引用 直达；vfs 查找大小写不敏感）；
+ * 2. 回落 FAK 同目录 stem 匹配（引用 J01-S01.tga → 同目录 j01-s01.dds）。
+ * 解码失败经 onDecodeError 回调上报；找不到贴图的槽位静默置 null（维持原口径）。
+ */
+export async function resolveModelTextures(
+  modelPath: string,
+  refs: string[],
+  texCache: Map<string, TexData | null>,
+  onDecodeError?: (file: string, e: unknown) => void,
+): Promise<ModelTexSlot[]> {
+  // 同目录列举一次；祖先路径候选失败才需要它（延迟到首次未命中再取）
+  let sameDirEntries: { kind: string; name: string; path: string }[] | null = null;
+  const sameDir = async () => {
+    if (!sameDirEntries) {
+      try {
+        sameDirEntries = await api.listResDir(
+          modelPath.replace(/[\\/][^\\/]*$/, "")
+        );
+      } catch {
+        sameDirEntries = [];
+      }
+    }
+    return sameDirEntries;
+  };
+
+  const memo = new Map<string, ModelTexSlot>();
+  const out: ModelTexSlot[] = [];
+  for (const ref of refs) {
+    const cached = memo.get(ref);
+    if (cached) {
+      out.push(cached);
+      continue;
+    }
+    let slot: ModelTexSlot = { tex: null, file: null };
+
+    // 1. 路径优先：引用带目录部分才有意义（裸文件名拼祖先 = 同目录全扫，无增益）
+    if (ref && /[\\/]/.test(ref)) {
+      const norm = ref.replace(/[\\/]+/g, "\\");
+      for (const anc of ancestorsOf(modelPath)) {
+        const candidate = `${anc}\\${norm}`;
+        if (texCache.has(candidate)) {
+          const tex = texCache.get(candidate) ?? null;
+          if (tex) {
+            slot = { tex, file: candidate };
+            break;
+          }
+          continue; // 该候选曾解码失败，试下一个祖先
+        }
+        try {
+          const tex = await loadTexData(candidate);
+          texCache.set(candidate, tex);
+          slot = { tex, file: candidate };
+          break;
+        } catch {
+          // 路径不存在（vfs 快速失败）或解码失败：继续试下一祖先
+        }
+      }
+    }
+
+    // 2. 同目录 stem 匹配
+    if (!slot.tex && ref) {
+      const stem = (ref.split(/[\\/]/).pop() ?? "")
+        .replace(/\.[^.]*$/, "")
+        .toLowerCase();
+      const entry = (await sameDir()).find(
+        (e) =>
+          TEX_KINDS.test(e.kind) &&
+          e.name.replace(/\.[^.]*$/, "").toLowerCase() === stem
+      );
+      if (entry) {
+        if (!texCache.has(entry.path)) {
+          try {
+            texCache.set(entry.path, await loadTexData(entry.path));
+          } catch (e) {
+            onDecodeError?.(entry.path, e);
+            texCache.set(entry.path, null);
+          }
+        }
+        slot = { tex: texCache.get(entry.path) ?? null, file: entry.path };
+      }
+    }
+
+    memo.set(ref, slot);
+    out.push(slot);
+  }
+  return out;
 }
 
 /**

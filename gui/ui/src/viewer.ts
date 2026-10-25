@@ -361,14 +361,19 @@ export class Viewer {
   private fakMeshes: THREE.Mesh[] = [];
   private fakGeoms: THREE.BufferGeometry[] = [];
   private fakMats: THREE.MeshStandardMaterial[] = [];
+  /** fakMats 同位：各子网格引用的材质序号（多节可共用同一材质） */
+  private fakMatIdx: number[] = [];
   /** 所有子网格共享的顶点属性（位置/法线逐帧更新，UV 恒定） */
   private fakPos: THREE.BufferAttribute | null = null;
   private fakNrm: THREE.BufferAttribute | null = null;
 
   // ---- FSM 静态武器网格 ----
+  private fsmModel: FsmModel | null = null;
   private fsmMeshes: THREE.Mesh[] = [];
   private fsmGeoms: THREE.BufferGeometry[] = [];
   private fsmMats: THREE.MeshStandardMaterial[] = [];
+  /** fsmMats 同位：各子网格引用的材质序号 */
+  private fsmMatIdx: number[] = [];
   /** 挂点标记（小球），mesh/材质与 fsmMeshes 分开管理 */
   private fsmDummyGroup: THREE.Group | null = null;
   private fsmDummyGeoms: THREE.SphereGeometry[] = [];
@@ -3874,8 +3879,20 @@ export class Viewer {
       this.fakMeshes.push(mesh);
       this.fakGeoms.push(geom);
       this.fakMats.push(mat);
+      this.fakMatIdx.push(matIdx);
     });
     this.applyFakFrame(0, 0, 0);
+  }
+
+  /** FAK 材质贴图热替换（检查器换图）：按材质序号更新全部引用该材质的子网格 */
+  setFakTexture(matIdx: number, file: string, tex: TexData) {
+    const fm = this.fakModel?.materials[matIdx];
+    const mask = Viewer.texFlip(fm?.pre);
+    for (let i = 0; i < this.fakMats.length; i++) {
+      if (this.fakMatIdx[i] !== matIdx) continue;
+      this.fakMats[i].map = this.getTexture(file, tex, false, mask);
+      this.fakMats[i].needsUpdate = true;
+    }
   }
 
   /** 应用第 i0 帧；给出 i1/alpha 时做位置/法线 lerp 平滑插值（法线重归一化） */
@@ -3935,6 +3952,7 @@ export class Viewer {
     this.fakMeshes = [];
     this.fakGeoms = [];
     this.fakMats = [];
+    this.fakMatIdx = [];
     this.fakPos = null;
     this.fakNrm = null;
     this.fakModel = null;
@@ -3957,6 +3975,8 @@ export class Viewer {
     meshes: THREE.Mesh[];
     geoms: THREE.BufferGeometry[];
     matsOut: THREE.MeshStandardMaterial[];
+    /** matsOut 同位：各子网格引用的材质序号 */
+    matIdxOut: number[];
   } {
     const n = model.vertexCount;
     const pos = new Float32Array(n * 3);
@@ -3993,6 +4013,7 @@ export class Viewer {
     const meshes: THREE.Mesh[] = [];
     const geoms: THREE.BufferGeometry[] = [];
     const matsOut: THREE.MeshStandardMaterial[] = [];
+    const matIdxOut: number[] = [];
     model.submeshes.forEach((s) => {
       const geom = new THREE.BufferGeometry();
       geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
@@ -4025,8 +4046,9 @@ export class Viewer {
       meshes.push(new THREE.Mesh(geom, mat));
       geoms.push(geom);
       matsOut.push(mat);
+      matIdxOut.push(matIdx);
     });
-    return { meshes, geoms, matsOut };
+    return { meshes, geoms, matsOut, matIdxOut };
   }
 
   /**
@@ -4036,13 +4058,15 @@ export class Viewer {
    */
   setFsm(model: FsmModel, mats: { tex: TexData | null; file: string | null }[]) {
     this.clearFsm();
-    const { meshes, geoms, matsOut } = this.buildFsmMeshes(model, mats);
+    this.fsmModel = model;
+    const { meshes, geoms, matsOut, matIdxOut } = this.buildFsmMeshes(model, mats);
     for (const mesh of meshes) {
       this.modelRoot.add(mesh);
       this.fsmMeshes.push(mesh);
     }
     this.fsmGeoms = geoms;
     this.fsmMats = matsOut;
+    this.fsmMatIdx = matIdxOut;
 
     // 挂点标记：尺寸按网格包围盒自适应（J01 剑长约 124）
     const diag = Math.hypot(
@@ -4073,6 +4097,8 @@ export class Viewer {
     this.fsmMeshes = [];
     this.fsmGeoms = [];
     this.fsmMats = [];
+    this.fsmMatIdx = [];
+    this.fsmModel = null;
     if (this.fsmDummyGroup) {
       this.modelRoot.remove(this.fsmDummyGroup);
       for (const g of this.fsmDummyGeoms) g.dispose();
@@ -4085,6 +4111,17 @@ export class Viewer {
 
   hasFsm() {
     return this.fsmMeshes.length > 0;
+  }
+
+  /** FSM 材质贴图热替换（检查器换图）：按材质序号更新全部引用该材质的子网格 */
+  setFsmTexture(matIdx: number, file: string, tex: TexData) {
+    const fm = this.fsmModel?.materials[matIdx];
+    const mask = Viewer.texFlip(fm?.pre);
+    for (let i = 0; i < this.fsmMats.length; i++) {
+      if (this.fsmMatIdx[i] !== matIdx) continue;
+      this.fsmMats[i].map = this.getTexture(file, tex, false, mask);
+      this.fsmMats[i].needsUpdate = true;
+    }
   }
 
   // ---------------- 骨骼挂接网格（帽子等 FSM 静态件，统一进 parts 管线） ----------------

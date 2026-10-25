@@ -8,6 +8,14 @@
     <span v-if="fak.fakLoading">帧数据加载中…</span>
     <template v-else>
       <n-divider style="margin: 8px 0" />
+      <MatTexPanel
+        :materials="fak.fakModel.materials"
+        :mat-files="fak.texPanel.matFiles"
+        :dir-tex-files="fak.texPanel.dirTexFiles"
+        :load-preview="fak.texPanel.texPreviewUrl"
+        @set-texture="(mi, f) => fak.texPanel.setTexture(mi, f)"
+      />
+      <n-divider style="margin: 8px 0" />
       <div
         v-for="(a, i) in fak.fakModel.actions"
         :key="a.name + i"
@@ -25,6 +33,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { FakStore } from "../composables/useFakMode";
+import MatTexPanel from "./MatTexPanel.vue";
 
 const props = defineProps<{ fak: FakStore }>();
 

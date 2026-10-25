@@ -7,9 +7,13 @@
     <template v-if="fsm.fsmLoading">加载中…</template>
     <template v-else>
       <n-divider style="margin: 8px 0" />
-      <div v-for="mat in fsm.fsmModel.materials" :key="mat.index" class="kv">
-        {{ textureName(mat.texturePath) }}
-      </div>
+      <MatTexPanel
+        :materials="fsm.fsmModel.materials"
+        :mat-files="fsm.texPanel.matFiles"
+        :dir-tex-files="fsm.texPanel.dirTexFiles"
+        :load-preview="fsm.texPanel.texPreviewUrl"
+        @set-texture="(mi, f) => fsm.texPanel.setTexture(mi, f)"
+      />
       <n-divider style="margin: 8px 0" />
       <div v-for="d in fsm.fsmModel.dummies" :key="d.name" class="action-row">
         <span>{{ d.name }}</span>
@@ -22,6 +26,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { FsmStore } from "../composables/useFsmMode";
+import MatTexPanel from "./MatTexPanel.vue";
 
 const props = defineProps<{ fsm: FsmStore }>();
 
@@ -39,10 +44,6 @@ const sizeText = computed(() => {
   const d = [0, 1, 2].map((i) => Math.round(m.bboxMax[i] - m.bboxMin[i]));
   return `${d[0]} × ${d[1]} × ${d[2]}`;
 });
-
-function textureName(p: string) {
-  return p.split(/[\\/]/).pop() ?? p;
-}
 
 /** 挂点位置（values 前 3 个 f32） */
 function fmtPos(values: number[]) {

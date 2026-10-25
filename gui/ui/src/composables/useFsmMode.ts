@@ -1,57 +1,33 @@
 import { reactive, ref, type ShallowRef } from "vue";
 import { api } from "../api";
-import type { FsmModel, ResEntry } from "../types";
-import { texDataFromDto } from "../tex";
+import type { FsmModel } from "../types";
+import { resolveModelTextures } from "../tex";
 import type { TexData, Viewer } from "../viewer";
 import { message } from "../message";
 import { shortName } from "../utils";
-
-/** 同目录内可作贴图的扩展名 */
-const TEX_KINDS = /^(dds|tga|png|jpg|bmp)$/;
+import { useTexPanelState } from "./useTexPanel";
 
 /**
- * FSM 静态武器网格：加载 + 按材质路径 stem 在同目录解析贴图
- * （J01-S01.tga → j01-s01.dds）。与皮肤/骨架/FAK 模式互斥（App 层负责切换时清理）。
+ * FSM 静态武器网格：加载 + 材质贴图解析（路径优先 + 同目录 stem 回落，
+ * 与 FAK/装扮模式同口径）。与皮肤/骨架/FAK 模式互斥（App 层负责切换时清理）。
  */
 export function useFsmMode(viewer: ShallowRef<Viewer | null>) {
   const fsmModel = ref<FsmModel | null>(null);
   const fsmLoading = ref(false);
   const texCache = reactive(new Map<string, TexData | null>());
 
-  async function resolveMaterials(
-    model: FsmModel
-  ): Promise<{ tex: TexData | null; file: string | null }[]> {
-    const dir = model.path.replace(/[\\/][^\\/]*$/, "");
-    let entries: ResEntry[] = [];
-    try {
-      entries = await api.listResDir(dir);
-    } catch {
-      // 目录列举失败仅意味着无贴图
-    }
-    const out: { tex: TexData | null; file: string | null }[] = [];
-    for (const mat of model.materials) {
-      const stem = (mat.texturePath.split(/[\\/]/).pop() ?? "")
-        .replace(/\.[^.]*$/, "")
-        .toLowerCase();
-      const entry = entries.find(
-        (e) =>
-          TEX_KINDS.test(e.kind) &&
-          e.name.replace(/\.[^.]*$/, "").toLowerCase() === stem
-      );
-      let tex: TexData | null = null;
-      const file = entry?.path ?? null;
-      if (file && !texCache.has(file)) {
-        try {
-          texCache.set(file, texDataFromDto(await api.loadTexture(file)));
-        } catch (e) {
-          message.error(`纹理解码失败 ${shortName(file)}: ${e}`);
-          texCache.set(file, null);
-        }
-      }
-      if (file) tex = texCache.get(file) ?? null;
-      out.push({ tex, file });
-    }
-    return out;
+  /** 检查器贴图面板：绑定清单 / 同目录可选 / 预览 / 热替换（FAK/FSM 共用） */
+  const texPanel = useTexPanelState(texCache, (mi, f, t) =>
+    viewer.value?.setFsmTexture(mi, f, t)
+  );
+
+  function resolveMaterials(model: FsmModel) {
+    return resolveModelTextures(
+      model.path,
+      model.materials.map((m) => m.texturePath),
+      texCache,
+      (file, e) => message.error(`纹理解码失败 ${shortName(file)}: ${e}`)
+    );
   }
 
   async function openFsmFile(path: string) {
@@ -60,6 +36,8 @@ export function useFsmMode(viewer: ShallowRef<Viewer | null>) {
       const model = await api.loadFsm(path);
       fsmModel.value = model;
       const mats = await resolveMaterials(model);
+      texPanel.matFiles.value = mats.map((s) => s.file);
+      texPanel.loadDirOptions(model.path);
       viewer.value?.setFsm(model, mats);
       viewer.value?.frameAll();
     } catch (e) {
@@ -71,6 +49,8 @@ export function useFsmMode(viewer: ShallowRef<Viewer | null>) {
 
   function closeFsm() {
     fsmModel.value = null;
+    texPanel.matFiles.value = [];
+    texPanel.dirTexFiles.value = [];
     viewer.value?.clearFsm();
   }
 
@@ -79,6 +59,7 @@ export function useFsmMode(viewer: ShallowRef<Viewer | null>) {
     fsmLoading,
     openFsmFile,
     closeFsm,
+    texPanel,
   });
 }
 
