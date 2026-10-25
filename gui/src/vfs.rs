@@ -31,29 +31,31 @@ pub fn is_cpk_path(v: &str) -> bool {
 
 /// 拆出 (CPK 包文件磁盘路径, 包内路径)。非 CPK 寻址返回 None；
 /// 包内路径统一 '\' 分隔、无首尾分隔符，包根为空串。
+/// 扩展名 .cpk 与 .gcpk（NPC.GCPK 等游戏 CPK 同格式包）同等接受。
 pub fn split_cpk(vpath: &str) -> Option<(PathBuf, String)> {
     let rest = vpath.strip_prefix(CPK_PREFIX)?;
-    // 沿祖先链从完整路径开始缩短，第一个"存在的 .cpk 文件"即最长匹配
+    let has_pack_ext = |p: &Path| -> bool {
+        p.extension()
+            .map(|e| {
+                let e = e.to_string_lossy();
+                e.eq_ignore_ascii_case("cpk") || e.eq_ignore_ascii_case("gcpk")
+            })
+            .unwrap_or(false)
+    };
+    let is_pack_file = |p: &Path| -> bool { p.is_file() && has_pack_ext(p) };
+    // 沿祖先链从完整路径开始缩短，第一个"存在的包文件"即最长匹配
     for anc in Path::new(rest).ancestors() {
-        let is_cpk_file = anc.is_file()
-            && anc
-                .extension()
-                .map(|e| e.to_string_lossy().eq_ignore_ascii_case("cpk"))
-                .unwrap_or(false);
-        if is_cpk_file {
+        if is_pack_file(anc) {
             let n = anc.as_os_str().len();
             let inner = rest[n..].trim_matches(['\\', '/']).replace('/', "\\");
             return Some((anc.to_path_buf(), inner));
         }
     }
-    // 未命中存在的包文件：仍按格式给出包路径让上层报"打开失败"，而不是当成磁盘目录
+    // 未命中存在的包文件：仍按格式给出包路径让上层报"打开失败"，而不是当成
+    // 磁盘目录——此时文件不存在，只按扩展名判（同旧 .cpk 行为 + .gcpk 扩展）
     let mut best: Option<PathBuf> = None;
     for anc in Path::new(rest).ancestors() {
-        if anc
-            .extension()
-            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("cpk"))
-            .unwrap_or(false)
-        {
+        if has_pack_ext(anc) {
             best = Some(anc.to_path_buf());
             break;
         }

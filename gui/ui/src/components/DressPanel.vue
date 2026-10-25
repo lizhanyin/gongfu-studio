@@ -120,16 +120,29 @@
       <div v-else-if="!slot.items.length" class="meta">(无可用物品)</div>
       <div v-if="coveredByFashion(slot.key)" class="meta covered-note">被时装覆盖</div>
 
-      <!-- 帽子：挂点骨骼与偏移微调 -->
+      <!-- 帽子：帽子直选 + 挂点骨骼与偏移微调 -->
       <div v-if="slot.key === 'hat' && dress.equipOn.get('hat')" class="hat-tuning">
+        <div class="row">
+          <span class="dress-label">帽子</span>
+          <n-select
+            size="tiny"
+            class="dress-select"
+            filterable
+            :value="dress.equipPath.get('hat') ?? ''"
+            :options="hatOptions"
+            placeholder="选择帽子"
+            @update:value="(v: string) => dress.setEquip('hat', v || null)"
+          />
+        </div>
         <div class="row">
           <span class="dress-label">挂骨</span>
           <n-select
             size="tiny"
             class="dress-select"
-            :value="dress.hatBone || ''"
-            :options="boneOptions"
-            @update:value="(v: string) => (dress.hatBone = v)"
+            filterable
+            :value="'bone:' + (dress.hatBone || '')"
+            :options="mountOptions"
+            @update:value="onMountPick"
           />
         </div>
         <div class="row">
@@ -188,10 +201,46 @@ const setCurrentValue = computed(() => {
   return n === null || n === -1 ? undefined : n;
 });
 
-const boneOptions = computed(() => [
-  { label: "自动 (tag_Hat)", value: "" },
-  ...props.actDirSkeleton.map((n) => ({ label: n, value: n })),
+/** 帽子全量清单（不按性别过滤：跨性别试戴 + NPC 模型都在帽槽里） */
+const hatItems = computed(
+  () => props.dress.catalog?.slots.find((s) => s.key === "hat")?.items ?? []
+);
+
+const hatOptions = computed(() => [
+  { label: "(脱下帽子)", value: "" },
+  ...hatItems.value.map((i) => ({ label: itemLabel(i), value: i.path })),
 ]);
+
+/** 挂骨下拉：挂点骨（编辑当前帽的挂骨）+ 帽子组（选择=佩戴该帽并应用其记忆） */
+const mountOptions = computed(() => [
+  {
+    type: "group" as const,
+    label: "挂点骨",
+    key: "g-bone",
+    children: [
+      { label: "自动 (tag_Hat)", value: "bone:" },
+      ...props.actDirSkeleton.map((n) => ({ label: n, value: `bone:${n}` })),
+    ],
+  },
+  {
+    type: "group" as const,
+    label: "帽子（选择=佩戴）",
+    key: "g-hat",
+    children: hatItems.value.map((i) => ({
+      label: itemLabel(i),
+      value: `hat:${i.path}`,
+    })),
+  },
+]);
+
+/** 挂骨下拉选择：bone: 前缀 = 设当前帽挂骨；hat: 前缀 = 佩戴该帽 */
+function onMountPick(v: string) {
+  if (v.startsWith("hat:")) {
+    void props.dress.setEquip("hat", v.slice(4));
+  } else {
+    props.dress.hatBone = v.slice(5);
+  }
+}
 
 // 帽子偏移步长：普通点击 0.1，按住 Ctrl 为 1
 const ctrlHeld = ref(false);

@@ -38,10 +38,13 @@ interface PartObj {
   skinned: boolean;
   /** fmath wasm 部件槽位（-1 = TS 回退模式未注册） */
   gfmId: number;
-  /** 合成自动绑发件（长发 FSM 代理，见 addBoneAttached）：boneLocalPos 按
+  /** 合成件（长发 FSM 代理，见 addBoneAttached）：boneLocalPos 按
    *  当前骨架绑定姿态生成、数据自洽，链诊断/锚定闸门跳过（纯 LBS 即正确，
    *  再锚定会叠加骨盆载体双重运动） */
   syntheticHair?: boolean;
+  /** 合成刚性挂接件（帽子 FSM 代理）：单骨 w=1 烘焙 mount，纯 LBS 刚体
+   *  随骨；与 syntheticHair 同样跳过链/裙/障碍池，但不参与长发体表去穿透 */
+  syntheticMount?: boolean;
 }
 
 function b64ToBytes(b64: string): Uint8Array {
@@ -342,7 +345,7 @@ export class Viewer {
   private static readonly HAT_OFFSET = new THREE.Vector3(10, -1.5, -3);
   /** tag 挂点直挂的锚点补偿（fix/面板帧）：tag_Hat 骨原点相对游戏实际渲染
    *  挂点的残差，由用户面板实测折算固化。面板偏移在此基础上微调（+） */
-  private static readonly TAG_MOUNT_OFFSET = new THREE.Vector3(-1.5, -0.5, 6.5);
+  private static readonly TAG_MOUNT_OFFSET = new THREE.Vector3(-1.1, -0.7, 6.2);
   // 每帧复用的临时对象
   private cCarry = new THREE.Matrix4();
   private cAnchor = new THREE.Vector3();
@@ -735,7 +738,8 @@ export class Viewer {
     path: string,
     model: FskinModel,
     texes: (TexData | null)[],
-    texFiles: (string | null)[]
+    texFiles: (string | null)[],
+    opts?: { uvSeamSplit?: boolean }
   ) {
     if (this.parts.has(path)) this.removePart(path);
 
@@ -786,7 +790,12 @@ export class Viewer {
 
     // 跨缝拆分：手臂等条带 UV 环绕 u=0/1 接缝（引擎用重复寻址）。
     // 三角形两端的顶点分处缝两侧时插值会横穿整张纹理，需复制顶点把 UV 归一到同侧。
+    // 仅对平铺类纹理成立——图集类（帽子/长发 FSM 图集行序混排）大跨度三角
+    // 是 authored 的合法跨度，拆分平移 ±1 会把采样弧改到环绕缝、采到别的
+    // 图块（FM38 头右上装饰实测），FSM 合成部件须关（uvSeamSplit:false，
+    // 与单独渲染 setFsm 同口径）。
     // 多子网格：各节三角形按序拼接为一个索引流，groups 记录每节的区间给材质分组。
+    const splitUv = opts?.uvSeamSplit !== false;
     const tri: number[] = [];
     const groupRanges: Array<[number, number]> = [];
     for (const s of model.submeshes) {
@@ -800,7 +809,7 @@ export class Viewer {
       const vs = [uv[ia * 2 + 1], uv[ib * 2 + 1], uv[ic * 2 + 1]];
       const du = Math.max(...us) - Math.min(...us);
       const dv = Math.max(...vs) - Math.min(...vs);
-      if (du <= 0.5 && dv <= 0.5) continue;
+      if (!splitUv || (du <= 0.5 && dv <= 0.5)) continue;
       const news = [ia, ib, ic].map((vi, m) => {
         let u = uv[vi * 2];
         let v = uv[vi * 2 + 1];
@@ -1308,7 +1317,7 @@ export class Viewer {
     for (const r of roots) for (const m of this.boneChainMembers(r)) chainOf.set(m, r);
     const vertsOf = new Map<number, Vertex[]>(roots.map((r) => [r, []]));
     for (const p of this.parts.values()) {
-      if (p.syntheticHair) continue;
+      if (p.syntheticHair || p.syntheticMount) continue;
       for (const v of p.model.vertices) {
         for (const inf of v.influences) {
           const r = chainOf.get(inf.boneIndex);
@@ -1397,7 +1406,7 @@ export class Viewer {
       semanticAnchor.set(root, { skirt: false, hair: 0 });
     }
     for (const p of this.parts.values()) {
-      if (p.mesh.visible === false || p.syntheticHair) continue;
+      if (p.mesh.visible === false || p.syntheticHair || p.syntheticMount) continue;
       const isSkirt = skirtSlot(p.model.path);
       for (const v of p.model.vertices) {
         for (const inf of v.influences) {
@@ -1561,7 +1570,7 @@ export class Viewer {
       const dst: number[] = [];
       let np = 0;
       for (const p of this.parts.values()) {
-        if (p.mesh.visible === false || p.syntheticHair) continue;
+        if (p.mesh.visible === false || p.syntheticHair || p.syntheticMount) continue;
         for (const v of p.model.vertices) {
           for (const inf of v.influences) {
             if (inf.boneIndex >= n || !memberSet.has(inf.boneIndex)) continue;
@@ -1810,8 +1819,12 @@ export class Viewer {
       this.legCaps.push({ bone: b, len });
     }
     // 与 skinPart 同源遍历（inflOf 含接缝克隆），收集受 Bone* 链影响的顶点；
-    // 同源三角化收集裙片三角形与去重边（跨穿推出用）+ 腿网格三角形
+    // 同源三角化收集裙片三角形与去重边（跨穿推出用）+ 腿网格三角形。
+    // 合成件（长发/刚性帽）不进裙摆池（与其余拟合函数同口径）：其顶点无
+    // 链/腿影响，只会以 body 三角形身份进阶段五跟随池——合成发顶点接收裤
+    // 侧位移，帽偏移调整会连带被拽动
     for (const p of this.parts.values()) {
+      if (p.syntheticHair || p.syntheticMount) continue;
       const chain = new Uint8Array(p.inflOf.length);
       const leg = new Uint8Array(p.inflOf.length);
       for (let i = 0; i < p.inflOf.length; i++) {
@@ -2158,6 +2171,16 @@ export class Viewer {
    * 半径/网格内采样等代理判据都有反例（详见阶段二注释）。
    */
   private applySkirtDePenVerts(abs = NaN) {
+    // 暂停态的帧外调用（addPart/setClothSim）：其它部件缓冲仍停留在上一轮
+    // 去穿透输出（暂停不逐帧重蒙皮），skirtOrigSnap 会把已推位置当基准，
+    // 阶段二相交腿网格的 +Y 最小推逐轮棘轮累积——暂停下调帽偏移（长发
+    // 重建走 addPart）把裤链顶点逐次推高的根因。先全量重蒙皮恢复"基准=
+    // 当前帧 LBS 输出"前置条件，与播放路径 applyFskelFrame 逐帧同口径
+    // （同参"重蒙皮+去穿透"循环位和恒定实测）；帧内调用传有限 abs，部件
+    // 刚重蒙皮过，不受影响
+    if (!Number.isFinite(abs) && this.skelBones.length) {
+      for (const p of this.parts.values()) this.skinPart(p);
+    }
     if (gfmEnabled) {
       this.gfmUploadWorldMats();
       if (this.skirtRecord) this.skirtPushLog = [];
@@ -2976,7 +2999,7 @@ export class Viewer {
     const cs = this.hairBodyCellSize;
     const pad = 6;
     for (const p of this.parts.values()) {
-      if (p.syntheticHair || p.mesh.visible === false) continue;
+      if (p.syntheticHair || p.syntheticMount || p.mesh.visible === false) continue;
       for (const sm of p.model.submeshes) {
         for (let t = 0; t + 2 < sm.triangles.length; t += 3) {
           const a = sm.triangles[t];
@@ -3671,7 +3694,7 @@ export class Viewer {
     }
     this.updateBoneLines();
     this.updateAnchoredMats();
-    this.updateBoneAttachedMats(); // 帽子等骨骼挂接件：写入骨骼相对运动（显示共轭）
+    // 帽子等挂接件已并入 parts 管线：随下方 skinPart 循环统一蒙皮
     this.updateClothMats(i0 + alpha);
     // 关节小球跟随世界坐标
     const m = new THREE.Matrix4();
@@ -4020,41 +4043,75 @@ export class Viewer {
     return this.fsmMeshes.length > 0;
   }
 
-  // ---------------- 骨骼挂接网格（帽子等 FSM 静态件） ----------------
+  // ---------------- 骨骼挂接网格（帽子等 FSM 静态件，统一进 parts 管线） ----------------
 
-  /** 挂接层级（骨路径）：modelRoot(带 MODEL_YAW) → holder（每帧 = 骨骼相对运动
-   *  boneW(t)·boneW0⁻¹，见 updateBoneAttachedMats）→ fix（静态 = Yawπ·骨绑定
-   *  姿态·沿骨平移，与 body 显示旋转共轭对齐）→ inner（FSM 局部系→骨系旋转 +
-   *  偏移）→ 网格。静态时 Yawπ·Yawπ 相消 = 旧的骨下直接挂接位置；
-   *  动画时经 Yawπ 共轭，俯仰/侧倾与身体网格同向（不共轭会镜像反相） */
+  /** 挂接件元数据。渲染不再走独立的 Group 层级/逐帧矩阵——全部在构建期把
+   *  挂接矩阵（mount = Yaw·boneW0·锚点补偿·姿态旋转+偏移，见 mountOf）烘焙
+   *  进顶点，做成合成蒙皮部件经 addPart 进 parts 管线：刚性帽单骨 w=1
+   *  （LBS 单骨 = boneW(t)·boneW0⁻¹·pw，与旧 holder 每帧相对运动逐点等价），
+   *  长发 FSM 多骨自动绑骨（buildAutoHairPart）。逐帧与身体件同一 skinPart
+   *  LBS（含 fmath wasm 内核）+ 显隐/取景/拾取一致；显示系 Yaw 共轭问题
+   *  一并消失（顶点在数据空间建模，显示经 modelRoot，与身体件同口径）。 */
   private boneAttached = new Map<
     string,
     {
-      holder: THREE.Group;
-      fix: THREE.Group;
-      inner: THREE.Group;
-      meshes: THREE.Mesh[];
-      geoms: THREE.BufferGeometry[];
-      mats: THREE.MeshStandardMaterial[];
+      model: FsmModel;
+      mats: { tex: TexData | null; file: string | null }[];
       boneName: string;
-      /** 绑定的骨骼实例（骨架重载后重找）；null = 静态回落（挂 modelRoot） */
+      /** 面板微调偏移（inner 系）：变更经 setBoneAttachedOffset 重建烘焙 */
+      offset: [number, number, number];
+      /** 解析到的挂接骨实例（骨架重载后重找）；null = 静态回落（零权重
+       *  保持绑定姿势 = 旧静态摆放） */
       bone: THREE.Bone | null;
-      /** 绑定时骨骼世界矩阵的逆（相对运动载体，bone 非空时有效） */
-      bindInv: THREE.Matrix4;
-      /** 长发 FSM 自动绑骨件（addBoneAttached 分流）：合成蒙皮部件的重建材料 */
-      autoHair?: {
-        model: FsmModel;
-        mats: { tex: TexData | null; file: string | null }[];
-        offset: [number, number, number];
-      };
+      /** 长发 FSM（多骨自动绑骨）；false = 刚性帽（单骨 w=1） */
+      autoHair: boolean;
+      /** 网格原点落点（绑定姿态、显示空间，挂接日志口径），构建期更新 */
+      origin: THREE.Vector3 | null;
     }
   >();
 
+  /** 挂点骨名解析：精确（忽略大小写）→ 包含匹配；找不到 null */
+  private resolveMountBone(boneName: string): THREE.Bone | null {
+    const lower = boneName.toLowerCase();
+    return (
+      this.skelBones.find((b) => b.name.toLowerCase() === lower) ??
+      this.skelBones.find((b) => b.name.toLowerCase().includes(lower)) ??
+      null
+    );
+  }
+
+  /** 挂接基准（数据空间）：fix = Yaw·骨绑定姿态·锚点补偿（tag 挂点骨 =
+   *  TAG_MOUNT_OFFSET，普通骨回落 = HAT_OFFSET）；mount = fix·inner
+   *  （inner = 姿态旋转 + 偏移：tag 转 Ry(π) 前后归位，回落转 Rz(−π/2)）。
+   *  origin = fix·offset（网格原点落点，不含 inner 旋转，日志口径） */
+  private mountOf(
+    bone: THREE.Bone,
+    offset: [number, number, number]
+  ): { mount: THREE.Matrix4; origin: THREE.Vector3 } {
+    const idx = this.skelBones.indexOf(bone);
+    const bindW = (idx >= 0 ? this.bindWorldMats[idx] : null) ?? bone.matrixWorld;
+    const isTag = bone.name.toLowerCase().startsWith("tag_");
+    const anchor = isTag ? Viewer.TAG_MOUNT_OFFSET : Viewer.HAT_OFFSET;
+    const fix = new THREE.Matrix4().makeRotationY(MODEL_YAW).multiply(bindW);
+    fix.multiply(new THREE.Matrix4().makeTranslation(anchor.x, anchor.y, anchor.z));
+    const inner = new THREE.Matrix4()
+      .makeRotationY(isTag ? Math.PI : 0)
+      .setPosition(offset[0], offset[1], offset[2]);
+    if (!isTag) inner.multiply(new THREE.Matrix4().makeRotationZ(-Math.PI / 2));
+    return {
+      mount: fix.clone().multiply(inner),
+      origin: new THREE.Vector3(offset[0], offset[1], offset[2]).applyMatrix4(fix),
+    };
+  }
+
   /**
-   * FSM 网格挂到骨骼（帽子槽）：随骨骼刚性运动，且动画相位与身体网格一致
-   * （经 MODEL_YAW 共轭，见 boneAttached 注释）。骨架未加载或骨名不存在时
-   * 按普通静态网格摆放。offset 为 fix 系微调：tag 挂点骨下 Y=上下（tag 帧
-   * +Y 朝上），普通 head 骨回落路径 X=沿骨轴上下。
+   * FSM 网格挂到骨骼（帽子槽）：经 mount 矩阵烘焙成合成蒙皮部件进 parts
+   * 管线（见 boneAttached 注释）——刚性帽单骨 w=1 随骨刚体运动；长发 FSM
+   * （FM38 实测 y 跨 87 vs 普通帽 29）自动绑骨成多骨合成件走 LBS（近头随
+   * 头、发束随链动画；原版引擎对 FSM 帽是 SGAvatarAttachment 刚挂，游戏里
+   * 长发同样刚性穿模，此为 viewer 增强）。骨架未加载或骨名不存在时零权重
+   * 保持绑定姿势（= 旧静态摆放）。offset 为 inner 系微调：tag 挂点骨下
+   * Y=上下（tag 帧 +Y 朝上），普通 head 骨回落路径 X=沿骨轴上下。
    */
   addBoneAttached(
     path: string,
@@ -4064,71 +4121,34 @@ export class Viewer {
     offset: [number, number, number] = [0, 0, 0]
   ) {
     this.removeBoneAttached(path);
-    // 长发 FSM（FM38 实测 y 跨 87 vs 普通帽 29）自动绑骨：原版引擎对 FSM
-    // 帽是 SGAvatarAttachment 刚挂（客户端仅 tag_* 五挂点、SMM 无蒙皮数据，
-    // 游戏里长发同样刚性穿模）。viewer 增强：按 tag 挂接姿态把顶点最近分配
-    // 到 头/颈骨+Bone* 发链骨 合成蒙皮件，走 LBS——近头随头、发束随链动画
-    // （舞蹈 74°/帧摆动）。lp 按绑定帧生成故数据自洽，纯 LBS 即正确。
-    if (this.isLongHairFsm(model) && this.skelBones.length) {
-      const lower = boneName.toLowerCase();
-      const bone =
-        this.skelBones.find((b) => b.name.toLowerCase() === lower) ??
-        this.skelBones.find((b) => b.name.toLowerCase().includes(lower));
-      if (bone) {
-        this.boneAttached.set(path, {
-          holder: new THREE.Group(),
-          fix: new THREE.Group(),
-          inner: new THREE.Group(),
-          meshes: [],
-          geoms: [],
-          mats: [],
-          boneName,
-          bone,
-          bindInv: new THREE.Matrix4(),
-          autoHair: { model, mats, offset },
-        });
-        this.buildAutoHairPart(path);
-        return;
-      }
-    }
-    const { meshes, geoms, matsOut } = this.buildFsmMeshes(model, mats);
-    const inner = new THREE.Group();
-    inner.position.set(offset[0], offset[1], offset[2]);
-    for (const mesh of meshes) inner.add(mesh);
-    const fix = new THREE.Group();
-    fix.matrixAutoUpdate = false;
-    fix.add(inner);
-    const holder = new THREE.Group();
-    holder.matrixAutoUpdate = false;
-    holder.add(fix);
+    const autoHair =
+      this.isLongHairFsm(model) && this.skelBones.length > 0 && !!this.resolveMountBone(boneName);
     this.boneAttached.set(path, {
-      holder,
-      fix,
-      inner,
-      meshes,
-      geoms,
-      mats: matsOut,
+      model,
+      mats,
       boneName,
+      offset,
       bone: null,
-      bindInv: new THREE.Matrix4(),
+      autoHair,
+      origin: null,
     });
-    this.refreshBoneAttached(path);
+    if (autoHair) this.buildAutoHairPart(path);
+    else this.buildRigidHatPart(path);
     // 挂接监控：晚到装配/骨缺失/多帽叠加（幽灵）都在此暴露，__diagLog 可查。
     // 位置为显示空间、绑定姿态（帧 0）数值
     const e = this.boneAttached.get(path)!;
     const tail = path.replace(/^.*[\\/]/, "");
     if (!e.bone) {
       this.dwarn(`帽子挂接: ${tail} 骨「${boneName}」不存在，回落静态摆放`);
-    } else {
+    } else if (!autoHair) {
       // 报绑定姿态（帧 0）数值：与挂接时刻无关、可复现；播放中帽子随头部
       // 运动，实时位置用 boneAttachedInfo() 查
       const idx = this.skelBones.indexOf(e.bone);
       const bindW = (idx >= 0 ? this.bindWorldMats[idx] : null) ?? e.bone.matrixWorld;
       const anchor = new THREE.Vector3().setFromMatrixPosition(bindW);
-      const origin = new THREE.Vector3().copy(e.inner.position).applyMatrix4(e.fix.matrix);
       const f = (p: THREE.Vector3) => `${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)}`;
       this.dlog(
-        `帽子挂接: ${tail} → 骨 ${e.bone.name} 锚(${f(anchor)}) · 原点(${f(origin)}) · rotY ${e.inner.rotation.y.toFixed(2)} · 偏移 [${offset.join(",")}]`
+        `帽子挂接: ${tail} → 骨 ${e.bone.name} 锚(${f(anchor)}) · 原点(${e.origin ? f(e.origin) : "-"}) · 偏移 [${offset.join(",")}]`
       );
     }
     if (this.boneAttached.size > 1) {
@@ -4141,7 +4161,8 @@ export class Viewer {
   }
 
   /** 挂接状态快照（CDP/诊断用）：`__viewer.boneAttachedInfo()` 直查。
-   *  显示空间坐标；origin=网格原点落点，bbox=帽子网格世界包围盒 min/max */
+   *  显示空间坐标；origin=网格原点落点（绑定姿态、构建期烘焙口径），
+   *  bbox=合成部件当前蒙皮位置的世界包围盒 min/max */
   boneAttachedInfo(): {
     path: string;
     bone: string | null;
@@ -4152,29 +4173,30 @@ export class Viewer {
     bbox: number[][] | null;
   }[] {
     return [...this.boneAttached.entries()].map(([path, e]) => {
-      e.holder.updateMatrixWorld(true);
-      const o = e.meshes[0]
-        ? new THREE.Vector3().setFromMatrixPosition(e.meshes[0].matrixWorld)
-        : null;
+      const p = this.parts.get(path);
       const box = new THREE.Box3();
       let has = false;
-      for (const m of e.meshes) {
-        m.geometry.computeBoundingBox();
-        if (m.geometry.boundingBox) {
-          box.union(m.geometry.boundingBox.clone().applyMatrix4(m.matrixWorld));
+      if (p) {
+        p.mesh.updateMatrixWorld(true);
+        p.mesh.geometry.computeBoundingBox();
+        if (p.mesh.geometry.boundingBox) {
+          box.copy(p.mesh.geometry.boundingBox).applyMatrix4(p.mesh.matrixWorld);
           has = true;
         }
       }
       const a = e.bone
         ? new THREE.Vector3().setFromMatrixPosition(e.bone.matrixWorld)
         : null;
+      const rotY = e.bone?.name.toLowerCase().startsWith("tag_") ? Math.PI : 0;
       return {
         path,
         bone: e.bone?.name ?? null,
         anchor: a ? [+a.x.toFixed(1), +a.y.toFixed(1), +a.z.toFixed(1)] : null,
-        rotY: +e.inner.rotation.y.toFixed(3),
-        offset: e.inner.position.toArray().map((n) => +n.toFixed(2)),
-        origin: o ? [+o.x.toFixed(1), +o.y.toFixed(1), +o.z.toFixed(1)] : null,
+        rotY: +rotY.toFixed(3),
+        offset: e.offset.map((n) => +n.toFixed(2)),
+        origin: e.origin
+          ? [+e.origin.x.toFixed(1), +e.origin.y.toFixed(1), +e.origin.z.toFixed(1)]
+          : null,
         bbox: has
           ? [
               [+box.min.x.toFixed(1), +box.min.y.toFixed(1), +box.min.z.toFixed(1)],
@@ -4187,7 +4209,8 @@ export class Viewer {
 
   /** 帽子网格 vs 身体部件的穿模监控（bbox 级近似：落在某身体部件世界 AABB
    *  内的帽子顶点数与最深下探量；bbox 内 ≠ 真穿面，作观察指标用）。
-   *  刚体 FSM 帽（引擎同款挂接）长发的固有穿模靠它量化定位 */
+   *  刚体 FSM 帽（引擎同款挂接）长发的固有穿模靠它量化定位。
+   *  帽=挂接合成部件，身体=其余部件（长发合成件保留为障碍，与旧口径同） */
   hatOverlapInfo(): {
     hat: string;
     part: string;
@@ -4197,11 +4220,13 @@ export class Viewer {
     const out: { hat: string; part: string; vertsInBox: number; deepestY: number }[] =
       [];
     const v = new THREE.Vector3();
-    for (const [hatPath, e] of this.boneAttached.entries()) {
-      e.holder.updateMatrixWorld(true);
+    for (const hatPath of this.boneAttached.keys()) {
+      const hp = this.parts.get(hatPath);
+      if (!hp?.mesh?.geometry) continue;
+      hp.mesh.updateMatrixWorld(true);
       const hatName = hatPath.replace(/^.*[\\/]/, "");
       for (const p of this.parts.values()) {
-        if (!p.mesh?.geometry) continue;
+        if (p === hp || p.syntheticMount || !p.mesh?.geometry) continue;
         p.mesh.updateMatrixWorld(true);
         p.mesh.geometry.computeBoundingBox();
         const bb = p.mesh.geometry.boundingBox!.clone().applyMatrix4(
@@ -4210,14 +4235,12 @@ export class Viewer {
         bb.expandByScalar(-0.5); // 收缩排除贴面顶点
         let n = 0;
         let deepest = 1e9;
-        for (const m of e.meshes) {
-          const pos = m.geometry.attributes.position;
-          for (let i = 0; i < pos.count; i++) {
-            v.fromBufferAttribute(pos, i).applyMatrix4(m.matrixWorld);
-            if (bb.containsPoint(v)) {
-              n++;
-              deepest = Math.min(deepest, v.y);
-            }
+        const pos = hp.mesh.geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+          v.fromBufferAttribute(pos, i).applyMatrix4(hp.mesh.matrixWorld);
+          if (bb.containsPoint(v)) {
+            n++;
+            deepest = Math.min(deepest, v.y);
           }
         }
         if (n > 0) out.push({ hat: hatName, part: p.model.path.replace(/^.*[\\/]/, ""), vertsInBox: n, deepestY: +deepest.toFixed(1) });
@@ -4245,46 +4268,25 @@ export class Viewer {
     return mx - mn > 50;
   }
 
-  /** 长发 FSM → 合成蒙皮部件：顶点经挂接矩阵（refreshBoneAttached 同口径）
+  /** 长发 FSM → 合成蒙皮部件：顶点经挂接矩阵（mountOf，与刚性帽同口径）
    *  变换到数据空间，最近分配到 头/颈骨+tag 挂点骨+Bone* 发链骨（前二骨
    *  距离加权平滑），boneLocalPos = 绑定帧世界矩阵逆 × 世界位置。骨架重载
    *  后由 refreshBoneAttached 重建（lp 相对新骨架重新生成）。 */
   private buildAutoHairPart(path: string) {
     const e = this.boneAttached.get(path);
-    const ah = e?.autoHair;
-    if (!e || !ah || !e.bone || !this.skelBones.length || !this.bindWorldMats.length) return;
-    const { model, mats, offset } = ah;
-    const bone = e.bone;
+    if (!e?.autoHair || !this.skelBones.length || !this.bindWorldMats.length) return;
+    // 每次构建按名重解析骨实例（骨架重载后旧 Bone 已脱离层级，沿旧实例
+    // 会取到陈旧 matrixWorld）
+    const bone = this.resolveMountBone(e.boneName);
+    if (!bone) return;
+    e.bone = bone;
+    const { model, mats, offset } = e;
     const idx = this.skelBones.indexOf(bone);
-    const bindW = (idx >= 0 ? this.bindWorldMats[idx] : null) ?? bone.matrixWorld;
-    const isTag = bone.name.toLowerCase().startsWith("tag_");
-    // 挂接基准与 refreshBoneAttached 完全同口径（含 TAG_MOUNT_OFFSET 标定：
-    // 那是显示空间的挂点标定，长发同样适用——实测去掉后 crown 整体偏后~6.5
-    // 偏上 0.5 悬空）。长发与帽的差别不在挂点，而在绑定：长发只绑头/颈骨系
-    // （随头刚体运动），authored 网格自带的垂坠形态与大间隙得以保留。
-    const fix = new THREE.Matrix4().makeRotationY(MODEL_YAW).multiply(bindW);
-    if (isTag) {
-      fix.multiply(
-        new THREE.Matrix4().makeTranslation(
-          Viewer.TAG_MOUNT_OFFSET.x,
-          Viewer.TAG_MOUNT_OFFSET.y,
-          Viewer.TAG_MOUNT_OFFSET.z
-        )
-      );
-    } else {
-      fix.multiply(
-        new THREE.Matrix4().makeTranslation(
-          Viewer.HAT_OFFSET.x,
-          Viewer.HAT_OFFSET.y,
-          Viewer.HAT_OFFSET.z
-        )
-      );
-    }
-    const inner = new THREE.Matrix4()
-      .makeRotationY(isTag ? Math.PI : 0)
-      .setPosition(offset[0], offset[1], offset[2]);
-    if (!isTag) inner.multiply(new THREE.Matrix4().makeRotationZ(-Math.PI / 2));
-    const mount = fix.multiply(inner);
+    // 挂接基准 mountOf（含 TAG_MOUNT_OFFSET 标定：那是显示空间的挂点标定，
+    // 长发同样适用——实测去掉后 crown 整体偏后~6.5 偏上 0.5 悬空）。长发与
+    // 帽的差别不在挂点，而在绑定：长发多骨最近分配，帽单骨 w=1 刚挂
+    const { mount, origin } = this.mountOf(bone, offset);
+    e.origin = origin; // 诊断口径与刚性帽一致（绑定姿态网格原点落点）
 
     const n = this.fskelBoneCount;
     // 候选骨：只用头/颈骨 + tag 挂点骨——游戏内 FM38 类长发 FSM 是
@@ -4307,8 +4309,9 @@ export class Viewer {
       const tris: number[] = [];
       for (const p2 of this.parts.values()) {
         // 障碍只取身体件：偏移触发的重建路径里旧发件要到 addPart 才被替换，
-        // 若算进障碍会把新发从自身旧壳上再推一层 MARGIN（逐次调整爆跳根因）
-        if (p2.mesh.visible === false || p2.syntheticHair) continue;
+        // 若算进障碍会把新发从自身旧壳上再推一层 MARGIN（逐次调整爆跳根因）；
+        // 合成挂接帽同样排除（此前非部件、从未进障碍池，口径不变）
+        if (p2.mesh.visible === false || p2.syntheticHair || p2.syntheticMount) continue;
         // 障碍三角形用模型 authored 索引（几何索引含拆缝副本，越界 model.vertices）
         for (const sm of p2.model.submeshes) {
           for (let t = 0; t + 2 < sm.triangles.length; t += 3) {
@@ -4481,105 +4484,51 @@ export class Viewer {
         );
       }
     }
-    const inv = new THREE.Matrix4();
-    const lpOf = (b: number, pw: THREE.Vector3): number[] => {
-      inv.copy(this.bindWorldMats[b]).invert();
-      const local = pw.clone().applyMatrix4(inv);
-      return [local.x, local.y, local.z];
-    };
-
-    // UV 岛修复（与 buildFsmMeshes 同口径）：mask 类图集行序混排按簇色判据
-    // 分流；合成发顶点取修复后的 UV
-    const uvFix = new Float32Array(model.vertexCount * 2);
-    for (let i = 0; i < model.vertexCount; i++) {
-      uvFix[i * 2] = model.vertices[i * 8 + 6];
-      uvFix[i * 2 + 1] = model.vertices[i * 8 + 7];
-    }
-    for (const [mi, tris] of Viewer.trisByMaterial(model)) {
-      const mt = mats[mi];
-      if (!Viewer.texFlip(model.materials[mi]?.pre) || !mt?.tex) continue;
-      Viewer.repairMaskUvIslands(uvFix, tris, mt.tex);
-    }
-
-    const verts: Vertex[] = [];
-    const v3 = new THREE.Vector3();
+    // 顶点绑骨：最近两骨距离加权（d2 < d1·1.5 时平滑，否则单骨 w=1）
     const boneCount = new Map<number, number>();
     const nv = model.vertexCount;
     const pushedPos = (model as FsmModel & { __pushedPos?: THREE.Vector3[] }).__pushedPos;
-    for (let i = 0; i < nv; i++) {
-      const pw = pushedPos
-        ? pushedPos[i].clone()
-        : v3
-            .set(model.vertices[i * 8], model.vertices[i * 8 + 1], model.vertices[i * 8 + 2])
-            .applyMatrix4(mount);
-      let b1 = cand[0];
-      let b2 = cand[1] ?? cand[0];
-      let d1 = Infinity;
-      let d2 = Infinity;
-      for (const b of cand) {
-        const bm = this.bindWorldMats[b].elements;
-        const d = Math.hypot(pw.x - bm[12], pw.y - bm[13], pw.z - bm[14]);
-        if (d < d1) {
-          b2 = b1;
-          d2 = d1;
-          b1 = b;
-          d1 = d;
-        } else if (d < d2) {
-          b2 = b;
-          d2 = d;
+    const synth = this.synthFromFsm(
+      path + "#autohair",
+      model,
+      mats,
+      mount,
+      (pw, lpOf) => {
+        let b1 = cand[0];
+        let b2 = cand[1] ?? cand[0];
+        let d1 = Infinity;
+        let d2 = Infinity;
+        for (const b of cand) {
+          const bm = this.bindWorldMats[b].elements;
+          const d = Math.hypot(pw.x - bm[12], pw.y - bm[13], pw.z - bm[14]);
+          if (d < d1) {
+            b2 = b1;
+            d2 = d1;
+            b1 = b;
+            d1 = d;
+          } else if (d < d2) {
+            b2 = b;
+            d2 = d;
+          }
         }
-      }
-      const influences: Influence[] = [];
-      if (d2 < d1 * 1.5) {
-        const w1 = d2 / (d1 + d2);
-        influences.push({ boneIndex: b1, weight: w1, boneLocalPos: lpOf(b1, pw) });
-        influences.push({ boneIndex: b2, weight: 1 - w1, boneLocalPos: lpOf(b2, pw) });
-        boneCount.set(b1, (boneCount.get(b1) ?? 0) + 1);
-        boneCount.set(b2, (boneCount.get(b2) ?? 0) + 1);
-      } else {
-        influences.push({ boneIndex: b1, weight: 1, boneLocalPos: lpOf(b1, pw) });
-        boneCount.set(b1, (boneCount.get(b1) ?? 0) + 1);
-      }
-      const nrm = new THREE.Vector3(
-        model.vertices[i * 8 + 3],
-        model.vertices[i * 8 + 4],
-        model.vertices[i * 8 + 5]
-      ).transformDirection(mount);
-      verts.push({
-        pos: [pw.x, pw.y, pw.z],
-        normal: [nrm.x, nrm.y, nrm.z],
-        uv: [uvFix[i * 2], uvFix[i * 2 + 1]],
-        influences,
-      });
-    }
-
-    const synth: FskinModel = {
-      path: path + "#autohair",
-      version: 1,
-      bboxMax: [...model.bboxMax],
-      bboxMin: [...model.bboxMin],
-      reserved256: [],
-      vertices: verts,
-      submeshes: model.submeshes.map((sm) => ({
-        zero1: (sm.index << 16) >>> 0,
-        zero2: 0,
-        vertexCount2: sm.vertexCount,
-        misc: [0, 0, 0, 0, 0, 0],
-        triangles: [...sm.triangles],
-      })),
-      materials: model.materials.map((mm) => ({
-        lead: mm.index,
-        diffuse: [...mm.diffuse],
-        ambient: [...mm.ambient],
-        emissive: [...mm.emissive],
-        specular: [...mm.specular],
-        specPower: mm.specPower,
-        pre: [...mm.pre],
-        texturePath: mm.texturePath,
-        tail: [],
-      })),
-    };
-    this.addPart(path, synth, mats.map((m) => m.tex), mats.map((m) => m.file));
+        const influences: Influence[] = [];
+        if (d2 < d1 * 1.5) {
+          const w1 = d2 / (d1 + d2);
+          influences.push({ boneIndex: b1, weight: w1, boneLocalPos: lpOf(b1, pw) });
+          influences.push({ boneIndex: b2, weight: 1 - w1, boneLocalPos: lpOf(b2, pw) });
+          boneCount.set(b1, (boneCount.get(b1) ?? 0) + 1);
+          boneCount.set(b2, (boneCount.get(b2) ?? 0) + 1);
+        } else {
+          influences.push({ boneIndex: b1, weight: 1, boneLocalPos: lpOf(b1, pw) });
+          boneCount.set(b1, (boneCount.get(b1) ?? 0) + 1);
+        }
+        return influences;
+      },
+      pushedPos
+    );
+    this.addPart(path, synth.model, synth.texes, synth.texFiles, {
+      uvSeamSplit: false, // FSM 图集无平铺接缝，拆分会误改 authored 大跨度采样弧
+    });
     const part = this.parts.get(path);
     if (part) part.syntheticHair = true;
     const top = [...boneCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
@@ -4596,16 +4545,142 @@ export class Viewer {
     );
   }
 
-  removeBoneAttached(path: string) {
-    if (this.parts.has(path) && this.parts.get(path)!.syntheticHair) {
-      this.removePart(path); // 长发自动绑骨合成件
+  /** 刚性帽 → 合成蒙皮部件：mount 烘焙进顶点，全部顶点单骨 w=1（挂点骨）。
+   *  单骨 LBS = boneW(t)·boneW0⁻¹·pw，与旧 holder 刚挂（boneW(t)·boneW0⁻¹
+   *  作用于挂接位顶点）逐点等价，法线静态与引擎蒙皮同口径。骨缺失/无骨架
+   *  时零权重保持绑定姿势 = 旧静态摆放（FSM authored 局部坐标直出） */
+  private buildRigidHatPart(path: string) {
+    const e = this.boneAttached.get(path);
+    if (!e || e.autoHair) return;
+    const { model, mats, offset, boneName } = e;
+    const bone = this.resolveMountBone(boneName);
+    e.bone = bone;
+    let synth: { model: FskinModel; texes: (TexData | null)[]; texFiles: (string | null)[] };
+    if (bone && this.bindWorldMats.length) {
+      const idx = this.skelBones.indexOf(bone);
+      const { mount, origin } = this.mountOf(bone, offset);
+      e.origin = origin;
+      synth = this.synthFromFsm(path + "#mount", model, mats, mount, (pw, lpOf) => [
+        { boneIndex: idx, weight: 1, boneLocalPos: lpOf(idx, pw) },
+      ]);
+    } else {
+      e.origin = null;
+      synth = this.synthFromFsm(path + "#mount", model, mats, new THREE.Matrix4(), (pw) => [
+        { boneIndex: 0, weight: 0, boneLocalPos: [pw.x, pw.y, pw.z] },
+      ]);
     }
+    this.addPart(path, synth.model, synth.texes, synth.texFiles, {
+      uvSeamSplit: false, // FSM 图集无平铺接缝，拆分会误改 authored 大跨度采样弧
+    });
+    const part = this.parts.get(path);
+    if (part) part.syntheticMount = true;
+  }
+
+  /** FSM → 合成蒙皮 FskinModel：mount 挂接矩阵烘焙进顶点（pos = mount·
+   *  authored、normal 按方向量变换即归一化），影响表由 weightFn 给出（长发
+   *  最近骨分配 / 刚性帽单骨 w=1 / 静态回落零权重）。UV 岛修复与
+   *  buildFsmMeshes 同口径（mask 类图集行序混排按簇色判据分流）。
+   *  posOverride 给定时跳过 mount 直接采用（长发体表外推后的位置）。
+   *  返回的 texes/texFiles/materials 均按子网格的 s.index 材质引用对位
+   *  （setFsm 单独渲染同口径；addPart 按位置序消费，故在此重排） */
+  private synthFromFsm(
+    synthPath: string,
+    model: FsmModel,
+    mats: { tex: TexData | null; file: string | null }[],
+    mount: THREE.Matrix4,
+    weightFn: (
+      pw: THREE.Vector3,
+      lpOf: (b: number, pw: THREE.Vector3) => number[]
+    ) => Influence[],
+    posOverride?: THREE.Vector3[]
+  ): {
+    model: FskinModel;
+    texes: (TexData | null)[];
+    texFiles: (string | null)[];
+  } {
+    const inv = new THREE.Matrix4();
+    const lpOf = (b: number, pw: THREE.Vector3): number[] => {
+      inv.copy(this.bindWorldMats[b]).invert();
+      const local = pw.clone().applyMatrix4(inv);
+      return [local.x, local.y, local.z];
+    };
+
+    const uvFix = new Float32Array(model.vertexCount * 2);
+    for (let i = 0; i < model.vertexCount; i++) {
+      uvFix[i * 2] = model.vertices[i * 8 + 6];
+      uvFix[i * 2 + 1] = model.vertices[i * 8 + 7];
+    }
+    for (const [mi, tris] of Viewer.trisByMaterial(model)) {
+      const mt = mats[mi];
+      if (!Viewer.texFlip(model.materials[mi]?.pre) || !mt?.tex) continue;
+      Viewer.repairMaskUvIslands(uvFix, tris, mt.tex);
+    }
+
+    const verts: Vertex[] = [];
+    const v3 = new THREE.Vector3();
+    for (let i = 0; i < model.vertexCount; i++) {
+      const pw = posOverride?.[i]
+        ? posOverride[i].clone()
+        : v3
+            .set(model.vertices[i * 8], model.vertices[i * 8 + 1], model.vertices[i * 8 + 2])
+            .applyMatrix4(mount);
+      const nrm = new THREE.Vector3(
+        model.vertices[i * 8 + 3],
+        model.vertices[i * 8 + 4],
+        model.vertices[i * 8 + 5]
+      ).transformDirection(mount);
+      verts.push({
+        pos: [pw.x, pw.y, pw.z],
+        normal: [nrm.x, nrm.y, nrm.z],
+        uv: [uvFix[i * 2], uvFix[i * 2 + 1]],
+        influences: weightFn(pw, lpOf),
+      });
+    }
+
+    // 材质按子网格的 s.index 引用对位（setFsm 单独渲染同口径；多子网格共用
+    // 材质时重复排列，addPart 按位置序消费即可得到正确材质）
+    const matIdxOf = (sm: { index: number }) =>
+      Math.min(sm.index, model.materials.length - 1);
+    return {
+      model: {
+        path: synthPath,
+        version: 1,
+        bboxMax: [...model.bboxMax],
+        bboxMin: [...model.bboxMin],
+        reserved256: [],
+        vertices: verts,
+        submeshes: model.submeshes.map((sm) => ({
+          zero1: (sm.index << 16) >>> 0,
+          zero2: 0,
+          vertexCount2: sm.vertexCount,
+          misc: [0, 0, 0, 0, 0, 0],
+          triangles: [...sm.triangles],
+        })),
+        materials: model.submeshes.map((sm) => {
+          const mm = model.materials[matIdxOf(sm)];
+          return {
+            lead: mm?.index ?? 0,
+            diffuse: [...(mm?.diffuse ?? [1, 1, 1])],
+            ambient: [...(mm?.ambient ?? [1, 1, 1])],
+            emissive: [...(mm?.emissive ?? [0, 0, 0])],
+            specular: [...(mm?.specular ?? [0, 0, 0])],
+            specPower: mm?.specPower ?? 0,
+            pre: [...(mm?.pre ?? [])],
+            texturePath: mm?.texturePath ?? "",
+            tail: [],
+          };
+        }),
+      },
+      texes: model.submeshes.map((sm) => mats[matIdxOf(sm)]?.tex ?? null),
+      texFiles: model.submeshes.map((sm) => mats[matIdxOf(sm)]?.file ?? null),
+    };
+  }
+
+  removeBoneAttached(path: string) {
     const e = this.boneAttached.get(path);
     if (!e) return;
     this.dlog(`帽子卸下: ${path.replace(/^.*[\\/]/, "")} · 剩余 ${this.boneAttached.size - 1}`);
-    e.holder.parent?.remove(e.holder);
-    for (const g of e.geoms) g.dispose();
-    for (const m of e.mats) m.dispose();
+    if (this.parts.has(path)) this.removePart(path); // 合成部件（长发/刚性帽统一）
     this.boneAttached.delete(path);
   }
 
@@ -4616,13 +4691,11 @@ export class Viewer {
   setBoneAttachedOffset(path: string, offset: [number, number, number]) {
     const e = this.boneAttached.get(path);
     if (!e) return;
-    e.inner.position.set(offset[0], offset[1], offset[2]);
-    if (e.autoHair) {
-      // 长发合成件把挂接矩阵烘焙进顶点，改 inner 不产生视觉变化——
-      // 必须更新 autoHair.offset 并重建（体表外推+绑骨以新偏移重跑）
-      e.autoHair.offset = [offset[0], offset[1], offset[2]];
-      this.buildAutoHairPart(path);
-    }
+    // 挂接矩阵烘焙进顶点：改偏移对合成件不产生视觉变化，必须更新元数据并
+    // 重建（长发含体表外推+绑骨重跑，刚性帽重烘焙 mount）
+    e.offset = [offset[0], offset[1], offset[2]];
+    if (e.autoHair) this.buildAutoHairPart(path);
+    else this.buildRigidHatPart(path);
   }
 
   /** 骨名列表（帽槽挂点选择用），按骨架当前骨序 */
@@ -4631,9 +4704,13 @@ export class Viewer {
   }
 
   /**
-   * 按当前骨架重挂。FSM 网格为**局部坐标**建模（原点 = 挂点锚，帽子/武器均
-   * 绕原点，实测 FM01 bbox ±10~15、J01 ±10~43，不存在世界坐标 authored 的 FSM；
-   * 帽类 FSM 挂点区全为 0，不带任何逐模型修正）。
+   * 按当前骨架重建挂接件合成部件（骨架加载/切换/清空后调用）：mount 与
+   * boneLocalPos 均按新骨架绑定姿态（帧 0 快照）重新烘焙，渲染结果与重建
+   * 时刻无关（等价引擎逐帧重算 boneW(t)·offset）。挂接口径见 mountOf：
+   *
+   * FSM 网格为**局部坐标**建模（原点 = 挂点锚，帽子/武器均绕原点，实测
+   * FM01 bbox ±10~15、J01 ±10~43，不存在世界坐标 authored 的 FSM；帽类
+   * FSM 挂点区全为 0，不带任何逐模型修正）。
    *
    * tag_* 挂点骨（引擎约定，AvatarBoy/Girl 全部 FSKEL 均自带 tag_Hat /
    * tag_LWeapon / tag_LWrist / tag_RWeapon / tag_RWrist）：原点直落骨骼原点、
@@ -4651,83 +4728,25 @@ export class Viewer {
    * 游戏内实测）。该挂法只逼近了 tag_Hat 的位置（HAT_OFFSET.x=10≈局部
    * 9.47）未复现其姿态，不对称帽子会有残差，仅兜底用。
    *
-   * 运动学（两种挂法相同）：身体网格显示经过 modelRoot 的 MODEL_YAW(π)，
-   * 而骨骼层级在 scene（数据空间）——若帽子直接挂骨骼下渲染，其俯仰/侧倾
-   * 相对身体是**共轭镜像**的（头前倾时帽子后仰，实测）。故挂接改为
-   * modelRoot → holder（每帧 = boneW(t)·boneW0⁻¹ 相对运动）→
-   * fix（= Yawπ·boneW0·[T静态]）→ inner：静态时 Yawπ·I·Yawπ 相消，与骨下
-   * 直接挂接完全同位；动画时总变换 = Yawπ·(boneW(t)·boneW0⁻¹)·Yawπ·(boneW0·T)
-   * = 共轭相对运动 × 静态位，与身体蒙皮顶点的显示运动逐点同向。绕竖直轴
-   * 转动原本就一致，水平轴转动由共轭修正。
+   * 运动学：顶点烘焙到数据空间（mount·authored），显示经 modelRoot 的
+   * MODEL_YAW(π) 与身体蒙皮件同口径——单骨 LBS = boneW(t)·boneW0⁻¹·pw，
+   * 与身体件逐点同向，旧 holder 路径的 Yaw 共轭补偿不再需要。
    *
-   * 骨名不存在时按普通静态网格摆放（挂 modelRoot、无每帧更新）。
+   * 骨名不存在/骨架未加载时走零权重静态回落（authored 局部坐标直出）。
    */
   private refreshBoneAttached(path?: string) {
-    const entries = path
-      ? [this.boneAttached.get(path)].filter((e) => !!e)
-      : [...this.boneAttached.values()];
-    for (const e of entries) {
+    const paths = path ? [path] : [...this.boneAttached.keys()];
+    for (const p of paths) {
+      const e = this.boneAttached.get(p);
+      if (!e) continue;
       if (e.autoHair) {
-        if (this.parts.has(path ?? "") && this.parts.get(path ?? "")!.syntheticHair) {
-          this.removePart(path!);
-        }
-        this.buildAutoHairPart(path!);
-        continue;
-      }
-      const lower = e.boneName.toLowerCase();
-      const bone =
-        this.skelBones.find((b) => b.name.toLowerCase() === lower) ??
-        this.skelBones.find((b) => b.name.toLowerCase().includes(lower));
-      if (bone) {
-        e.bone = bone;
-        // 静态基准恒取帧 0（绑定姿态）快照：渲染结果与挂接时刻无关（等价
-        // 引擎逐帧重算 boneW(t)·offset）。若取点击瞬间姿态，播放中戴帽的
-        // 头部俯仰经 Yawπ 共轭会留残差——不同时刻戴的帽贴合度有细微差别
-        const idx = this.skelBones.indexOf(bone);
-        const bindW = (idx >= 0 ? this.bindWorldMats[idx] : null) ?? bone.matrixWorld;
-        e.bindInv.copy(bindW).invert();
-        this.modelRoot.add(e.holder);
-        bone.updateWorldMatrix(true, false);
-        // 以当前姿态播种相对运动（暂停在非 0 帧时挂接也在正确位置；
-        // 播放中由 updateBoneAttachedMats 每帧重写为同一函数）
-        e.holder.matrix.multiplyMatrices(bone.matrixWorld, e.bindInv);
-        const isTag = bone.name.toLowerCase().startsWith("tag_");
-        e.fix.matrix.makeRotationY(MODEL_YAW).multiply(bindW);
-        if (isTag) {
-          // 锚点补偿（用户实测值固化）；面板偏移另算
-          e.fix.matrix.multiply(
-            new THREE.Matrix4().makeTranslation(
-              Viewer.TAG_MOUNT_OFFSET.x,
-              Viewer.TAG_MOUNT_OFFSET.y,
-              Viewer.TAG_MOUNT_OFFSET.z
-            )
-          );
-        } else {
-          e.fix.matrix.multiply(
-            new THREE.Matrix4().makeTranslation(
-              Viewer.HAT_OFFSET.x,
-              Viewer.HAT_OFFSET.y,
-              Viewer.HAT_OFFSET.z
-            )
-          );
-        }
-        // tag 挂法：Ry(π) 前后归位（恒等直挂会反面）；回落挂法：Rz(−90°) mesh +Y→骨+X
-        e.inner.rotation.set(0, isTag ? Math.PI : 0, isTag ? 0 : -Math.PI / 2);
+        // 长发合成件重建（含体表外推重跑）；骨架未就位时 build 前置守卫
+        // 直接返回，先卸旧件避免旧骨架数据残留
+        if (this.parts.has(p)) this.removePart(p);
+        this.buildAutoHairPart(p);
       } else {
-        e.bone = null;
-        this.modelRoot.add(e.holder); // modelRoot 已带显示旋转
-        e.holder.matrix.identity();
-        e.fix.matrix.identity();
-        e.inner.rotation.set(0, 0, 0);
+        this.buildRigidHatPart(p); // addPart 内部替换旧件
       }
-    }
-  }
-
-  /** 每帧把骨骼当前相对运动写入挂接 holder（applyFskelFrame 在骨骼世界矩阵
-   *  刷新后调用；静态回落路径 bone=null 跳过） */
-  private updateBoneAttachedMats() {
-    for (const e of this.boneAttached.values()) {
-      if (e.bone) e.holder.matrix.multiplyMatrices(e.bone.matrixWorld, e.bindInv);
     }
   }
 

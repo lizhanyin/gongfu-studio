@@ -12,8 +12,14 @@ import type {
 
 export const api = {
   scanModelSet: (dir: string) => invoke<ModelSet>("scan_model_set", { dir }),
-  /** 角色装扮目录扫描：基础模型 / 装备槽 / 时装 + 全根贴图索引 */
-  scanCharacter: (root: string) => invoke<CharacterCatalog>("scan_character", { root }),
+  /** 角色装扮目录扫描：基础模型 / 装备槽 / 时装 + 全根贴图索引；
+   *  npcModels/npcTextures 为可选 NPC.GCPK / NPCRes.GCPK 的 cpk: 路径 */
+  scanCharacter: (root: string, npcModels?: string, npcTextures?: string) =>
+    invoke<CharacterCatalog>("scan_character", {
+      root,
+      npcModels: npcModels || null,
+      npcTextures: npcTextures || null,
+    }),
   loadFskin: (path: string) => invoke<FskinModel>("load_fskin", { path }),
   saveFskin: (path: string, model: FskinModel) =>
     invoke<void>("save_fskin", { path, model }),

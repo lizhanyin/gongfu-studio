@@ -36,10 +36,19 @@ async fn scan_model_set(dir: String) -> Result<fskin::ModelSet, String> {
     run_blocking(move || fskin::scan_model_set(&dir)).await
 }
 
-/// 角色装扮目录扫描：基础模型 / 装备槽 / 时装 + 全根贴图索引
+/// 角色装扮目录扫描：基础模型 / 装备槽 / 时装 + 全根贴图索引；
+/// npc_models/npc_textures 为可选的 NPC.GCPK / NPCRes.GCPK `cpk:` 路径
+/// （NPC 的 FSM 并入帽槽、贴图并入索引，缺失或打不开则静默跳过）
 #[tauri::command]
-async fn scan_character(root: String) -> Result<dress::CharacterCatalog, String> {
-    run_blocking(move || dress::scan_character(&root)).await
+async fn scan_character(
+    root: String,
+    npc_models: Option<String>,
+    npc_textures: Option<String>,
+) -> Result<dress::CharacterCatalog, String> {
+    run_blocking(move || {
+        dress::scan_character(&root, npc_models.as_deref(), npc_textures.as_deref())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -322,9 +331,9 @@ pub fn dds_decode_for_test(bytes: &[u8]) -> Result<Vec<u8>, String> {
     dds::decode_dds(bytes).map(|t| t.rgba)
 }
 
-/// 诊断探针（dress_scan 示例用）：装扮目录扫描结果
+/// 诊断探针（dress_scan 示例用）：装扮目录扫描结果（不含 NPC 包）
 pub fn dress_scan_for_test(root: &str) -> Result<dress::CharacterCatalog, String> {
-    dress::scan_character(root)
+    dress::scan_character(root, None, None)
 }
 
 /// 诊断探针（fsm_mat 示例用）：FSM 材质贴图路径列表（index, path）

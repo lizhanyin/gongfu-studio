@@ -36,6 +36,51 @@ function stemOf(file: string): string {
   return (file.split(/[\\/]/).pop() ?? "").replace(/\.[^.]*$/, "").toLowerCase();
 }
 
+/** NPC 资源包默认位置（cpk: 寻址；GCPK 为游戏 CPK 同格式包）。
+ *  localStorage "dress.npcPacks"（JSON {models,textures}）可覆盖 */
+const NPC_PACKS_KEY = "dress.npcPacks";
+const NPC_PACKS_DEFAULT = {
+  models: "F:\\game\\客户端\\客户端\\wf\\Character\\NPC\\NPC.GCPK",
+  textures: "F:\\game\\客户端\\客户端\\wf\\resource\\NPCRes\\NPCRes.GCPK",
+};
+function loadNpcPacks(): { models: string; textures: string } {
+  try {
+    const v = JSON.parse(localStorage.getItem(NPC_PACKS_KEY) ?? "null");
+    if (v && typeof v.models === "string" && typeof v.textures === "string") {
+      return v;
+    }
+  } catch {
+    // 配置损坏回落默认
+  }
+  return NPC_PACKS_DEFAULT;
+}
+
+/** 每帽挂接记忆：`${baseKey}|${帽子路径}` → {bone, offset}。
+ *  localStorage "dress.hatTuning.v1" 持久化，换帽/换角色自动应用 */
+const HAT_TUNING_KEY = "dress.hatTuning.v1";
+type HatTuning = { bone: string; offset: [number, number, number] };
+function loadHatTuning(): Map<string, HatTuning> {
+  const m = new Map<string, HatTuning>();
+  try {
+    const v = JSON.parse(localStorage.getItem(HAT_TUNING_KEY) ?? "null");
+    if (v && typeof v === "object") {
+      for (const [k, t] of Object.entries(v)) {
+        const tt = t as HatTuning;
+        if (
+          typeof tt?.bone === "string" &&
+          Array.isArray(tt?.offset) &&
+          tt.offset.length === 3
+        ) {
+          m.set(k, { bone: tt.bone, offset: [...tt.offset] as [number, number, number] });
+        }
+      }
+    }
+  } catch {
+    // 配置损坏从空开始
+  }
+  return m;
+}
+
 /**
  * 角色装扮模式：组合 skin（基础模型 + 目录内变体）与 act（骨架动作），
  * 在此之上管理装备槽（Hat/Armonr/Lower/Glove/Boot）与时装（shizhuang）。
@@ -57,6 +102,47 @@ export function useDressMode(
   /** 帽子挂接骨骼名（空 = 自动选含 head 的骨）与显示偏移 */
   const hatBone = ref("");
   const hatOffset = ref<[number, number, number]>([0, 0, 0]);
+
+  // ---------- 每帽挂接记忆（按角色分开） ----------
+
+  const hatTuning = loadHatTuning();
+  /** >0 时帽挂参数变更来自记忆回放（换帽应用），监听器跳过重挂与持久化 */
+  let hatTuningReplay = 0;
+  const tuningKeyOf = (hatPath: string) => `${baseKey.value}|${hatPath}`;
+
+  function saveHatTuning() {
+    const path = equipPath.get("hat");
+    if (!path || !equipOn.get("hat")) return;
+    hatTuning.set(tuningKeyOf(path), {
+      bone: hatBone.value,
+      offset: [...hatOffset.value] as [number, number, number],
+    });
+    try {
+      localStorage.setItem(
+        HAT_TUNING_KEY,
+        JSON.stringify(Object.fromEntries(hatTuning))
+      );
+    } catch {
+      // 存储满等异常忽略（内存态仍生效）
+    }
+  }
+
+  /** 换帽时应用该帽（当前角色）的记忆挂骨+偏移；无记忆保留当前值
+   *  （切换套装不把已调偏移重置为 0——多数帽共用量级相近；用户手动
+   *  归零/调整会写入该帽记忆，显式记忆优先） */
+  function applyHatTuning(hatPath: string) {
+    hatTuningReplay++;
+    try {
+      const t = hatTuning.get(tuningKeyOf(hatPath));
+      if (t) {
+        hatBone.value = t.bone;
+        hatOffset.value = [...t.offset] as [number, number, number];
+      }
+    } finally {
+      // watch 回调在下方 await 的 IO 间隙刷新，届时仍是抑制态
+      setTimeout(() => hatTuningReplay--, 0);
+    }
+  }
 
   /** 已加载的装备/时装模型（fskin 或 fsm），跨槽位复用 */
   const loaded = reactive(new Map<string, FskinModel | FsmModel>());
@@ -268,9 +354,18 @@ export function useDressMode(
     // 时装覆盖期间身体装备只记录状态不渲染（关时装时恢复）；帽子共存
     const hiddenByFashion =
       fashionOn.value && FASHION_MUTEX_SLOTS.includes(slotKey);
-    if (slot.kind === "fsm") await addHat(path);
-    else if (!hiddenByFashion) await addFskinPart(path);
-    syncBaseSlots();
+    if (slot.kind === "fsm") {
+      applyHatTuning(path); // 先取该帽记忆的挂骨+偏移（无记忆默认值）
+      await addHat(path);
+      syncBaseSlots();
+      // 初始构建时被套装隐藏的基础件仍可见（体表外推障碍含基础身体，
+      // 男38实测 213 顶点外推），隐藏落定后按同参重建一次，与后续偏移
+      // 调整的障碍口径一致（实测 97），避免首次调整时形态跳变
+      viewer.value?.setBoneAttachedOffset(path, hatOffset.value);
+    } else {
+      if (!hiddenByFashion) await addFskinPart(path);
+      syncBaseSlots();
+    }
   }
 
   function toggleEquip(slotKey: string, on: boolean) {
@@ -539,7 +634,8 @@ export function useDressMode(
       // catalog 一旦先清空，removeAllDressParts 将查不到路径什么都不卸，
       // 旧套装部件残留场景，与新装配的基础模型重叠）
       removeAllDressParts();
-      const c = await api.scanCharacter(root ?? "");
+      const npc = loadNpcPacks();
+      const c = await api.scanCharacter(root ?? "", npc.models, npc.textures);
       catalog.value = c;
       // 重扫时保留当前基础模型（资源里仍有时），首次默认女体
       baseKey.value =
@@ -596,16 +692,24 @@ export function useDressMode(
 
   // ---------- 联动监听 ----------
 
-  // 帽子挂点/偏移调整
+  // 帽子挂点调整：重挂 + 记忆（记忆回放期间跳过）
   watch(hatBone, async () => {
+    if (hatTuningReplay > 0) return;
+    saveHatTuning();
     const path = equipPath.get("hat");
     if (path && equipOn.get("hat")) await addHat(path);
   });
-  // 偏移连击（步进按钮/逐键输入）做短去抖：长发合成件重建含体表外推较重
+  // 偏移连击（步进按钮/逐键输入）做短去抖：长发合成件重建含体表外推较重；
+  // 值变更即记忆（去抖只作用于视口重建）
   let hatOffsetTimer: ReturnType<typeof setTimeout> | undefined;
   watch(
     hatOffset,
     () => {
+      if (hatTuningReplay > 0) {
+        clearTimeout(hatOffsetTimer); // 旧帽遗留的待发重建随换帽作废
+        return;
+      }
+      saveHatTuning();
       clearTimeout(hatOffsetTimer);
       hatOffsetTimer = setTimeout(() => {
         const path = equipPath.get("hat");

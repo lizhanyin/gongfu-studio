@@ -240,8 +240,64 @@ fn scan_equip_dir(
     items
 }
 
-/// 扫描角色资源：基础模型 + 装备槽 + 时装 + 全根贴图索引
-pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
+/// NPC.GCPK 内全部 FSM → 帽槽物品（NPC 模型当头饰挂 tag_Hat 试戴）。
+/// 解析失败/缺材质的条目跳过；.gender 统一 "u"。
+fn scan_npc_hats(
+    pack: &str,
+    tex_index: &BTreeMap<String, String>,
+    path_index: &BTreeMap<String, String>,
+) -> Vec<EquipItem> {
+    let mut items = Vec::new();
+    for f in vfs::walk_files(pack, &["fsm"]) {
+        let Ok(bytes) = vfs::read_file(&f.path) else {
+            continue;
+        };
+        let Ok(m) = fsm::parse_fsm(&f.path, &bytes) else {
+            continue;
+        };
+        let tex_paths: Vec<String> = m
+            .materials
+            .iter()
+            .map(|md| md.texture_path.clone())
+            .collect();
+        let (gender, number) = parse_gender_number(&f.name);
+        // NPC 材质路径的目录部分是包内结构，路径键按包内路径解析；
+        // 失败回落全根 stem 索引（NPCRes 贴图已并入）
+        let texture_files = tex_paths
+            .iter()
+            .map(|p| {
+                path_index
+                    .get(&tex_path_key(p))
+                    .cloned()
+                    .or_else(|| tex_stem_of(p).and_then(|stem| tex_index.get(&stem).cloned()))
+            })
+            .collect();
+        items.push(EquipItem {
+            name: f.name.clone(),
+            path: f.path,
+            gender,
+            number,
+            vertex_count: m.vertex_count,
+            triangle_count: m
+                .submeshes
+                .iter()
+                .map(|s| s.triangles.len() as u32 / 3)
+                .sum(),
+            texture_files,
+        });
+    }
+    items
+}
+
+/// 扫描角色资源：基础模型 + 装备槽 + 时装 + 全根贴图索引。
+/// npc_models / npc_textures 给出 NPC.GCPK / NPCRes.GCPK 的 `cpk:` 寻址，
+/// 存在则把 NPC 的全部 FSM 并入帽槽（NPC 模型当头饰挂戴）、贴图并入全根索引；
+/// 路径不存在或格式不符则静默跳过（不阻断角色扫描）。
+pub fn scan_character(
+    input: &str,
+    npc_models: Option<&str>,
+    npc_textures: Option<&str>,
+) -> Result<CharacterCatalog, String> {
     let root = find_character_root(input)?;
 
     // 全根贴图索引 ×2：stem（同名取路径序首个，兜底用）与游戏相对路径（精确，
@@ -268,6 +324,38 @@ pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
             stem,
             path: t.path.clone(),
         });
+    }
+
+    // NPC 资源包：贴图（NPCRes.GCPK）先并入全根索引，再扫模型（NPC.GCPK）
+    // 的 FSM 并入帽槽——材质解析依赖索引已含 NPCRes
+    let mut npc_hat_items: Vec<EquipItem> = Vec::new();
+    if let Some(npc_textures) = npc_textures.filter(|p| !p.is_empty()) {
+        if vfs::exists(npc_textures) {
+            for t in vfs::walk_files(npc_textures, &["dds", "tga", "png", "jpg", "bmp"]) {
+                let Some(stem) = tex_stem_of(&t.name) else {
+                    continue;
+                };
+                // 路径键用包内路径（cpk: 前缀与包文件本身不属于材质引用的路径空间）
+                let inner = vfs::split_cpk(&t.path)
+                    .map(|(_, i)| i)
+                    .unwrap_or_else(|| t.name.clone());
+                path_index
+                    .entry(tex_path_key(&inner))
+                    .or_insert_with(|| t.path.clone());
+                tex_index
+                    .entry(stem.clone())
+                    .or_insert_with(|| t.path.clone());
+                tex_infos.push(fskin::TexInfo {
+                    stem,
+                    path: t.path.clone(),
+                });
+            }
+        }
+    }
+    if let Some(npc_models) = npc_models.filter(|p| !p.is_empty()) {
+        if vfs::exists(npc_models) {
+            npc_hat_items = scan_npc_hats(npc_models, &tex_index, &path_index);
+        }
     }
 
     let mut bases = Vec::new();
@@ -298,11 +386,15 @@ pub fn scan_character(input: &str) -> Result<CharacterCatalog, String> {
     let mut slots = Vec::new();
     for (dir_name, label, kind) in SLOT_DIRS {
         let dir = vfs::join_vpath(&root, dir_name);
-        let items = if vfs::exists(&dir) {
+        let mut items = if vfs::exists(&dir) {
             scan_equip_dir(&dir, kind, &tex_index, &path_index)
         } else {
             Vec::new()
         };
+        // NPC 模型全部进帽槽（gender u，两性基础模型均可挂戴）
+        if dir_name == "hat" && !npc_hat_items.is_empty() {
+            items.append(&mut npc_hat_items);
+        }
         slots.push(CharacterSlot {
             key: dir_name.to_string(),
             label: label.to_string(),
@@ -387,7 +479,7 @@ mod tests {
 
     #[test]
     fn scan_res_system() {
-        let c = scan_character(&res_dir()).unwrap();
+        let c = scan_character(&res_dir(), None, None).unwrap();
         // 基础模型：AvatarGirl（仓库样本必有）
         assert!(
             c.bases.iter().any(|b| b.key == "avatargirl"),
@@ -408,7 +500,7 @@ mod tests {
     /// 造样本后的装备扫描（res/system/Armonr 等，样本缺失时跳过）
     #[test]
     fn scan_equip_samples() {
-        let c = scan_character(&res_dir()).unwrap();
+        let c = scan_character(&res_dir(), None, None).unwrap();
         let armonr = c.slots.iter().find(|s| s.key == "armonr").unwrap();
         if armonr.items.is_empty() {
             eprintln!("跳过: 无 Armonr 装备样本");
