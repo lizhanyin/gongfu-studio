@@ -685,7 +685,11 @@ export class Viewer {
     }
     let flippedVerts = 0;
     for (const cl of cls) {
-      const wantFlip = cl.b0 > 0 && cl.b1 < cl.b0;
+      // 黑占比闸：恒等采样以真实彩色 art 为主的簇不翻——少量 authored 黑
+      // 描边（FM38 耳饰盘簇实测 75% 紫盘 + 4% 黑描边）是合法 art，游戏按
+      // authored UV 原样渲染 fm38.dds 的紫盘岛（引擎无任何 UV 修复）；
+      // 只有恒等落点被黑垫底主导（≥50% 不透明采样为纯黑）才是行序错排
+      const wantFlip = cl.b0 > 0 && cl.b1 < cl.b0 && cl.b0 * 2 >= cl.idOp;
       if (wantFlip) {
         for (const i of cl.comp) uv[i * 2 + 1] = 1 - uv[i * 2 + 1];
         flippedVerts += cl.comp.length;
@@ -904,10 +908,12 @@ export class Viewer {
     geom.setIndex(tri);
 
     // 每子网格一个材质（护甲类多节网格各有贴图），groups 对应拼接区间。
-    // mask 类（FSM 毛发/帽图集）按引擎 ALPHAREF=240 裁切；基础阈值记入
-    // userData 供 highlight 压暗后还原
+    // mask 判据与引擎同口径：材质记录 pre[2]≠0xFF ⇒ MMAlphaMask 类按引擎
+    // ALPHAREF=240 裁切（合成件路径由调用方显式传入；FSKIN 部件材质自带
+    // 同款 pre 位）。基础阈值记入 userData 供 highlight 压暗后还原
     const mats: THREE.MeshStandardMaterial[] = model.submeshes.map((_s, k) => {
-      const base = this.baseAlphaTestOf(!!opts?.texMask?.[k]);
+      const mask = opts?.texMask?.[k] ?? Viewer.texFlip(model.materials[k]?.pre);
+      const base = this.baseAlphaTestOf(mask);
       const mat = new THREE.MeshStandardMaterial({
         side: THREE.DoubleSide,
         roughness: 0.75,
@@ -923,7 +929,7 @@ export class Viewer {
       const texFile = texFiles[k] ?? null;
       const md = model.materials[k];
       if (tex && texFile) {
-        mat.map = this.getTexture(texFile, tex, false, opts?.texMask?.[k]);
+        mat.map = this.getTexture(texFile, tex, false, mask);
         (mat as any).customColorAttribute = "color";
       }
       if (md) {
@@ -3848,11 +3854,12 @@ export class Viewer {
       // 材质按记录自带序号（多节可共用同一材质）
       const matIdx = Math.min(s.index, model.materials.length - 1);
       const fm = model.materials[matIdx];
+      const mask = Viewer.texFlip(fm?.pre); // 与 addPart 同口径：pre[2]≠0xFF ⇒ 引擎 240 裁切
       const mat = new THREE.MeshStandardMaterial({
         side: THREE.DoubleSide,
         roughness: 0.75,
         metalness: 0.0,
-        alphaTest: 0.1, // 特效贴图镂空区裁掉，避免透明 texel 渲染成黑块
+        alphaTest: this.baseAlphaTestOf(mask),
       });
       if (fm) {
         mat.color.setRGB(fm.diffuse[0], fm.diffuse[1], fm.diffuse[2]);
@@ -3860,7 +3867,7 @@ export class Viewer {
         mat.roughness = Math.max(0.05, Math.min(1, 1 - fm.specPower / 60));
       }
       const m = mats[matIdx];
-      if (m?.tex && m.file) mat.map = this.getTexture(m.file, m.tex);
+      if (m?.tex && m.file) mat.map = this.getTexture(m.file, m.tex, false, mask);
       const mesh = new THREE.Mesh(geom, mat);
       mesh.frustumCulled = false; // 顶点动画变形后静态包围球不再可靠
       this.modelRoot.add(mesh);
