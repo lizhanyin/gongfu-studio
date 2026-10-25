@@ -345,7 +345,7 @@ export class Viewer {
   private static readonly HAT_OFFSET = new THREE.Vector3(10, -1.5, -3);
   /** tag 挂点直挂的锚点补偿（fix/面板帧）：tag_Hat 骨原点相对游戏实际渲染
    *  挂点的残差，由用户面板实测折算固化。面板偏移在此基础上微调（+） */
-  private static readonly TAG_MOUNT_OFFSET = new THREE.Vector3(-1.1, -0.7, 6.2);
+  private static readonly TAG_MOUNT_OFFSET = new THREE.Vector3(-1.2, 0.1, 5.6);
   // 每帧复用的临时对象
   private cCarry = new THREE.Matrix4();
   private cAnchor = new THREE.Vector3();
@@ -2790,6 +2790,9 @@ export class Viewer {
     const pairsOf: [number[], number[]][][] = Array.from({ length: n }, () => []);
     const vertsOf: number[][][] = Array.from({ length: n }, () => []);
     for (const p of this.parts.values()) {
+      // 合成件（长发/NPC 挂饰）不参与布料骨拟合：挂骨下拉可选 Bone* 链骨，
+      // 合成顶点会把该链的模拟锚点/目标拉向发簇（与其余拟合函数同口径）
+      if (p.syntheticHair || p.syntheticMount) continue;
       for (const v of p.model.vertices) {
         for (const inf of v.influences) {
           if (inf.boneIndex >= n) continue;
@@ -2973,6 +2976,9 @@ export class Viewer {
       const W = this.worldsFromPoses(0, mirror);
       let sum = 0;
       for (const p of this.parts.values()) {
+        // 合成件（长发/NPC 挂饰）排除，与其余拟合函数同口径：挂骨下拉可选
+        // Bone* 链骨时合成顶点会带生成数据参与链残差投票（镜像侧残差非 0）
+        if (p.syntheticHair || p.syntheticMount) continue;
         for (const v of p.model.vertices) {
           if (!v.influences.some((inf) => mem.has(inf.boneIndex))) continue;
           let x = 0, y = 0, z = 0;
