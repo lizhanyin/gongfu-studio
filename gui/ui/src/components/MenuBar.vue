@@ -14,6 +14,7 @@ import type { MenuOption } from "naive-ui";
 import type { SkinStore } from "../composables/useSkinMode";
 import type { ActStore } from "../composables/useActMode";
 import type { ResourceTreeStore } from "../composables/useResourceTree";
+import type { DressStore } from "../composables/useDressMode";
 
 /**
  * 下拉条目左侧的勾选槽：所有条目（含普通命令项）都占同等宽度的图标位，
@@ -21,8 +22,16 @@ import type { ResourceTreeStore } from "../composables/useResourceTree";
  */
 const tick = (on: boolean) => () => h("span", { class: "menu-tick" }, on ? "✓" : "");
 
-const props = defineProps<{ skin: SkinStore; act: ActStore; res: ResourceTreeStore }>();
-const emit = defineEmits<{ (e: "dress"): void }>();
+const props = defineProps<{
+  skin: SkinStore;
+  act: ActStore;
+  res: ResourceTreeStore;
+  dress?: DressStore;
+}>();
+const emit = defineEmits<{
+  (e: "dress"): void;
+  (e: "export-full-glb"): void;
+}>();
 
 /** 按作用分组的命令菜单：文件 / 视图（皮肤渲染）/ 动作 / 导出 */
 const options = computed<MenuOption[]>(() => {
@@ -81,6 +90,12 @@ const options = computed<MenuOption[]>(() => {
       label: "导出",
       key: "export",
       children: [
+        {
+          label: "导出整体 GLB（装配模型）…",
+          key: "exp-full-glb",
+          disabled: !props.skin.visiblePaths.length && !props.dress?.catalog,
+          icon: tick(false),
+        },
         {
           label: "导出 OBJ…",
           key: "exp-obj",
@@ -142,6 +157,9 @@ function onCommand(key: string | number) {
       break;
     case "close-act":
       props.act.closeAct();
+      break;
+    case "exp-full-glb":
+      emit("export-full-glb");
       break;
     case "exp-obj":
       void props.skin.exportObj();

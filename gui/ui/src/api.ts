@@ -40,6 +40,13 @@ export const api = {
     invoke<string>("export_fskel_bvh", { path, actionIndex, outPath }),
   exportFskelGlb: (path: string, outPath: string) =>
     invoke<string>("export_fskel_glb", { path, outPath }),
+  /** 整体 GLB:装配部件 + 骨架蒙皮 + 动作动画 + 帽子挂骨(textures 与视口显示同源) */
+  exportFullGlb: (spec: {
+    parts: { path: string; textures: (string | null)[] }[];
+    fskel: string | null;
+    hat: { path: string; bone: string; offset: [number, number, number] } | null;
+    outPath: string;
+  }) => invoke<string>("export_full_glb", { spec }),
   // 资源浏览
   listResDir: (dir: string) => invoke<ResEntry[]>("list_res_dir", { dir }),
   /** 目录配套的默认骨架（轻量，只列 act 目录）：整体预览装配前先换骨架用 */

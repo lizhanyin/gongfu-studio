@@ -4,6 +4,7 @@ mod fak;
 mod fskel;
 mod fskin;
 mod fsm;
+mod glb;
 mod obj;
 mod res;
 mod vfs;
@@ -145,6 +146,55 @@ async fn export_fskel_glb(path: String, out_path: String) -> Result<String, Stri
     run_blocking(move || {
         let f = fskel::get_or_load(&path)?;
         fskel::export_glb(&f, &out_path)
+    })
+    .await
+}
+
+// ---------------- 整体 GLB 导出 ----------------
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GlbHatSpec {
+    path: String,
+    bone: String,
+    offset: [f32; 3],
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GlbFullSpec {
+    /// 可见 fskin 部件:模型路径 + 每材质槽贴图文件(与视口显示同源)
+    parts: Vec<GlbPartSpec>,
+    fskel: Option<String>,
+    hat: Option<GlbHatSpec>,
+    out_path: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GlbPartSpec {
+    path: String,
+    textures: Vec<Option<String>>,
+}
+
+/// 导出整体 GLB:装配部件 + 骨架蒙皮 + 动作动画 + 帽子挂骨
+#[tauri::command]
+async fn export_full_glb(spec: GlbFullSpec) -> Result<String, String> {
+    run_blocking(move || {
+        let parts: Vec<glb::GlbPart> = spec
+            .parts
+            .into_iter()
+            .map(|p| glb::GlbPart {
+                path: p.path,
+                textures: p.textures,
+            })
+            .collect();
+        let hat = spec.hat.map(|h| glb::GlbHat {
+            path: h.path,
+            bone: h.bone,
+            offset: h.offset,
+        });
+        glb::export_full_glb(&parts, spec.fskel.as_deref(), hat.as_ref(), &spec.out_path)
     })
     .await
 }
@@ -311,6 +361,7 @@ pub fn run() {
             load_fskel_frames,
             export_fskel_bvh,
             export_fskel_glb,
+            export_full_glb,
             load_fak,
             save_fak,
             load_fsm,
@@ -706,6 +757,25 @@ pub fn sz38_probe_for_test(cpk_path: &str, fskel_path: &str) -> Result<String, S
         }
     }
     Ok(out)
+}
+
+/// 整体 GLB 导出的自动贴图解析版(示例 / 测试用,贴图按模型根目录 stem 匹配)
+pub fn export_full_glb_auto(
+    part_paths: &[String],
+    fskel_path: Option<&str>,
+    hat: Option<(&str, &str, [f32; 3])>,
+    out_path: &str,
+) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for p in part_paths {
+        parts.push(glb::auto_part(p)?);
+    }
+    let hat = hat.map(|(p, b, o)| glb::GlbHat {
+        path: p.to_string(),
+        bone: b.to_string(),
+        offset: o,
+    });
+    glb::export_full_glb(&parts, fskel_path, hat.as_ref(), out_path)
 }
 
 /// 诊断探针（skirt_probe 示例用）：裙摆防穿模/布料链排查——FSKEL 骨名、

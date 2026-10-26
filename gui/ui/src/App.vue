@@ -3,7 +3,13 @@
     <div class="app">
       <header class="app-header">
         <span class="title">Gongfu Studio</span>
-        <MenuBar :skin="skin" :act="act" :res="res" @dress="openDressMode()" />
+        <MenuBar
+          :skin="skin"
+          :act="act"
+          :res="res"
+          @dress="openDressMode()"
+          @export-full-glb="exportFullGlb()"
+        />
         <div class="header-spacer"></div>
         <n-input
           v-model:value="res.rootDir"
@@ -103,6 +109,7 @@
 
 <script setup lang="ts">
 import { onMounted, ref, watch } from "vue";
+import { save } from "@tauri-apps/plugin-dialog";
 import { darkTheme, zhCN, type GlobalThemeOverrides } from "naive-ui";
 import { useViewer } from "./composables/useViewer";
 import { useSkinMode } from "./composables/useSkinMode";
@@ -445,6 +452,70 @@ async function overlayAdd(e: ResEntry) {
   fsm.closeFsm();
   await skin.addToViewer(e.path);
   if (skin.selectedPart !== e.path) skin.selectPart(e.path);
+}
+
+// ---------------- 整体 GLB 导出 ----------------
+
+/** 与时装互斥渲染的身体装备槽（useDressMode FASHION_MUTEX_SLOTS 同款） */
+const FASHION_MUTEX_SLOTS = ["armonr", "lower", "glove", "boot"];
+
+/**
+ * 整体 GLB 导出（所见即所得）：收集当前装配 —— 基础可见部件（装扮显隐联动
+ * 已写入槽显隐）+ 装备/时装件 + FSM 帽子 + 当前骨架，交后端蒙皮导出。
+ * 贴图取 loaded 模型的最新材质路径按目录索引解析（换脸型/配色一并带出）。
+ */
+async function exportFullGlb() {
+  if (!skin.visiblePaths.length && !dress.catalog) {
+    message.warning("没有可导出的部件");
+    return;
+  }
+  const resolveTex = dress.catalog
+    ? (p: string) => dress.resolveTexPath(p)
+    : (p: string) => skin.resolveTexture(p);
+  const loadedOf = (path: string) => skin.loaded.get(path) ?? dress.loaded.get(path) ?? null;
+  const seen = new Set<string>();
+  const parts: { path: string; textures: (string | null)[] }[] = [];
+  const pushPart = (path: string) => {
+    if (seen.has(path)) return;
+    seen.add(path);
+    const m = loadedOf(path);
+    const textures =
+      m && "materials" in m
+        ? m.materials.map((md) => (md.texturePath ? resolveTex(md.texturePath) : null))
+        : [];
+    parts.push({ path, textures });
+  };
+  for (const p of skin.visiblePaths) pushPart(p);
+  let hat: { path: string; bone: string; offset: [number, number, number] } | null = null;
+  if (dress.catalog) {
+    if (dress.fashionOn && dress.fashionPath) pushPart(dress.fashionPath);
+    for (const s of dress.catalog.slots) {
+      const path = dress.equipPath.get(s.key);
+      if (!path || !dress.equipOn.get(s.key)) continue;
+      if (s.kind === "fsm") {
+        // 帽槽（FSM 挂骨）：骨名空 = 后端自动选 head
+        if (!hat) {
+          hat = { path, bone: dress.hatBone, offset: [...dress.hatOffset] as [number, number, number] };
+        }
+      } else if (!(dress.fashionOn && FASHION_MUTEX_SLOTS.includes(s.key))) {
+        pushPart(path);
+      }
+    }
+  }
+  if (!parts.length && !hat) {
+    message.warning("没有可导出的部件");
+    return;
+  }
+  const out = await save({
+    defaultPath: "character.glb",
+    filters: [{ name: "glTF 二进制", extensions: ["glb"] }],
+  });
+  if (!out) return;
+  try {
+    message.success(await api.exportFullGlb({ parts, fskel: act.actMeta?.path ?? null, hat, outPath: out }));
+  } catch (e) {
+    message.error(`导出失败: ${e}`);
+  }
 }
 
 onMounted(async () => {
