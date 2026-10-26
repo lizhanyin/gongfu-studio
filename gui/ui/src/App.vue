@@ -56,7 +56,8 @@
                   <div>SFX 特效 · {{ shortName(sfx.sfxModel.path) }}</div>
                   <div>
                     节点: {{ sfx.sfxModel.nodes.length }} · 贴图:
-                    {{ sfx.uniqueTextures.length }}（无 3D 预览，见检查器）
+                    {{ sfx.uniqueTextures.length }} · 当前帧
+                    {{ Math.floor(sfx.playTime) }}/{{ sfx.actionFrames - 1 }}（近似翻页预览）
                   </div>
                 </template>
                 <template v-else>
@@ -72,6 +73,7 @@
 
               <PlayBar v-if="act.actMeta" :player="act" />
               <PlayBar v-if="fak.fakModel" :player="fak" />
+              <PlayBar v-if="sfx.sfxModel" :player="sfx" />
 
               <!-- 贴图 2D 预览浮层 -->
               <div v-if="texPreview" class="tex2d">
@@ -217,7 +219,7 @@ const act = useActMode(viewer);
 const fak = useFakMode(viewer);
 const fsm = useFsmMode(viewer);
 const fscn = useFscnMode(viewer);
-const sfx = useSfxMode();
+const sfx = useSfxMode(viewer);
 const dress = useDressMode(viewer, skin, act);
 const res = useResourceTree();
 
@@ -294,7 +296,7 @@ async function rerenderViewport() {
     return;
   }
   if (sfx.sfxModel) {
-    // SFX 无 3D 内容，重开仅刷新检查器数据与贴图解析
+    // 重开重建公告板播放器并刷新检查器数据
     await sfx.openSfxFile(sfx.sfxModel.path);
     return;
   }

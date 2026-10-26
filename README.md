@@ -461,10 +461,15 @@ BVH段（SCN 特有）: [u32 记录总数][记录×N]，第 3 个 u32 为 0 是�
 EffectParticleEmitter（粒子）、EffectCross（交叉面）、EffectCylinder（柱面）、
 EffectBeam（光束）、EffectGrid（面片）、EffectMesh（FAK 网格）、EffectSphere
 （球面）、EffectMsg（数值飘字）、EffectExplosive（爆炸）、EffectSound（音效）。
-查看器：无 3D 预览（粒子/公告板为运行时行为，离线不可复现），检查器显示
-节点树（类型/GBK 节点名）与贴图缩略图（点击放大）、网格（.fak）与音效（.wav）
-引用；资源树附带轻量统计（节点数）。贴图在 `system\effect\tex\`，与 FSCN 同
-「路径优先」口径解析（祖先拼接 + .dds 重试）。
+查看器：近似播放器——参数区字段未逆向（粒子/发射行为离线不可复现），每个带
+贴图的节点渲染为一张公告板（Sprite，始终面向相机），按其贴图序列逐帧翻页
+（帧率可调，默认 12fps；序列内取模循环），叠加混合（可切普通透明）；根矩阵
+线性部分作用于整组、世界平移丢弃（Scn 摆放位离原点数千米）。检查器：节点
+列表限高滚动，贴图缩略图点击放大（吸底固定高度常驻）并可**改写贴图引用
+路径**（raw 内原槽位就地覆写、长度只减不增，同目录下拉 + 自定义路径，
+未解析到 .tga 时可改指 .dds），改写经「保存」落盘（CPK 内不可写）；
+EffectSound 引用可在线试听。资源树附带轻量统计（节点数）。贴图在
+`system\effect\tex\`，与 FSCN 同「路径优先」口径解析（祖先拼接 + .dds 重试）。
 
 节点参数区为逐类型变长（贴图槽数组 EffectQuad 72B/个、Emitter 168B、
 Cylinder 120B、Cross 124B、Sphere 108B、Beam 76B、Grid 96B + 变长字符串），

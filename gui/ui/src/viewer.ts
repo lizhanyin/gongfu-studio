@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { FakModel, FsmModel, FskinModel, FskelMeta, Influence, Vertex } from "./types";
+import type { FakModel, FsmModel, FskinModel, FskelMeta, Influence, SfxFile, Vertex } from "./types";
 import { gfm, gfmEnabled } from "./gfm";
 
 export interface TexData {
@@ -378,6 +378,22 @@ export class Viewer {
   private fsmDummyGroup: THREE.Group | null = null;
   private fsmDummyGeoms: THREE.SphereGeometry[] = [];
   private fsmDummyMats: THREE.Material[] = [];
+
+  // ---- SFX 特效播放器（近似预览：参数区字段未逆向，按节点贴图序列逐帧翻页）----
+  private sfxGroup: THREE.Group | null = null;
+  /** 各贴图节点一个公告板（Sprite 始终面向相机），node = 节点序 */
+  private sfxBoards: {
+    node: number;
+    sprite: THREE.Sprite;
+    mat: THREE.SpriteMaterial;
+    /** 逐帧纹理（null = 该帧贴图未解析到） */
+    frames: (THREE.Texture | null)[];
+    /** 当前绑定 map 与其帧序（热替换同帧时直接重绑） */
+    cur: THREE.Texture | null;
+    frameIdx: number;
+    label: THREE.Sprite;
+    labelTex: THREE.CanvasTexture;
+  }[] = [];
 
   // ---- 诊断日志（穿模/显示异常排查，所有日志开头统一为 "动作名: "）----
   /** 当前动作名（诊断日志前缀），useActMode 在加载/切换动作时设置 */
@@ -4124,6 +4140,141 @@ export class Viewer {
     }
   }
 
+  // ---------------- SFX 特效播放器 ----------------
+
+  /**
+   * 构建特效预览场景：每个带贴图的节点一个公告板（Sprite），网格排布展示
+   * （节点局部变换/发射参数未逆向，无法还原真实空间关系）。根矩阵的线性
+   * 部分（旋转/缩放）作用于整组，平移丢弃——Combat 特效近单位阵，Scn 特效
+   * 为场景世界摆放位（离原点数千米，对预览无意义）。逐帧动画 = 各节点贴图
+   * 序列翻页；帧率与相位文件未记录，统一按外部帧号驱动、序列内取模循环。
+   */
+  setSfx(model: SfxFile, nodeTex: { file: string | null; tex: TexData | null }[][]) {
+    this.clearSfx();
+    const group = new THREE.Group();
+    this.sfxGroup = group;
+    const boards = model.nodes
+      .map((n, i) => ({ n, i, slots: nodeTex[i] ?? [] }))
+      .filter((b) => b.n.textures.length > 0);
+    const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(boards.length))));
+    const rows = Math.ceil(boards.length / cols);
+    const SX = 320;
+    const SZ = 340;
+    const H = 150; // 公告板统一高度（世界单位），宽按贴图纵横比
+    boards.forEach((b, k) => {
+      const x = ((k % cols) - (cols - 1) / 2) * SX;
+      const z = (Math.floor(k / cols) - (rows - 1) / 2) * SZ;
+      const mat = new THREE.SpriteMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      // Sprite 的 UV 取向按图像习惯（flipY=true 缓存键独立，不与模型贴图互串）
+      const frames = b.slots.map((s) =>
+        s?.tex && s.file ? this.getTexture(s.file, s.tex, true) : null
+      );
+      const first = b.slots.find((s) => s?.tex);
+      const aspect = first?.tex ? first.tex.width / first.tex.height : 1;
+      const sprite = new THREE.Sprite(mat);
+      sprite.position.set(x, H / 2 + 46, z);
+      sprite.scale.set(H * Math.min(Math.max(aspect, 0.25), 4), H, 1);
+      group.add(sprite);
+      // 名称标签：对应检查器节点序，普通混合不受叠加开关影响
+      const { label, tex: labelTex } = this.sfxLabel(
+        `#${b.i} ${b.n.kind}${b.n.name ? ` · ${b.n.name}` : ""}`
+      );
+      label.position.set(x, 16, z);
+      group.add(label);
+      this.sfxBoards.push({ node: b.i, sprite, mat, frames, cur: null, frameIdx: 0, label, labelTex });
+    });
+    // 根矩阵行主序、末行为平移（D3D 行向量约定）→ 转置进 three 列主序；平移丢弃见上
+    const m = model.matrix;
+    group.applyMatrix4(
+      new THREE.Matrix4().set(
+        m[0], m[4], m[8], 0,
+        m[1], m[5], m[9], 0,
+        m[2], m[6], m[10], 0,
+        0, 0, 0, 1
+      )
+    );
+    this.modelRoot.add(group);
+    this.applySfxFrame(0);
+  }
+
+  /** 节点标签（canvas 文本 Sprite） */
+  private sfxLabel(text: string): { label: THREE.Sprite; tex: THREE.CanvasTexture } {
+    const cv = document.createElement("canvas");
+    cv.width = 512;
+    cv.height = 64;
+    const ctx = cv.getContext("2d")!;
+    ctx.fillStyle = "rgba(16,16,20,0.72)";
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.font = "28px sans-serif";
+    ctx.fillStyle = "#9fe8c4";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text.length > 30 ? text.slice(0, 29) + "…" : text, cv.width / 2, cv.height / 2);
+    const tex = new THREE.CanvasTexture(cv);
+    const label = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false })
+    );
+    label.scale.set(160, 160 * (cv.height / cv.width), 1);
+    return { label, tex };
+  }
+
+  /** 应用播放帧：各节点按自身帧数取模翻页（短序列提前循环） */
+  applySfxFrame(frame: number) {
+    for (const b of this.sfxBoards) {
+      if (!b.frames.length) continue;
+      const i = ((frame % b.frames.length) + b.frames.length) % b.frames.length;
+      const t = b.frames[i] ?? null;
+      b.frameIdx = i;
+      if (t === b.cur) continue;
+      b.cur = t;
+      b.mat.map = t ?? undefined;
+      b.mat.needsUpdate = true;
+      b.sprite.visible = !!t;
+    }
+  }
+
+  /** SFX 节点贴图热替换（检查器改路径后刷新公告板）：nodeIdx 节点序 / frameIdx 节点内贴图槽序 */
+  setSfxTexture(nodeIdx: number, frameIdx: number, file: string, tex: TexData) {
+    const b = this.sfxBoards.find((x) => x.node === nodeIdx);
+    if (!b || frameIdx >= b.frames.length) return;
+    b.frames[frameIdx] = this.getTexture(file, tex, true);
+    if (b.frameIdx === frameIdx) {
+      b.cur = b.frames[frameIdx] ?? null;
+      b.mat.map = b.cur ?? undefined;
+      b.mat.needsUpdate = true;
+      b.sprite.visible = !!b.cur;
+    }
+  }
+
+  /** 特效混合模式：叠加（发光贴图黑底加色，默认）↔ 普通透明 */
+  setSfxBlending(additive: boolean) {
+    for (const b of this.sfxBoards) {
+      b.mat.blending = additive ? THREE.AdditiveBlending : THREE.NormalBlending;
+      b.mat.needsUpdate = true;
+    }
+  }
+
+  clearSfx() {
+    if (this.sfxGroup) {
+      this.modelRoot.remove(this.sfxGroup);
+      this.sfxGroup = null;
+    }
+    for (const b of this.sfxBoards) {
+      b.mat.dispose();
+      b.labelTex.dispose();
+      (b.label.material as THREE.SpriteMaterial).dispose();
+    }
+    this.sfxBoards = [];
+  }
+
+  hasSfx() {
+    return !!this.sfxGroup;
+  }
+
   // ---------------- 骨骼挂接网格（帽子等 FSM 静态件，统一进 parts 管线） ----------------
 
   /** 挂接件元数据。渲染不再走独立的 Group 层级/逐帧矩阵——全部在构建期把
@@ -4896,6 +5047,11 @@ export class Viewer {
       box.expandByObject(mesh);
       has = true;
     }
+    if (this.sfxGroup) {
+      // Sprite 各自带缩放的 matrixWorld，expandByObject 即取公告板实际占位
+      box.expandByObject(this.sfxGroup);
+      has = true;
+    }
     if (!has) return;
     this.frameBox(box);
   }
@@ -4921,6 +5077,7 @@ export class Viewer {
   dispose() {
     cancelAnimationFrame(this.raf);
     this.ro.disconnect();
+    this.clearSfx();
     for (const p of this.parts.values()) {
       p.geom.dispose();
       for (const m of p.mats) m.dispose();
