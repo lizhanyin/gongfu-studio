@@ -87,10 +87,12 @@ function ancestorsOf(path: string): string[] {
 export type ModelTexSlot = { tex: TexData | null; file: string | null };
 
 /**
- * FAK/FSM 单模型材质贴图解析（FAK 与 FSM 模式共用，与装扮模式同「路径优先」口径）：
- * 1. 材质引用自带目录（system\npc\N302_3.tga）时按模型路径祖先逐级拼接试读
- *    （CPK 内即 包根+引用 直达；vfs 查找大小写不敏感）；
- * 2. 回落 FAK 同目录 stem 匹配（引用 J01-S01.tga → 同目录 j01-s01.dds）。
+ * FAK/FSM/FSCN 单模型材质贴图解析（各模式共用，同「路径优先」口径）：
+ * 1. 材质引用自带目录（system\npc\N302_3.tga、FSCN 的
+ *    system\building\texture\G01-086-A.tga）时按模型路径祖先逐级拼接试读
+ *    （CPK 内即 包根+引用 直达；vfs 查找大小写不敏感）；原名未命中时
+ *    换 .dds 扩展名重试——引用按 .tga 发布、包内常为同名 .dds；
+ * 2. 回落模型同目录 stem 匹配（引用 J01-S01.tga → 同目录 j01-s01.dds）。
  * 解码失败经 onDecodeError 回调上报；找不到贴图的槽位静默置 null（维持原口径）。
  */
 export async function resolveModelTextures(
@@ -127,23 +129,30 @@ export async function resolveModelTextures(
     // 1. 路径优先：引用带目录部分才有意义（裸文件名拼祖先 = 同目录全扫，无增益）
     if (ref && /[\\/]/.test(ref)) {
       const norm = ref.replace(/[\\/]+/g, "\\");
-      for (const anc of ancestorsOf(modelPath)) {
-        const candidate = `${anc}\\${norm}`;
-        if (texCache.has(candidate)) {
-          const tex = texCache.get(candidate) ?? null;
-          if (tex) {
-            slot = { tex, file: candidate };
-            break;
+      // 引用多按 .tga 发布而包内实为同名 .dds（FSCN 建筑贴图
+      // building\texture 全量如此），原名未命中时换 .dds 重试
+      const cands = /\.dds$/i.test(norm)
+        ? [norm]
+        : [norm, norm.replace(/\.[^.]*$/, "") + ".dds"];
+      outer: for (const anc of ancestorsOf(modelPath)) {
+        for (const c of cands) {
+          const candidate = `${anc}\\${c}`;
+          if (texCache.has(candidate)) {
+            const tex = texCache.get(candidate) ?? null;
+            if (tex) {
+              slot = { tex, file: candidate };
+              break outer;
+            }
+            continue; // 该候选曾解码失败，试下一个候选/祖先
           }
-          continue; // 该候选曾解码失败，试下一个祖先
-        }
-        try {
-          const tex = await loadTexData(candidate);
-          texCache.set(candidate, tex);
-          slot = { tex, file: candidate };
-          break;
-        } catch {
-          // 路径不存在（vfs 快速失败）或解码失败：继续试下一祖先
+          try {
+            const tex = await loadTexData(candidate);
+            texCache.set(candidate, tex);
+            slot = { tex, file: candidate };
+            break outer;
+          } catch {
+            // 路径不存在（vfs 快速失败）或解码失败：继续试下一候选/祖先
+          }
         }
       }
     }

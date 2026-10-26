@@ -11,7 +11,7 @@
 use serde::Serialize;
 use std::io::Read;
 
-use crate::{fak, fsm, fskin, fskel, vfs};
+use crate::{fak, fscn, fsm, fskin, fskel, vfs};
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -101,12 +101,17 @@ fn light_stats(e: &vfs::VfsEntry, kind: &str) -> (Option<u32>, Option<u32>, Opti
             Some((vc, tc)) => (Some(vc), Some(tc), None, None),
             None => (None, None, None, None),
         },
+        // 轻量统计只走头部 + 子网格区，不解析顶点、材质与尾部 BVH
+        "fscn" => match vfs::open_reader(&e.path).ok().and_then(|mut r| fscn::light_meta(&mut r)) {
+            Some((vc, tc)) => (Some(vc), Some(tc), None, None),
+            None => (None, None, None, None),
+        },
         _ => (None, None, None, None),
     }
 }
 
 /// 列举虚拟目录直接子项：目录在前、文件在后，各自按名称不区分大小写排序。
-/// fskin / fskel / fak / fsm 附带轻量统计（解析失败仅缺省 meta）。
+/// fskin / fskel / fak / fsm / fscn 附带轻量统计（解析失败仅缺省 meta）。
 pub fn list_dir(dir: &str) -> Result<Vec<ResEntry>, String> {
     let entries = vfs::list_dir(dir)?;
     let mut dirs: Vec<ResEntry> = Vec::new();

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CharacterCatalog,
   FakModel,
+  FscnModel,
   FsmModel,
   FskinModel,
   FskelMeta,
@@ -65,4 +66,9 @@ export const api = {
   loadFsm: (path: string) => invoke<FsmModel>("load_fsm", { path }),
   saveFsm: (path: string, model: FsmModel) =>
     invoke<void>("save_fsm", { path, model }),
+  // FSCN 场景静态网格（建筑/迷宫/道具，含尾部 BVH；贴图在 building	exture 等
+  // 引用目录，经 resolveModelTextures 路径优先解析，不在模型同目录）
+  loadFscn: (path: string) => invoke<FscnModel>("load_fscn", { path }),
+  saveFscn: (path: string, model: FscnModel) =>
+    invoke<void>("save_fscn", { path, model }),
 };

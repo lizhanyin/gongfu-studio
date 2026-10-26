@@ -75,12 +75,15 @@
         <n-collapse-item v-if="fsm.fsmModel" title="FSM 信息" name="fsm">
           <FsmFileInfo :fsm="fsm" />
         </n-collapse-item>
+        <n-collapse-item v-if="fscn.fscnModel" title="FSCN 信息" name="fscn">
+          <FscnFileInfo :fscn="fscn" />
+        </n-collapse-item>
         <n-collapse-item v-if="skin.selectedPart" title="部件检查" name="part">
           <PartInspector :skin="skin" />
         </n-collapse-item>
       </n-collapse>
       <div
-        v-if="!skin.hasParts && !act.actMeta && !fak.fakModel && !fsm.fsmModel"
+        v-if="!skin.hasParts && !act.actMeta && !fak.fakModel && !fsm.fsmModel && !fscn.fscnModel"
         class="inspector-empty"
       >
         从资源网格选择文件预览
@@ -105,6 +108,7 @@ import type { SkinStore } from "../composables/useSkinMode";
 import type { ActStore } from "../composables/useActMode";
 import type { FakStore } from "../composables/useFakMode";
 import type { FsmStore } from "../composables/useFsmMode";
+import type { FscnStore } from "../composables/useFscnMode";
 import type { DressStore } from "../composables/useDressMode";
 import DressPanel from "./DressPanel.vue";
 import PartGroupList from "./PartGroupList.vue";
@@ -112,6 +116,7 @@ import TexSlotPanel from "./TexSlotPanel.vue";
 import ActFileInfo from "./ActFileInfo.vue";
 import FakFileInfo from "./FakFileInfo.vue";
 import FsmFileInfo from "./FsmFileInfo.vue";
+import FscnFileInfo from "./FscnFileInfo.vue";
 import PartInspector from "./PartInspector.vue";
 import BoneList from "./BoneList.vue";
 import type { ResourceTreeStore } from "../composables/useResourceTree";
@@ -121,6 +126,7 @@ const props = defineProps<{
   act: ActStore;
   fak: FakStore;
   fsm: FsmStore;
+  fscn: FscnStore;
   dress?: DressStore;
   res: ResourceTreeStore;
 }>();
@@ -146,6 +152,7 @@ const firstSection = computed(() => {
   if (props.act.actMeta) return "bones";
   if (props.fak.fakModel) return "fak";
   if (props.fsm.fsmModel) return "fsm";
+  if (props.fscn.fscnModel) return "fscn";
   if (props.skin.selectedPart) return "part";
   return null;
 });

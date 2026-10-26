@@ -1,6 +1,7 @@
 mod dds;
 mod dress;
 mod fak;
+mod fscn;
 mod fskel;
 mod fskin;
 mod fsm;
@@ -243,6 +244,27 @@ async fn save_fsm(path: String, model: fsm::FsmModel) -> Result<(), String> {
     .await
 }
 
+/// .fscn 场景静态网格（含顶点 / 材质 / 尾部 BVH）
+#[tauri::command]
+async fn load_fscn(path: String) -> Result<fscn::FscnModel, String> {
+    run_blocking(move || {
+        let bytes = vfs::read_file(&path)?;
+        fscn::parse_fscn(&path, &bytes)
+    })
+    .await
+}
+
+/// 保存 .fscn（未修改的模型字节级还原，见 fscn roundtrip 测试）
+#[tauri::command]
+async fn save_fscn(path: String, model: fscn::FscnModel) -> Result<(), String> {
+    run_blocking(move || {
+        reject_cpk_write(&path)?;
+        let bytes = fscn::serialize_fscn(&model)?;
+        std::fs::write(&path, bytes).map_err(|e| format!("写入失败: {e}"))
+    })
+    .await
+}
+
 /// 列举资源目录直接子项（供资源树懒加载 / 资源网格）
 #[tauri::command]
 async fn list_res_dir(dir: String) -> Result<Vec<res::ResEntry>, String> {
@@ -366,6 +388,8 @@ pub fn run() {
             save_fak,
             load_fsm,
             save_fsm,
+            load_fscn,
+            save_fscn,
             list_res_dir,
             dir_default_fskel,
             export_file,
@@ -452,6 +476,53 @@ pub fn fsm_probe_for_test(path: &str) -> Result<String, String> {
         mn[1], mx[1], mn[0], mx[0], mn[2], mx[2],
         m.dummies.iter().map(|d| d.name.clone()).collect::<Vec<_>>().join(",")
     ))
+}
+
+/// 诊断探针（fscn_scan 示例用）：解析概览 + 字节级往返校验
+pub fn fscn_probe_for_test(path: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+    let m = fscn::parse_fscn(path, &bytes)?;
+    let roundtrip = fscn::serialize_fscn(&m)?;
+    if roundtrip != bytes {
+        return Err("往返序列化与原文件不一致".into());
+    }
+    let nodes = m
+        .tree
+        .iter()
+        .filter(|r| matches!(r, fscn::FscnTreeRecord::Node { .. }))
+        .count();
+    let leaf_tris: usize = m
+        .tree
+        .iter()
+        .map(|r| match r {
+            fscn::FscnTreeRecord::Leaf { triangles, .. } => triangles.len() / 3,
+            _ => 0,
+        })
+        .sum();
+    Ok(format!(
+        "{}: {}v sub{} mat{} tris{}(bvh{}) tree{}(node{}+leaf{}) bbox y[{:.0},{:.0}] x[{:.0},{:.0}] z[{:.0},{:.0}]",
+        path.rsplit(['\\', '/']).next().unwrap_or(path),
+        m.vertex_count,
+        m.submeshes.len(),
+        m.materials.len(),
+        m.submeshes.iter().map(|s| s.triangles.len() / 3).sum::<usize>(),
+        leaf_tris,
+        m.tree.len(),
+        nodes,
+        m.tree.len() - nodes,
+        m.bbox_min[1], m.bbox_max[1], m.bbox_min[0], m.bbox_max[0], m.bbox_min[2], m.bbox_max[2],
+    ))
+}
+
+/// 诊断探针（fscn_tex 示例用）：FSCN 材质贴图引用列表（index, path）
+pub fn fscn_materials_for_test(path: &str) -> Result<Vec<(u32, String)>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+    let m = fscn::parse_fscn(path, &bytes)?;
+    Ok(m
+        .materials
+        .iter()
+        .map(|md| (md.index, md.texture_path.clone()))
+        .collect())
 }
 
 /// 诊断探针（sz38_probe 示例用）：时装部件头发链排查——从 system.cpk 提取

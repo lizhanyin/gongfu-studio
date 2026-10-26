@@ -334,3 +334,13 @@ export interface FsmModel {
   materials: FsmMaterial[];
   dummies: FsmDummy[];
 }
+
+/** FSCN 尾部 BVH 记录（判型见 gui/src/fscn.rs：node 第三字段恒 0） */
+export type FscnTreeRecord =
+  | { type: "node"; left: number; right: number; bboxMax: number[]; bboxMin: number[] }
+  | { type: "leaf"; triangles: number[]; bboxMax: number[]; bboxMin: number[] };
+
+/** FSCN 场景静态网格：几何/材质与 FSM 字段级同构（挂点恒空），多一棵尾部 BVH */
+export interface FscnModel extends FsmModel {
+  tree: FscnTreeRecord[];
+}

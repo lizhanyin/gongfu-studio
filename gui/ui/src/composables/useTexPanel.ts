@@ -6,7 +6,7 @@ import { message } from "../message";
 import { shortName } from "../utils";
 
 /**
- * 检查器贴图面板（FAK / FSM 模式共用）：各材质当前绑定贴图、同目录可选贴图
+ * 检查器贴图面板（FAK / FSM / FSCN 模式共用）：各材质当前绑定贴图、可选贴图
  * 清单（下拉换图）、预览缩略图。换图走热替换回调（viewer.setFakTexture /
  * setFsmTexture），不落盘——CPK 内模型本就不可写，目录内模型保存仍走原导出。
  */
@@ -48,10 +48,27 @@ export function useTexPanelState(
     } catch {
       entries = [];
     }
-    const opts = entries
+    let opts = entries
       .filter((e) => TEX_KINDS.test(e.kind))
       .map((e) => ({ name: e.name, path: e.path }))
       .sort((a, b) => a.name.localeCompare(b.name));
+    // 模型同目录无贴图时（FSCN 建筑网格贴图在 building\texture 等引用目录），
+    // 用首个已解析绑定所在目录补全换图选项
+    if (!opts.length) {
+      const first = matFiles.value.find((f): f is string => !!f);
+      if (first) {
+        try {
+          const tdir = first.replace(/[\\/][^\\/]*$/, "");
+          const tentries = await api.listResDir(tdir);
+          opts = tentries
+            .filter((e) => TEX_KINDS.test(e.kind))
+            .map((e) => ({ name: e.name, path: e.path }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+        } catch {
+          // 引用目录列举失败：保持空清单，仅显示当前绑定
+        }
+      }
+    }
     for (const f of matFiles.value) {
       if (f && !opts.some((o) => o.path === f)) {
         opts.unshift({ name: shortName(f), path: f });
