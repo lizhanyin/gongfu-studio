@@ -144,6 +144,29 @@ function polarRotation(h: number[]): number[] | null {
   return mat3Det(m) > 0.5 ? m : null; // 未收敛或落入反射
 }
 
+/** 挂接特效实例（viewer 侧渲染对象；播放状态在 useEffectMode composable） */
+interface FxItemObj {
+  id: number;
+  group: THREE.Group;
+  /** 带贴图节点各一块公告板（局部原点叠加混合）；on = 节点显隐（≈引擎 FindEffect 粒度） */
+  boards: {
+    node: number;
+    sprite: THREE.Sprite;
+    mat: THREE.SpriteMaterial;
+    frames: (THREE.Texture | null)[];
+    cur: THREE.Texture | null;
+    on: boolean;
+  }[];
+  mode: "bone" | "world";
+  boneIdx: number;
+  boneName: string;
+  worldPos: [number, number, number];
+  offset: [number, number, number];
+  eulerRad: [number, number, number];
+  scale: number;
+  visible: boolean;
+}
+
 export class Viewer {
   private scene = new THREE.Scene();
   /** 模型根组（绕 Y 旋转 MODEL_YAW）：网格/骨架可视化挂此处；骨骼层级与蒙皮数学留在 scene（数据空间） */
@@ -394,6 +417,18 @@ export class Viewer {
     label: THREE.Sprite;
     labelTex: THREE.CanvasTexture;
   }[] = [];
+
+  // ---- 挂接特效（角色叠加播放：挂骨跟随 / 世界放置；与上方 SFX 预览模式互不影响）----
+  /** 每实例一个 Group 挂 modelRoot（matrixAutoUpdate=false，矩阵由 updateFxMatrices 重算） */
+  private fxItems = new Map<number, FxItemObj>();
+  private fxTmpA = new THREE.Matrix4();
+  private fxTmpB = new THREE.Matrix4();
+  private fxTmpQ = new THREE.Quaternion();
+  private fxTmpE = new THREE.Euler();
+  private fxTmpV = new THREE.Vector3();
+  private fxTmpS = new THREE.Vector3();
+  /** 挂接特效公告板标称高度（世界单位；角色身高 ~170，武器光效观感标定） */
+  private static readonly FX_BOARD_H = 48;
 
   // ---- 诊断日志（穿模/显示异常排查，所有日志开头统一为 "动作名: "）----
   /** 当前动作名（诊断日志前缀），useActMode 在加载/切换动作时设置 */
@@ -1253,6 +1288,7 @@ export class Viewer {
     this.applyFskelFrame(0, 0, 0);
     this.bindWorldMats = this.worldMats.map((m) => m.clone()); // 帧 0 快照（挂接静态基准）
     this.refreshBoneAttached(); // 骨架加载/切换后按帧 0 位姿重挂骨骼挂接网格
+    this.bindFxToSkeleton(); // 挂接特效按名重解析到新骨架
   }
 
   // ---- 诊断日志 ----
@@ -3824,6 +3860,7 @@ export class Viewer {
     this.anchoredChains.clear();
     this.anchoredMats.clear();
     this.refreshBoneAttached(); // 骨架已清空：挂接网格回落为静态摆放
+    this.bindFxToSkeleton(); // 挂接特效按名重解析（骨架清空 = 落角色原点）
     this.applyStaticSkin(); // 默认状态对齐离群部件（hair05）
   }
 
@@ -4273,6 +4310,206 @@ export class Viewer {
 
   hasSfx() {
     return !!this.sfxGroup;
+  }
+
+  // ---------------- 挂接特效播放器（角色叠加） ----------------
+
+  /**
+   * 添加挂接特效实例（同 id 先卸再建）。公告板口径：带贴图节点各一块 Sprite
+   * 落局部原点、叠加混合（引擎对 Quad/Cross 即骨位公告板同点发光，节点
+   * 局部偏移在参数区未逆向，原点叠加最贴近游戏观感）；EffectSound 不渲染
+   * （音频由检查器试听），EffectMesh 的 .fak 暂不渲染。
+   */
+  addFx(
+    id: number,
+    model: SfxFile,
+    nodeTex: { file: string | null; tex: TexData | null }[][],
+    opts: {
+      mode: "bone" | "world";
+      bone: string;
+      worldPos: [number, number, number];
+      offset: [number, number, number];
+      euler: [number, number, number];
+      scale: number;
+      additive: boolean;
+      visible: boolean;
+      nodeMute?: boolean[];
+    }
+  ) {
+    this.removeFx(id);
+    const group = new THREE.Group();
+    group.matrixAutoUpdate = false;
+    const boards: FxItemObj["boards"] = [];
+    model.nodes.forEach((n, i) => {
+      const slots = nodeTex[i] ?? [];
+      if (!n.textures.length || !slots.length) return;
+      const mat = new THREE.SpriteMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: opts.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+      });
+      const frames = slots.map((s) =>
+        s?.tex && s.file ? this.getTexture(s.file, s.tex, true) : null
+      );
+      const first = slots.find((s) => s?.tex);
+      const aspect = first?.tex ? first.tex.width / first.tex.height : 1;
+      const H = Viewer.FX_BOARD_H;
+      const sprite = new THREE.Sprite(mat);
+      sprite.scale.set(H * Math.min(Math.max(aspect, 0.25), 4), H, 1);
+      sprite.raycast = () => {}; // 不参与网格拾取（点击选中部件不被特效遮挡）
+      group.add(sprite);
+      const on = !opts.nodeMute?.[i];
+      boards.push({ node: i, sprite, mat, frames, cur: null, on });
+    });
+    this.modelRoot.add(group);
+    const item = {
+      id,
+      group,
+      boards,
+      mode: opts.mode,
+      boneIdx: -1,
+      boneName: opts.mode === "bone" ? opts.bone : "",
+      worldPos: [...opts.worldPos] as [number, number, number],
+      offset: [...opts.offset] as [number, number, number],
+      eulerRad: opts.euler.map((d) => (d * Math.PI) / 180) as [number, number, number],
+      scale: opts.scale,
+      visible: opts.visible,
+    };
+    this.fxItems.set(id, item);
+    this.resolveFxBone(item);
+    group.visible = opts.visible;
+    this.updateFxMatrix(item);
+    this.applyFxFrame(id, 0);
+  }
+
+  /** 按名解析骨序（大小写不敏感；未加载/找不到 = -1，特效落角色原点） */
+  private resolveFxBone(item: { boneName: string; boneIdx: number }) {
+    item.boneIdx = -1;
+    if (!item.boneName) return;
+    const lower = item.boneName.toLowerCase();
+    item.boneIdx = this.skelBones.findIndex((b) => b.name.toLowerCase() === lower);
+  }
+
+  /**
+   * 重算单个实例的组矩阵。挂骨模式 = modelRoot 世界逆 × 骨世界矩阵（骨骼在
+   * scene 数据空间、渲染对象统一挂 modelRoot 带 MODEL_YAW，与蒙皮件同口径
+   * 换系）× 骨局部修正 T·R·S；世界模式 = T(worldPos)·R·S 直摆（Combat/Scn
+   * 特效的引擎语义即客户端 SetWorldMat 实体位，这里按角色原点相对摆放）。
+   */
+  private updateFxMatrix(item: FxItemObj) {
+    if (item.mode === "bone" && item.boneIdx >= 0 && this.skelBones[item.boneIdx]) {
+      const b = this.skelBones[item.boneIdx];
+      b.updateWorldMatrix(true, false);
+      this.fxTmpA.copy(this.modelRoot.matrixWorld).invert().multiply(b.matrixWorld);
+    } else {
+      this.fxTmpA.makeTranslation(item.worldPos[0], item.worldPos[1], item.worldPos[2]);
+    }
+    this.fxTmpE.set(item.eulerRad[0], item.eulerRad[1], item.eulerRad[2]);
+    this.fxTmpQ.setFromEuler(this.fxTmpE);
+    this.fxTmpB.compose(
+      this.fxTmpV.set(item.offset[0], item.offset[1], item.offset[2]),
+      this.fxTmpQ,
+      this.fxTmpS.setScalar(item.scale)
+    );
+    item.group.matrix.copy(this.fxTmpA).multiply(this.fxTmpB);
+    item.group.matrixWorldNeedsUpdate = true;
+  }
+
+  /** 全实例矩阵刷新（composable 每帧调用：暂停时特效仍须跟随骨骼动画） */
+  updateFxMatrices() {
+    if (!this.fxItems.size) return;
+    this.modelRoot.updateWorldMatrix(true, false);
+    for (const item of this.fxItems.values()) this.updateFxMatrix(item);
+  }
+
+  /** 应用播放帧：各节点按自身帧数取模翻页（短序列提前循环），尊重节点显隐 */
+  applyFxFrame(id: number, frame: number) {
+    const item = this.fxItems.get(id);
+    if (!item) return;
+    for (const b of item.boards) {
+      if (!b.frames.length) continue;
+      const i = ((frame % b.frames.length) + b.frames.length) % b.frames.length;
+      const t = b.frames[i] ?? null;
+      if (t !== b.cur) {
+        b.cur = t;
+        b.mat.map = t ?? undefined;
+        b.mat.needsUpdate = true;
+      }
+      b.sprite.visible = item.visible && b.on && !!t;
+    }
+  }
+
+  /** 更新实例参数（bones 换名重解析；additive/visible 即时生效） */
+  setFxTransform(
+    id: number,
+    t: Partial<{
+      mode: "bone" | "world";
+      bone: string;
+      worldPos: [number, number, number];
+      offset: [number, number, number];
+      euler: [number, number, number];
+      scale: number;
+      additive: boolean;
+      visible: boolean;
+    }>
+  ) {
+    const item = this.fxItems.get(id);
+    if (!item) return;
+    if (t.mode !== undefined) item.mode = t.mode;
+    if (t.bone !== undefined) item.boneName = t.mode === "world" ? "" : t.bone;
+    if (t.mode === "world") item.boneName = "";
+    if (t.worldPos) item.worldPos = [...t.worldPos] as [number, number, number];
+    if (t.offset) item.offset = [...t.offset] as [number, number, number];
+    if (t.euler)
+      item.eulerRad = t.euler.map((d) => (d * Math.PI) / 180) as [number, number, number];
+    if (t.scale !== undefined) item.scale = t.scale;
+    if (t.additive !== undefined)
+      for (const b of item.boards) {
+        b.mat.blending = t.additive ? THREE.AdditiveBlending : THREE.NormalBlending;
+        b.mat.needsUpdate = true;
+      }
+    if (t.visible !== undefined) item.visible = t.visible;
+    this.resolveFxBone(item);
+    item.group.visible = item.visible;
+    this.updateFxMatrix(item);
+  }
+
+  /** 节点显隐（nodeMute 反向口：on=false 即静音该节点） */
+  setFxNodeVisible(id: number, nodeIdx: number, on: boolean) {
+    const item = this.fxItems.get(id);
+    const b = item?.boards.find((x) => x.node === nodeIdx);
+    if (!b) return;
+    b.on = on;
+    b.sprite.visible = item.visible && on && !!b.cur;
+  }
+
+  /** 骨架加载/切换/清空后按名重挂全部实例（refreshBoneAttached 同源钩子） */
+  private bindFxToSkeleton() {
+    for (const item of this.fxItems.values()) {
+      this.resolveFxBone(item);
+      this.updateFxMatrix(item);
+    }
+  }
+
+  removeFx(id: number) {
+    const item = this.fxItems.get(id);
+    if (!item) return;
+    this.modelRoot.remove(item.group);
+    for (const b of item.boards) b.mat.dispose();
+    this.fxItems.delete(id);
+  }
+
+  clearFx() {
+    for (const id of [...this.fxItems.keys()]) this.removeFx(id);
+  }
+
+  hasFx(id: number) {
+    return this.fxItems.has(id);
+  }
+
+  /** 视口内是否有骨架（composable 据此判断特效可重挂：角色在场） */
+  skeletonReady() {
+    return this.skelBones.length > 0;
   }
 
   // ---------------- 骨骼挂接网格（帽子等 FSM 静态件，统一进 parts 管线） ----------------
@@ -5078,6 +5315,7 @@ export class Viewer {
     cancelAnimationFrame(this.raf);
     this.ro.disconnect();
     this.clearSfx();
+    this.clearFx();
     for (const p of this.parts.values()) {
       p.geom.dispose();
       for (const m of p.mats) m.dispose();

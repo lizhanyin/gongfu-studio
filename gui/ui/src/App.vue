@@ -89,7 +89,7 @@
             <ViewerHost :target="viewportRef" @ready="onViewerReady" />
 
             <!-- 检查器（可折叠）：独立组件，改 InspectorPanel.vue 只重载检查器子树 -->
-            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" :fscn="fscn" :sfx="sfx" :dress="dress" :res="res" />
+            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" :fscn="fscn" :sfx="sfx" :dress="dress" :fx="fx" :res="res" />
           </div>
 
           <!-- 右下：当前目录资源网格（高度可拖拽） -->
@@ -138,6 +138,7 @@ import { useFsmMode } from "./composables/useFsmMode";
 import { useFscnMode } from "./composables/useFscnMode";
 import { useSfxMode } from "./composables/useSfxMode";
 import { useDressMode } from "./composables/useDressMode";
+import { useEffectMode } from "./composables/useEffectMode";
 import { useResourceTree } from "./composables/useResourceTree";
 import { texDataFromDto, b64ToBytes, decodeTga, imageUrlFromB64 } from "./tex";
 import type { TexData, Viewer } from "./viewer";
@@ -221,6 +222,7 @@ const fsm = useFsmMode(viewer);
 const fscn = useFscnMode(viewer);
 const sfx = useSfxMode(viewer);
 const dress = useDressMode(viewer, skin, act);
+const fx = useEffectMode(viewer);
 const res = useResourceTree();
 
 // ---------------- CDP/端到端验证钩子 ----------------
@@ -232,8 +234,59 @@ const res = useResourceTree();
     openScene(root: string, suitNo: number, action: string): Promise<string>;
     openModel(path: string): Promise<string>;
     setModelTexture(kind: "fak" | "fsm", matIdx: number, file: string): Promise<string>;
+    /** 特效挂载链路（attach + 播放 + 挂骨跟随），供 CDP 验证 */
+    attachFx(path: string, bone?: string): Promise<string>;
+    fxNpc(csvPath: string): Promise<string>;
+    fxProbe(): string;
   };
 }).__e2e = {
+  async attachFx(path, bone) {
+    const before = fx.count;
+    await fx.attach(
+      path,
+      bone
+        ? {
+            mode: "bone",
+            bone,
+            worldPos: [0, 0, 0],
+            offset: [0, 0, 0],
+            euler: [0, 0, 0],
+            scale: 1,
+            additive: true,
+          }
+        : undefined
+    );
+    await new Promise((r) => setTimeout(r, 800));
+    return fx.count > before ? `ok fx=${fx.count}` : `fail ${path.split(/[\\/]/).pop()}`;
+  },
+  /** NPC csv 一键还原链路，供 CDP 验证 */
+  async fxNpc(csvPath) {
+    const root = (res.treeData[0]?.key as string | undefined) ?? "";
+    const before = fx.count;
+    await fx.importNpcCsv(csvPath, root);
+    await new Promise((r) => setTimeout(r, 800));
+    return `ok +${fx.count - before} total=${fx.count}`;
+  },
+  /** 特效实例双侧状态（composable × viewer）对照，供 CDP 排查 */
+  fxProbe(): string {
+    const viewerFx = (viewer.value as unknown as {
+      fxItems: Map<number, { boneName: string; boneIdx: number }>;
+    } | null)?.fxItems;
+    return JSON.stringify({
+      inst: [...fx.instances.values()].map((i) => ({
+        id: i.id,
+        bone: i.bone,
+        mode: i.mode,
+        playing: i.playing,
+        elapsed: +i.elapsed.toFixed(2),
+      })),
+      viewer: [...(viewerFx?.entries() ?? [])].map(([id, it]) => ({
+        id,
+        bone: it.boneName,
+        idx: it.boneIdx,
+      })),
+    });
+  },
   async openScene(root, suitNo, action) {
     await res.changeRoot(root);
     // open 尾部的统计 toast 对个别槽位可能抛错（items 缺失），但装配已完成，
@@ -404,9 +457,10 @@ async function previewEntry(e: ResEntry) {
   }
 }
 
-/** FAK / FSM / FSCN / SFX 与皮肤/骨架模式互斥 */
+/** FAK / FSM / FSCN / SFX 与皮肤/骨架模式互斥（特效挂载随角色语境一并清场） */
 async function openFakPreview(path: string) {
   dress.close();
+  fx.clear();
   skin.clearScene();
   act.closeAct();
   fsm.closeFsm();
@@ -417,6 +471,7 @@ async function openFakPreview(path: string) {
 
 async function openFsmPreview(path: string) {
   dress.close();
+  fx.clear();
   skin.clearScene();
   act.closeAct();
   fak.closeFak();
@@ -427,6 +482,7 @@ async function openFsmPreview(path: string) {
 
 async function openFscnPreview(path: string) {
   dress.close();
+  fx.clear();
   skin.clearScene();
   act.closeAct();
   fak.closeFak();
@@ -438,6 +494,7 @@ async function openFscnPreview(path: string) {
 /** SFX 特效脚本：无 3D 渲染（检查器展示节点树与贴图引用） */
 async function openSfxPreview(path: string) {
   dress.close();
+  fx.clear();
   skin.clearScene();
   act.closeAct();
   fak.closeFak();
@@ -458,16 +515,21 @@ async function openDressMode(root?: string) {
 
 // 资源根实际切换（输入框回车 / 打开目录 / 加载 system.cpk）后：
 // 装扮模式开启时按新根重扫（套装/装备/时装/基础模型随之刷新），
-// 新根无角色资源则退出装扮回落整体预览
+// 新根无角色资源则退出装扮回落整体预览。
+// 注意 openScene 也走 changeRoot+dress.open——CPK 树列举迟到 10~30s，watch
+// 晚触发会对同一根二次重扫（重装配 + 清特效挂载 + 折叠态重置），按根幂等跳过
+const normRoot = (p: string) => p.toLowerCase().replace(/[\\/]+$/, "");
 watch(
   () => res.treeData[0]?.key as string | undefined,
   async (root, prev) => {
     if (!root || root === prev || !dress.catalog) return;
+    if (normRoot(dress.catalog.root) === normRoot(root)) return;
     texPreview.value = null;
     fak.closeFak();
     fsm.closeFsm();
     fscn.closeFscn();
     sfx.closeSfx();
+    fx.clear();
     const ok = await dress.open(root);
     if (!ok) {
       dress.close();

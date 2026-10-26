@@ -69,6 +69,13 @@
         <n-collapse-item v-if="act.actMeta" title="骨骼" name="bones">
           <BoneList :act="act" />
         </n-collapse-item>
+        <n-collapse-item
+          v-if="skin.modelSet || dress?.catalog"
+          title="特效挂载"
+          name="fx"
+        >
+          <EffectPanel :fx="fx" :act="act" :res="res" />
+        </n-collapse-item>
         <n-collapse-item v-if="fak.fakModel" title="FAK 信息" name="fak">
           <FakFileInfo :fak="fak" />
         </n-collapse-item>
@@ -114,6 +121,7 @@ import type { FsmStore } from "../composables/useFsmMode";
 import type { FscnStore } from "../composables/useFscnMode";
 import type { SfxStore } from "../composables/useSfxMode";
 import type { DressStore } from "../composables/useDressMode";
+import type { EffectStore } from "../composables/useEffectMode";
 import DressPanel from "./DressPanel.vue";
 import PartGroupList from "./PartGroupList.vue";
 import TexSlotPanel from "./TexSlotPanel.vue";
@@ -122,6 +130,7 @@ import FakFileInfo from "./FakFileInfo.vue";
 import FsmFileInfo from "./FsmFileInfo.vue";
 import FscnFileInfo from "./FscnFileInfo.vue";
 import SfxFileInfo from "./SfxFileInfo.vue";
+import EffectPanel from "./EffectPanel.vue";
 import PartInspector from "./PartInspector.vue";
 import BoneList from "./BoneList.vue";
 import type { ResourceTreeStore } from "../composables/useResourceTree";
@@ -134,6 +143,7 @@ const props = defineProps<{
   fscn: FscnStore;
   sfx: SfxStore;
   dress?: DressStore;
+  fx: EffectStore;
   res: ResourceTreeStore;
 }>();
 
