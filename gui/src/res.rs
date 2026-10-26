@@ -11,7 +11,7 @@
 use serde::Serialize;
 use std::io::Read;
 
-use crate::{fak, fscn, fsm, fskin, fskel, vfs};
+use crate::{fak, fscn, fsm, fskin, fskel, sfx, vfs};
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +31,8 @@ pub struct ResEntry {
     pub triangle_count: Option<u32>,
     pub frame_count: Option<u32>,
     pub bone_count: Option<u32>,
+    /// sfx 特效节点数
+    pub node_count: Option<u32>,
 }
 
 fn has_ext(name: &str, ext: &str) -> bool {
@@ -66,18 +68,27 @@ fn is_model_dir(dir: &str) -> bool {
     dir_contains(&vfs::join_vpath(dir, "act"), "fskel")
 }
 
+/// 轻量统计结果（按格式各取所需字段，失败全缺省）
+#[derive(Default)]
+struct Meta {
+    vertex: Option<u32>,
+    triangle: Option<u32>,
+    frame: Option<u32>,
+    bone: Option<u32>,
+    node: Option<u32>,
+}
+
 /// 轻量统计：按扩展名选择解析器（失败仅缺省 meta）
-fn light_stats(e: &vfs::VfsEntry, kind: &str) -> (Option<u32>, Option<u32>, Option<u32>, Option<u32>) {
+fn light_stats(e: &vfs::VfsEntry, kind: &str) -> Meta {
     match kind {
         // 三角形数需要完整解析；失败仅缺省 meta
         "fskin" => match vfs::read_file(&e.path).ok().and_then(|b| fskin::parse_fskin(&e.path, &b).ok()) {
-            Some(m) => (
-                Some(m.vertices.len() as u32),
-                Some(m.triangle_count() as u32),
-                None,
-                None,
-            ),
-            None => (None, None, None, None),
+            Some(m) => Meta {
+                vertex: Some(m.vertices.len() as u32),
+                triangle: Some(m.triangle_count() as u32),
+                ..Default::default()
+            },
+            None => Meta::default(),
         },
         // 帧数/骨骼数在文件头（0x114 骨骼数），只读头部避免整读大文件
         "fskel" => {
@@ -87,31 +98,56 @@ fn light_stats(e: &vfs::VfsEntry, kind: &str) -> (Option<u32>, Option<u32>, Opti
                 .ok()
                 .and_then(|_| fskel::light_meta(&buf));
             match meta {
-                Some((frames, bones)) => (None, None, Some(frames), Some(bones)),
-                None => (None, None, None, None),
+                Some((frames, bones)) => Meta {
+                    frame: Some(frames),
+                    bone: Some(bones),
+                    ..Default::default()
+                },
+                None => Meta::default(),
             }
         }
         // 轻量统计只走头部 + 子网格区，不解析逐帧顶点数据
         "fak" => match vfs::open_reader(&e.path).ok().and_then(|mut r| fak::light_meta(&mut r)) {
-            Some((vc, tc, fc)) => (Some(vc), Some(tc), Some(fc), None),
-            None => (None, None, None, None),
+            Some((vc, tc, fc)) => Meta {
+                vertex: Some(vc),
+                triangle: Some(tc),
+                frame: Some(fc),
+                ..Default::default()
+            },
+            None => Meta::default(),
         },
         // 轻量统计只走头部 + 子网格区，不解析顶点与材质
         "fsm" => match vfs::open_reader(&e.path).ok().and_then(|mut r| fsm::light_meta(&mut r)) {
-            Some((vc, tc)) => (Some(vc), Some(tc), None, None),
-            None => (None, None, None, None),
+            Some((vc, tc)) => Meta {
+                vertex: Some(vc),
+                triangle: Some(tc),
+                ..Default::default()
+            },
+            None => Meta::default(),
         },
         // 轻量统计只走头部 + 子网格区，不解析顶点、材质与尾部 BVH
         "fscn" => match vfs::open_reader(&e.path).ok().and_then(|mut r| fscn::light_meta(&mut r)) {
-            Some((vc, tc)) => (Some(vc), Some(tc), None, None),
-            None => (None, None, None, None),
+            Some((vc, tc)) => Meta {
+                vertex: Some(vc),
+                triangle: Some(tc),
+                ..Default::default()
+            },
+            None => Meta::default(),
         },
-        _ => (None, None, None, None),
+        // sfx 文件小（均值 ~13KB），全量解析取节点数
+        "sfx" => match vfs::read_file(&e.path).ok().and_then(|b| sfx::parse_sfx(&e.path, &b).ok()) {
+            Some(m) => Meta {
+                node: Some(m.nodes.len() as u32),
+                ..Default::default()
+            },
+            None => Meta::default(),
+        },
+        _ => Meta::default(),
     }
 }
 
 /// 列举虚拟目录直接子项：目录在前、文件在后，各自按名称不区分大小写排序。
-/// fskin / fskel / fak / fsm / fscn 附带轻量统计（解析失败仅缺省 meta）。
+/// fskin / fskel / fak / fsm / fscn / sfx 附带轻量统计（解析失败仅缺省 meta）。
 pub fn list_dir(dir: &str) -> Result<Vec<ResEntry>, String> {
     let entries = vfs::list_dir(dir)?;
     let mut dirs: Vec<ResEntry> = Vec::new();
@@ -132,6 +168,7 @@ pub fn list_dir(dir: &str) -> Result<Vec<ResEntry>, String> {
                 triangle_count: None,
                 frame_count: None,
                 bone_count: None,
+                node_count: None,
             });
         } else {
             let kind = e
@@ -140,7 +177,7 @@ pub fn list_dir(dir: &str) -> Result<Vec<ResEntry>, String> {
                 .next()
                 .map(|x| x.to_lowercase())
                 .unwrap_or_default();
-            let (vc, tc, fc, bc) = light_stats(&e, &kind);
+            let m = light_stats(&e, &kind);
             files.push(ResEntry {
                 name: e.name,
                 path: e.path,
@@ -149,10 +186,11 @@ pub fn list_dir(dir: &str) -> Result<Vec<ResEntry>, String> {
                 byte_len: e.byte_len,
                 is_model: false,
                 is_character: false,
-                vertex_count: vc,
-                triangle_count: tc,
-                frame_count: fc,
-                bone_count: bc,
+                vertex_count: m.vertex,
+                triangle_count: m.triangle,
+                frame_count: m.frame,
+                bone_count: m.bone,
+                node_count: m.node,
             });
         }
     }
@@ -272,5 +310,20 @@ mod tests {
         assert_eq!(fsm.kind, "fsm");
         assert_eq!(fsm.vertex_count, Some(154));
         assert_eq!(fsm.triangle_count, Some(112));
+    }
+
+    #[test]
+    fn list_effect_has_sfx_meta() {
+        let entries = list_dir(&format!("{RES}/system/Effect/Combat")).unwrap();
+        let sfx = entries
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("tx01a_a.sfx"))
+            .unwrap();
+        assert_eq!(sfx.kind, "sfx");
+        assert_eq!(sfx.node_count, Some(9));
+        // Effect 目录不在整体预览范围内
+        let effect = list_dir(&format!("{RES}/system/Effect")).unwrap();
+        let combat = effect.iter().find(|e| e.name == "Combat").unwrap();
+        assert!(combat.is_dir && !combat.is_model);
     }
 }

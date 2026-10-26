@@ -104,6 +104,7 @@ function kindTag(e: ResEntry): string {
     fskin: "皮肤",
     fskel: "动作",
     fak: "模型",
+    sfx: "特效",
     dds: "贴图",
     tga: "贴图",
     png: "贴图",
@@ -124,6 +125,7 @@ function metaText(e: ResEntry): string {
   if (e.kind === "fskel") return `${e.frameCount ?? "?"} 帧 · ${e.boneCount ?? "?"} 骨`;
   if (e.kind === "fak")
     return `${e.vertexCount ?? "?"} 顶点 · ${e.triangleCount ?? "?"} 三角 · ${e.frameCount ?? "?"} 帧`;
+  if (e.kind === "sfx") return `${e.nodeCount ?? "?"} 节点 · ${fmtSize(e.byteLen)}`;
   return fmtSize(e.byteLen);
 }
 

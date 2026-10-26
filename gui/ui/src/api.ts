@@ -8,6 +8,7 @@ import type {
   FskelMeta,
   ModelSet,
   ResEntry,
+  SfxFile,
   TexImageDto,
 } from "./types";
 
@@ -71,4 +72,8 @@ export const api = {
   loadFscn: (path: string) => invoke<FscnModel>("load_fscn", { path }),
   saveFscn: (path: string, model: FscnModel) =>
     invoke<void>("save_fscn", { path, model }),
+  // SFX 特效脚本（节点树 + 贴图/网格/音效引用；节点参数原样字节保留）
+  loadSfx: (path: string) => invoke<SfxFile>("load_sfx", { path }),
+  saveSfx: (path: string, model: SfxFile) =>
+    invoke<void>("save_sfx", { path, model }),
 };

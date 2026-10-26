@@ -52,6 +52,13 @@
                     · BVH: {{ fscn.fscnModel.tree.length }} 记录
                   </div>
                 </template>
+                <template v-else-if="sfx.sfxModel">
+                  <div>SFX 特效 · {{ shortName(sfx.sfxModel.path) }}</div>
+                  <div>
+                    节点: {{ sfx.sfxModel.nodes.length }} · 贴图:
+                    {{ sfx.uniqueTextures.length }}（无 3D 预览，见检查器）
+                  </div>
+                </template>
                 <template v-else>
                   <div v-if="act.actMeta">
                     动作 {{ act.currentActionInfo?.name ?? "" }} · 当前帧
@@ -80,7 +87,7 @@
             <ViewerHost :target="viewportRef" @ready="onViewerReady" />
 
             <!-- 检查器（可折叠）：独立组件，改 InspectorPanel.vue 只重载检查器子树 -->
-            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" :fscn="fscn" :dress="dress" :res="res" />
+            <InspectorPanel :skin="skin" :act="act" :fak="fak" :fsm="fsm" :fscn="fscn" :sfx="sfx" :dress="dress" :res="res" />
           </div>
 
           <!-- 右下：当前目录资源网格（高度可拖拽） -->
@@ -105,6 +112,7 @@
         <span v-if="fak.fakModel">FAK: {{ shortName(fak.fakModel.path) }}</span>
         <span v-if="fsm.fsmModel">FSM: {{ shortName(fsm.fsmModel.path) }}</span>
         <span v-if="fscn.fscnModel">FSCN: {{ shortName(fscn.fscnModel.path) }}</span>
+        <span v-if="sfx.sfxModel">SFX: {{ shortName(sfx.sfxModel.path) }}</span>
         <span>可见部件: {{ skin.visiblePaths.map(shortName).join(" + ") || "无" }}</span>
       </footer>
 
@@ -126,6 +134,7 @@ import { useActMode } from "./composables/useActMode";
 import { useFakMode } from "./composables/useFakMode";
 import { useFsmMode } from "./composables/useFsmMode";
 import { useFscnMode } from "./composables/useFscnMode";
+import { useSfxMode } from "./composables/useSfxMode";
 import { useDressMode } from "./composables/useDressMode";
 import { useResourceTree } from "./composables/useResourceTree";
 import { texDataFromDto, b64ToBytes, decodeTga, imageUrlFromB64 } from "./tex";
@@ -208,6 +217,7 @@ const act = useActMode(viewer);
 const fak = useFakMode(viewer);
 const fsm = useFsmMode(viewer);
 const fscn = useFscnMode(viewer);
+const sfx = useSfxMode();
 const dress = useDressMode(viewer, skin, act);
 const res = useResourceTree();
 
@@ -235,12 +245,13 @@ const res = useResourceTree();
     if (i >= 0) act.selectAction(i);
     return `ok actions=${names.length} picked=${names[i] ?? "?"}`;
   },
-  /** 单模型预览（fak/fsm/fscn/fskin）：走与网格点击同一条路由，供贴图链路 CDP 验证 */
+  /** 单模型预览（fak/fsm/fscn/sfx/fskin）：走与网格点击同一条路由，供贴图链路 CDP 验证 */
   async openModel(path) {
     const kind = path.split(".").pop()?.toLowerCase();
     if (kind === "fak") await openFakPreview(path);
     else if (kind === "fsm") await openFsmPreview(path);
     else if (kind === "fscn") await openFscnPreview(path);
+    else if (kind === "sfx") await openSfxPreview(path);
     else return `unsupported ${kind}`;
     await new Promise((r) => setTimeout(r, 800));
     return `ok ${path.split(/[\\/]/).pop()}`;
@@ -266,7 +277,7 @@ function onViewerReady(v: Viewer) {
   if (!first) rerenderViewport();
 }
 
-/** 视口重建后重放当前内容（互斥优先级与 previewModelDir 一致：fak > fsm > fscn > act > dress > skin 扫描） */
+/** 视口重建后重放当前内容（互斥优先级与 previewModelDir 一致：fak > fsm > fscn > sfx > act > dress > skin 扫描） */
 async function rerenderViewport() {
   if (fak.fakModel) {
     const action = fak.currentAction;
@@ -280,6 +291,11 @@ async function rerenderViewport() {
   }
   if (fscn.fscnModel) {
     await fscn.openFscnFile(fscn.fscnModel.path);
+    return;
+  }
+  if (sfx.sfxModel) {
+    // SFX 无 3D 内容，重开仅刷新检查器数据与贴图解析
+    await sfx.openSfxFile(sfx.sfxModel.path);
     return;
   }
   if (dress.catalog) {
@@ -343,6 +359,7 @@ async function previewEntry(e: ResEntry) {
       fak.closeFak();
       fsm.closeFsm();
       fscn.closeFscn();
+      sfx.closeSfx();
       // 单文件预览：骨架按其父目录配套选取
       await scanWithSkeleton(e.path.replace(/[\\/][^\\/]*$/, ""), e.path);
       break;
@@ -351,6 +368,7 @@ async function previewEntry(e: ResEntry) {
       fak.closeFak();
       fsm.closeFsm();
       fscn.closeFscn();
+      sfx.closeSfx();
       act.openActFile(e.path);
       break;
     case "fak":
@@ -364,6 +382,10 @@ async function previewEntry(e: ResEntry) {
     case "fscn":
       texPreview.value = null;
       await openFscnPreview(e.path);
+      break;
+    case "sfx":
+      texPreview.value = null;
+      await openSfxPreview(e.path);
       break;
     case "dds":
     case "tga":
@@ -380,13 +402,14 @@ async function previewEntry(e: ResEntry) {
   }
 }
 
-/** FAK / FSM / FSCN 与皮肤/骨架模式互斥 */
+/** FAK / FSM / FSCN / SFX 与皮肤/骨架模式互斥 */
 async function openFakPreview(path: string) {
   dress.close();
   skin.clearScene();
   act.closeAct();
   fsm.closeFsm();
   fscn.closeFscn();
+  sfx.closeSfx();
   await fak.openFakFile(path);
 }
 
@@ -396,6 +419,7 @@ async function openFsmPreview(path: string) {
   act.closeAct();
   fak.closeFak();
   fscn.closeFscn();
+  sfx.closeSfx();
   await fsm.openFsmFile(path);
 }
 
@@ -405,7 +429,19 @@ async function openFscnPreview(path: string) {
   act.closeAct();
   fak.closeFak();
   fsm.closeFsm();
+  sfx.closeSfx();
   await fscn.openFscnFile(path);
+}
+
+/** SFX 特效脚本：无 3D 渲染（检查器展示节点树与贴图引用） */
+async function openSfxPreview(path: string) {
+  dress.close();
+  skin.clearScene();
+  act.closeAct();
+  fak.closeFak();
+  fsm.closeFsm();
+  fscn.closeFscn();
+  await sfx.openSfxFile(path);
 }
 
 /** 角色装扮模式：扫描资源根（或指定目录）装配基础模型 + 装备/时装 */
@@ -414,6 +450,7 @@ async function openDressMode(root?: string) {
   fak.closeFak();
   fsm.closeFsm();
   fscn.closeFscn();
+  sfx.closeSfx();
   await dress.open(root ?? res.rootDir);
 }
 
@@ -428,6 +465,7 @@ watch(
     fak.closeFak();
     fsm.closeFsm();
     fscn.closeFscn();
+    sfx.closeSfx();
     const ok = await dress.open(root);
     if (!ok) {
       dress.close();
@@ -477,6 +515,7 @@ async function previewModelDir(dir: string) {
   fak.closeFak();
   fsm.closeFsm();
   fscn.closeFscn();
+  sfx.closeSfx();
   dress.close();
   await scanWithSkeleton(dir);
 }
@@ -487,6 +526,7 @@ async function overlayAdd(e: ResEntry) {
   fak.closeFak();
   fsm.closeFsm();
   fscn.closeFscn();
+  sfx.closeSfx();
   await skin.addToViewer(e.path);
   if (skin.selectedPart !== e.path) skin.selectPart(e.path);
 }

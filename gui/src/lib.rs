@@ -8,6 +8,7 @@ mod fsm;
 mod glb;
 mod obj;
 mod res;
+mod sfx;
 mod vfs;
 
 use base64::Engine;
@@ -265,6 +266,27 @@ async fn save_fscn(path: String, model: fscn::FscnModel) -> Result<(), String> {
     .await
 }
 
+/// .sfx 特效脚本（节点树 + 贴图/网格/音效引用，参数原样保留）
+#[tauri::command]
+async fn load_sfx(path: String) -> Result<sfx::SfxFile, String> {
+    run_blocking(move || {
+        let bytes = vfs::read_file(&path)?;
+        sfx::parse_sfx(&path, &bytes)
+    })
+    .await
+}
+
+/// 保存 .sfx（未修改的节点字节级还原，见 sfx roundtrip 测试）
+#[tauri::command]
+async fn save_sfx(path: String, model: sfx::SfxFile) -> Result<(), String> {
+    run_blocking(move || {
+        reject_cpk_write(&path)?;
+        let bytes = sfx::serialize_sfx(&model)?;
+        std::fs::write(&path, bytes).map_err(|e| format!("写入失败: {e}"))
+    })
+    .await
+}
+
 /// 列举资源目录直接子项（供资源树懒加载 / 资源网格）
 #[tauri::command]
 async fn list_res_dir(dir: String) -> Result<Vec<res::ResEntry>, String> {
@@ -390,6 +412,8 @@ pub fn run() {
             save_fsm,
             load_fscn,
             save_fscn,
+            load_sfx,
+            save_sfx,
             list_res_dir,
             dir_default_fskel,
             export_file,
@@ -523,6 +547,29 @@ pub fn fscn_materials_for_test(path: &str) -> Result<Vec<(u32, String)>, String>
         .iter()
         .map(|md| (md.index, md.texture_path.clone()))
         .collect())
+}
+
+/// 诊断探针（sfx_scan 示例用）：解析概览 + 字节级往返校验
+pub fn sfx_probe_for_test(path: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取失败: {e}"))?;
+    let m = sfx::parse_sfx(path, &bytes)?;
+    if sfx::serialize_sfx(&m)? != bytes {
+        return Err("往返序列化与原文件不一致".into());
+    }
+    let tex: usize = m.nodes.iter().map(|n| n.textures.len()).sum();
+    let snd: usize = m.nodes.iter().map(|n| n.sounds.len()).sum();
+    let mdl: usize = m.nodes.iter().map(|n| n.models.len()).sum();
+    Ok(format!(
+        "{}: {}节点 tex{} fak{} wav{} t({:.0},{:.0},{:.0})",
+        path.rsplit(['\\', '/']).next().unwrap_or(path),
+        m.nodes.len(),
+        tex,
+        mdl,
+        snd,
+        m.matrix[12],
+        m.matrix[13],
+        m.matrix[14],
+    ))
 }
 
 /// 诊断探针（sz38_probe 示例用）：时装部件头发链排查——从 system.cpk 提取

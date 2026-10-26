@@ -453,3 +453,40 @@ BVH段（SCN 特有）: [u32 记录总数][记录×N]，第 3 个 u32 为 0 是�
 根为记录 0；满二叉时内部节点在前叶子在后（G01DW01: 262+263=525）；
 全部叶子三角形数之和 == 子网格三角形总数（全量样本逐字节核对）
 ```
+
+### SFX 特效脚本（`gui/src/sfx.rs`）
+
+战斗 / 场景 / 角色特效的节点脚本（`Effect/Combat|Scn|role|…`，system.cpk 全量
+782 个）。文件为「根变换 + 顺序节点表」，11 种节点类型：EffectQuad（公告板）、
+EffectParticleEmitter（粒子）、EffectCross（交叉面）、EffectCylinder（柱面）、
+EffectBeam（光束）、EffectGrid（面片）、EffectMesh（FAK 网格）、EffectSphere
+（球面）、EffectMsg（数值飘字）、EffectExplosive（爆炸）、EffectSound（音效）。
+查看器：无 3D 预览（粒子/公告板为运行时行为，离线不可复现），检查器显示
+节点树（类型/GBK 节点名）与贴图缩略图（点击放大）、网格（.fak）与音效（.wav）
+引用；资源树附带轻量统计（节点数）。贴图在 `system\effect\tex\`，与 FSCN 同
+「路径优先」口径解析（祖先拼接 + .dds 重试）。
+
+节点参数区为逐类型变长（贴图槽数组 EffectQuad 72B/个、Emitter 168B、
+Cylinder 120B、Cross 124B、Sphere 108B、Beam 76B、Grid 96B + 变长字符串），
+完整字段图未逆向；节点边界按「下一个 [u32 长度][已知类型名]」定位，以
+节点数 == 头部计数、类型名在已知集合内、末节点收于文件尾三条不变量校验，
+参数字节原样保留（保存 = 字节级还原）。参数区常见 0xCD 未初始化填充，系
+MSVC 调试版导出的原貌。
+
+#### sfx 格式速查（逆向结论，2026-10，system.cpk 全量 782 文件解析+往返 0 失败）
+
+```
+0x00  f32×16 根变换矩阵（行主序，末行为平移，[3][3] 恒 1.0；Scn 场景特效
+      为世界坐标摆放位，Combat 特效多为近单位阵）
+0x40  u32 节点数 N
+0x44  节点记录 ×N 顺序排列:
+        [u32 类型名长(含NUL)][类型名 NUL][u32 节点号][节点名 32B 缓冲 GBK
+         NUL 填充][类型参数变长区…]
+      节点号 = 节点表位置（EffectSound 恒写 0）；节点名为设计师命名
+      （"lujing"/"光传递_3"/"dust_a"，全量最长 15 字节）
+类型参数区内的资源引用（NUL 结尾可打印串，全小写前缀）:
+      system\effect\tex\…\*.tga  贴图（9802 条，多贴图 = 逐帧动画序列）
+      system\…\*.fak             EffectMesh 网格引用（111 条）
+      sound\…\*.wav              EffectSound 音效引用（281 条）
+```
+

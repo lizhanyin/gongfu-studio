@@ -1,5 +1,7 @@
-//! DDS 纹理解码（本游戏的 DDS 为 DXT1/DXT3 压缩，头部 pitch/mips 为 0 的变体）
+//! DDS 纹理解码（DXT1/DXT3/DXT5 压缩，头部 pitch/mips 为 0 的变体）
 //! 解码为自顶向下的 RGBA8。
+//! DXT5 长期未被触发（模型贴图全为 DXT1/DXT3），首个样本
+//! system\Effect\BladeGlow\glow.dds 暴露了 alpha 位流切片越界笔误（2026-10 修复）。
 
 pub struct TexImage {
     pub width: u32,
@@ -135,7 +137,13 @@ fn decode_dxt(data: &[u8], w: u32, h: u32, alpha_mode: Alpha) -> Result<Vec<u8>,
                         alphas[6] = 0;
                         alphas[7] = 255;
                     }
-                    let mut bits = u64::from_le_bytes(blk[2..8].try_into().unwrap());
+                    // 48bit alpha 索引流：字节 2 起连续 6 个（读 8 字节取低 48 位，
+                    // 逐像素 3bit 小端序，与下方 bits >>= 3 循环配套）
+                    let mut bits = u64::from_le_bytes(
+                        blk.get(2..10)
+                            .and_then(|s| s.try_into().ok())
+                            .ok_or("DXT5 alpha 块损坏")?,
+                    );
                     for slot in alpha_px.iter_mut().take(16) {
                         *slot = alphas[(bits & 7) as usize];
                         bits >>= 3;
@@ -170,4 +178,43 @@ fn decode_dxt(data: &[u8], w: u32, h: u32, alpha_mode: Alpha) -> Result<Vec<u8>,
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res");
+
+    /// DXT5 样本（system\Effect\BladeGlow\glow.dds，512×512）：Effect 目录
+    /// 497 个 DDS 中唯一的 DXT5，曾触发 alpha 位流切片越界 panic。
+    /// 期望像素值由独立参考解码器（标准 DXT5 算法）全图比对取得
+    #[test]
+    fn decode_dxt5_glow() {
+        let bytes = std::fs::read(format!("{RES}/system/Effect/BladeGlow/glow.dds")).unwrap();
+        let t = decode_dds(&bytes).unwrap();
+        assert_eq!((t.width, t.height), (512, 512));
+        assert_eq!(t.rgba.len(), 512 * 512 * 4);
+        // 透明角落 + 不透明辉光区（样本特定值，改动解码算法须重新校准）
+        assert_eq!(&t.rgba[0..4], &[0, 0, 0, 0]);
+        let px = |x: usize, y: usize| -> &[u8] {
+            let o = (y * 512 + x) * 4;
+            &t.rgba[o..o + 4]
+        };
+        assert_eq!(px(63, 53), &[235, 231, 235, 202]);
+        assert_eq!(px(191, 53), &[210, 211, 210, 202]);
+    }
+
+    /// 数据不足应报错而非 panic（修复前的 DXT5 路径会切片 unwrap 崩溃）
+    #[test]
+    fn truncated_data_is_error_not_panic() {
+        let bytes = std::fs::read(format!("{RES}/system/Effect/BladeGlow/glow.dds")).unwrap();
+        // 砍掉一半像素数据：need 检查应拦截
+        let cut = &bytes[..0x80 + 128 * 64 * 16];
+        assert!(decode_dds(cut).is_err());
+        // 仅头部
+        assert!(decode_dds(&bytes[..0x80]).is_err());
+        // 非 DDS 魔数
+        assert!(decode_dds(&[0u8; 0x80]).is_err());
+    }
 }

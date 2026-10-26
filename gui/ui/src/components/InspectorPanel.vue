@@ -78,12 +78,15 @@
         <n-collapse-item v-if="fscn.fscnModel" title="FSCN 信息" name="fscn">
           <FscnFileInfo :fscn="fscn" />
         </n-collapse-item>
+        <n-collapse-item v-if="sfx.sfxModel" title="SFX 特效" name="sfx">
+          <SfxFileInfo :sfx="sfx" />
+        </n-collapse-item>
         <n-collapse-item v-if="skin.selectedPart" title="部件检查" name="part">
           <PartInspector :skin="skin" />
         </n-collapse-item>
       </n-collapse>
       <div
-        v-if="!skin.hasParts && !act.actMeta && !fak.fakModel && !fsm.fsmModel && !fscn.fscnModel"
+        v-if="!skin.hasParts && !act.actMeta && !fak.fakModel && !fsm.fsmModel && !fscn.fscnModel && !sfx.sfxModel"
         class="inspector-empty"
       >
         从资源网格选择文件预览
@@ -109,6 +112,7 @@ import type { ActStore } from "../composables/useActMode";
 import type { FakStore } from "../composables/useFakMode";
 import type { FsmStore } from "../composables/useFsmMode";
 import type { FscnStore } from "../composables/useFscnMode";
+import type { SfxStore } from "../composables/useSfxMode";
 import type { DressStore } from "../composables/useDressMode";
 import DressPanel from "./DressPanel.vue";
 import PartGroupList from "./PartGroupList.vue";
@@ -117,6 +121,7 @@ import ActFileInfo from "./ActFileInfo.vue";
 import FakFileInfo from "./FakFileInfo.vue";
 import FsmFileInfo from "./FsmFileInfo.vue";
 import FscnFileInfo from "./FscnFileInfo.vue";
+import SfxFileInfo from "./SfxFileInfo.vue";
 import PartInspector from "./PartInspector.vue";
 import BoneList from "./BoneList.vue";
 import type { ResourceTreeStore } from "../composables/useResourceTree";
@@ -127,6 +132,7 @@ const props = defineProps<{
   fak: FakStore;
   fsm: FsmStore;
   fscn: FscnStore;
+  sfx: SfxStore;
   dress?: DressStore;
   res: ResourceTreeStore;
 }>();
@@ -153,6 +159,7 @@ const firstSection = computed(() => {
   if (props.fak.fakModel) return "fak";
   if (props.fsm.fsmModel) return "fsm";
   if (props.fscn.fscnModel) return "fscn";
+  if (props.sfx.sfxModel) return "sfx";
   if (props.skin.selectedPart) return "part";
   return null;
 });
