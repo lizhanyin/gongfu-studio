@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { FakModel, FsmModel, FskinModel, FskelMeta, Influence, SfxFile, Vertex } from "./types";
+import type { FakModel, FsmModel, FskinModel, FskelMeta, Influence, SfxFile, SfxPath, Vertex } from "./types";
 import { gfm, gfmEnabled } from "./gfm";
 
 export interface TexData {
@@ -148,7 +148,8 @@ function polarRotation(h: number[]): number[] | null {
 interface FxItemObj {
   id: number;
   group: THREE.Group;
-  /** 带贴图节点各一块公告板（局部原点叠加混合）；on = 节点显隐（≈引擎 FindEffect 粒度） */
+  /** 带贴图节点各一块公告板（板位 = 节点偏移 + 路径积分位置）；
+   *  on = 节点显隐（≈引擎 FindEffect 粒度） */
   boards: {
     node: number;
     sprite: THREE.Sprite;
@@ -156,7 +157,13 @@ interface FxItemObj {
     frames: (THREE.Texture | null)[];
     cur: THREE.Texture | null;
     on: boolean;
+    /** 节点 prop+112 偏移（引擎公告板位 = 偏移+路径位置，组矩阵负责挂接系） */
+    basePos: THREE.Vector3;
+    /** 引用的路径名（"" = 定点；须在 motions 中存在） */
+    pathName: string;
   }[];
+  /** 文件路径名 → 路径对象 + 模拟器（同名共享一份，引擎 SGEffectNode 同口径） */
+  motions: Map<string, { p: SfxPath; sim: MotionSim }>;
   mode: "bone" | "world";
   boneIdx: number;
   boneName: string;
@@ -165,6 +172,73 @@ interface FxItemObj {
   eulerRad: [number, number, number];
   scale: number;
   visible: boolean;
+}
+
+/** EffectMotion 路径模拟态：引擎语义 = 状态按时长推进（循环回绕）、
+ *  状态间线性插值速度、位置逐帧积分（EffectMotion::Update） */
+interface MotionSim {
+  /** 特效龄（含 delay 之前的等待） */
+  t: number;
+  /** 当前状态序与态内时间 */
+  idx: number;
+  elapsed: number;
+  pos: THREE.Vector3;
+  /** 非循环且末态播完（引擎保持末速度持续漂，5s 寿命兜底；预览口径停住） */
+  done: boolean;
+}
+
+function makeMotionSim(): MotionSim {
+  return { t: 0, idx: 0, elapsed: 0, pos: new THREE.Vector3(), done: false };
+}
+
+/** 推进一个路径：dt 秒（引擎 MainUpdate 每帧调 Update；这里等步长积分） */
+function tickMotionSim(p: SfxPath, s: MotionSim, dt: number) {
+  if (s.done || dt <= 0) return;
+  s.t += dt;
+  if (s.t < p.delay) return; // 引擎：特效龄超 delay 才开始积分
+  const n = p.states.length;
+  if (!n) {
+    s.done = true;
+    return;
+  }
+  s.elapsed += dt;
+  let guard = 0;
+  while (s.elapsed > p.states[s.idx][0] && guard++ < 10000) {
+    s.elapsed -= p.states[s.idx][0];
+    if (s.idx + 1 < n) s.idx++;
+    else if (p.looped) s.idx = 0;
+    else {
+      s.done = true; // 预览停住口径（见 MotionSim.done 注释）
+      return;
+    }
+  }
+  const cur = p.states[s.idx];
+  const next = s.idx + 1 < n ? p.states[s.idx + 1] : p.looped ? p.states[0] : null;
+  const f = Math.min(s.elapsed / Math.max(cur[0], 1e-6), 1);
+  let vx = cur[1], vy = cur[2], vz = cur[3];
+  if (next) {
+    vx += (next[1] - vx) * f;
+    vy += (next[2] - vy) * f;
+    vz += (next[3] - vz) * f;
+  }
+  s.pos.x += vx * dt;
+  s.pos.y += vy * dt;
+  s.pos.z += vz * dt;
+}
+
+/** 文件路径表 → 模拟器表（空状态路径不进表 = 引用节点按定点处理） */
+function makeMotionMap(paths: SfxPath[]): Map<string, { p: SfxPath; sim: MotionSim }> {
+  const m = new Map<string, { p: SfxPath; sim: MotionSim }>();
+  for (const p of paths) if (p.name && p.states.length) m.set(p.name, { p, sim: makeMotionSim() });
+  return m;
+}
+
+/** 节点引用的有效路径名（"none"/空/未定义路径 → ""） */
+function effPathName(
+  pathName: string,
+  motions: Map<string, { p: SfxPath; sim: MotionSim }>
+): string {
+  return pathName && pathName !== "none" && motions.has(pathName) ? pathName : "";
 }
 
 export class Viewer {
@@ -402,7 +476,7 @@ export class Viewer {
   private fsmDummyGeoms: THREE.SphereGeometry[] = [];
   private fsmDummyMats: THREE.Material[] = [];
 
-  // ---- SFX 特效播放器（近似预览：参数区字段未逆向，按节点贴图序列逐帧翻页）----
+  // ---- SFX 特效播放器（公告板按节点 prop+112 偏移真实摆放 + 路径动画）----
   private sfxGroup: THREE.Group | null = null;
   /** 各贴图节点一个公告板（Sprite 始终面向相机），node = 节点序 */
   private sfxBoards: {
@@ -414,9 +488,17 @@ export class Viewer {
     /** 当前绑定 map 与其帧序（热替换同帧时直接重绑） */
     cur: THREE.Texture | null;
     frameIdx: number;
+    /** 节点显隐（检查器逐节点开关） */
+    on: boolean;
+    /** 节点偏移（板位 = basePos + 路径积分位置） */
+    basePos: THREE.Vector3;
+    /** 引用的路径名（"" = 定点） */
+    pathName: string;
     label: THREE.Sprite;
     labelTex: THREE.CanvasTexture;
   }[] = [];
+  /** 路径名 → 路径对象+模拟器（同名共享；setSfx 重建） */
+  private sfxMotions = makeMotionMap([]);
 
   // ---- 挂接特效（角色叠加播放：挂骨跟随 / 世界放置；与上方 SFX 预览模式互不影响）----
   /** 每实例一个 Group 挂 modelRoot（matrixAutoUpdate=false，矩阵由 updateFxMatrices 重算） */
@@ -4180,27 +4262,26 @@ export class Viewer {
   // ---------------- SFX 特效播放器 ----------------
 
   /**
-   * 构建特效预览场景：每个带贴图的节点一个公告板（Sprite），网格排布展示
-   * （节点局部变换/发射参数未逆向，无法还原真实空间关系）。根矩阵的线性
-   * 部分（旋转/缩放）作用于整组，平移丢弃——Combat 特效近单位阵，Scn 特效
-   * 为场景世界摆放位（离原点数千米，对预览无意义）。逐帧动画 = 各节点贴图
-   * 序列翻页；帧率与相位文件未记录，统一按外部帧号驱动、序列内取模循环。
+   * 构建特效预览场景：每个带贴图的节点一个公告板（Sprite），按节点
+   * prop+112 的真实偏移摆放（Quad/Cross 逆向确证，90%+ 节点非零——
+   * 贴近游戏观感；其余类型偏移未逆向恒 0）。挂路径名的节点位 =
+   * 偏移 + EffectMotion 速度积分位置（tickSfxMotion 逐帧推进）。
+   * 根矩阵的线性部分（旋转/缩放）作用于整组，平移丢弃——Combat 特效
+   * 平移为编辑器残留、Scn 特效为场景世界摆放位（离原点数千米，对独立
+   * 预览无意义且 frameAll 焦距失控）。逐帧动画 = 各节点贴图序列翻页；
+   * 帧率与相位文件未记录，统一按外部帧号驱动、序列内取模循环。
    */
   setSfx(model: SfxFile, nodeTex: { file: string | null; tex: TexData | null }[][]) {
     this.clearSfx();
     const group = new THREE.Group();
     this.sfxGroup = group;
+    this.sfxMotions = makeMotionMap(model.paths);
     const boards = model.nodes
       .map((n, i) => ({ n, i, slots: nodeTex[i] ?? [] }))
       .filter((b) => b.n.textures.length > 0);
-    const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(boards.length))));
-    const rows = Math.ceil(boards.length / cols);
-    const SX = 320;
-    const SZ = 340;
     const H = 150; // 公告板统一高度（世界单位），宽按贴图纵横比
-    boards.forEach((b, k) => {
-      const x = ((k % cols) - (cols - 1) / 2) * SX;
-      const z = (Math.floor(k / cols) - (rows - 1) / 2) * SZ;
+    boards.forEach((b) => {
+      const base = new THREE.Vector3(b.n.offset[0] || 0, b.n.offset[1] || 0, b.n.offset[2] || 0);
       const mat = new THREE.SpriteMaterial({
         transparent: true,
         depthWrite: false,
@@ -4213,16 +4294,28 @@ export class Viewer {
       const first = b.slots.find((s) => s?.tex);
       const aspect = first?.tex ? first.tex.width / first.tex.height : 1;
       const sprite = new THREE.Sprite(mat);
-      sprite.position.set(x, H / 2 + 46, z);
+      sprite.position.copy(base);
       sprite.scale.set(H * Math.min(Math.max(aspect, 0.25), 4), H, 1);
       group.add(sprite);
       // 名称标签：对应检查器节点序，普通混合不受叠加开关影响
       const { label, tex: labelTex } = this.sfxLabel(
         `#${b.i} ${b.n.kind}${b.n.name ? ` · ${b.n.name}` : ""}`
       );
-      label.position.set(x, 16, z);
+      label.position.set(base.x, base.y - H * 0.62, base.z);
       group.add(label);
-      this.sfxBoards.push({ node: b.i, sprite, mat, frames, cur: null, frameIdx: 0, label, labelTex });
+      this.sfxBoards.push({
+        node: b.i,
+        sprite,
+        mat,
+        frames,
+        cur: null,
+        frameIdx: 0,
+        on: true,
+        basePos: base,
+        pathName: effPathName(b.n.pathName, this.sfxMotions),
+        label,
+        labelTex,
+      });
     });
     // 根矩阵行主序、末行为平移（D3D 行向量约定）→ 转置进 three 列主序；平移丢弃见上
     const m = model.matrix;
@@ -4259,7 +4352,7 @@ export class Viewer {
     return { label, tex };
   }
 
-  /** 应用播放帧：各节点按自身帧数取模翻页（短序列提前循环） */
+  /** 应用播放帧：各节点按自身帧数取模翻页（短序列提前循环），尊重节点显隐 */
   applySfxFrame(frame: number) {
     for (const b of this.sfxBoards) {
       if (!b.frames.length) continue;
@@ -4270,8 +4363,53 @@ export class Viewer {
       b.cur = t;
       b.mat.map = t ?? undefined;
       b.mat.needsUpdate = true;
-      b.sprite.visible = !!t;
+      b.sprite.visible = b.on && !!t;
     }
+  }
+
+  /** 路径动画推进（composable 播放循环逐帧调；贴图翻页独立按帧号驱动） */
+  tickSfxMotion(dt: number) {
+    if (!this.sfxGroup) return;
+    for (const { p, sim } of this.sfxMotions.values()) tickMotionSim(p, sim, dt);
+    for (const b of this.sfxBoards) {
+      if (!b.pathName) continue;
+      const sim = this.sfxMotions.get(b.pathName)?.sim;
+      if (!sim) continue;
+      b.sprite.position.set(
+        b.basePos.x + sim.pos.x,
+        b.basePos.y + sim.pos.y,
+        b.basePos.z + sim.pos.z
+      );
+      b.label.position.set(
+        b.sprite.position.x,
+        b.sprite.position.y - 93, // H(150)×0.62，与构建期标签位同口径
+        b.sprite.position.z
+      );
+    }
+  }
+
+  /** 路径动画复位（重播；setSfx 重建时随 clearSfx 一并清空） */
+  resetSfxMotion() {
+    for (const { sim } of this.sfxMotions.values()) {
+      sim.t = 0;
+      sim.idx = 0;
+      sim.elapsed = 0;
+      sim.done = false;
+      sim.pos.set(0, 0, 0);
+    }
+    for (const b of this.sfxBoards) {
+      b.sprite.position.copy(b.basePos);
+      b.label.position.set(b.basePos.x, b.basePos.y - 93, b.basePos.z);
+    }
+  }
+
+  /** 节点显隐（检查器逐节点开关；公告板与标签一并隐藏） */
+  setSfxNodeVisible(nodeIdx: number, on: boolean) {
+    const b = this.sfxBoards.find((x) => x.node === nodeIdx);
+    if (!b) return;
+    b.on = on;
+    b.sprite.visible = on && !!b.cur;
+    b.label.visible = on;
   }
 
   /** SFX 节点贴图热替换（检查器改路径后刷新公告板）：nodeIdx 节点序 / frameIdx 节点内贴图槽序 */
@@ -4306,6 +4444,7 @@ export class Viewer {
       (b.label.material as THREE.SpriteMaterial).dispose();
     }
     this.sfxBoards = [];
+    this.sfxMotions.clear();
   }
 
   hasSfx() {
@@ -4315,10 +4454,12 @@ export class Viewer {
   // ---------------- 挂接特效播放器（角色叠加） ----------------
 
   /**
-   * 添加挂接特效实例（同 id 先卸再建）。公告板口径：带贴图节点各一块 Sprite
-   * 落局部原点、叠加混合（引擎对 Quad/Cross 即骨位公告板同点发光，节点
-   * 局部偏移在参数区未逆向，原点叠加最贴近游戏观感）；EffectSound 不渲染
-   * （音频由检查器试听），EffectMesh 的 .fak 暂不渲染。
+   * 添加挂接特效实例（同 id 先卸再建）。公告板口径：带贴图节点各一块
+   * Sprite，按节点 prop+112 偏移落板（Quad/Cross 逆向确证——引擎公告板
+   * 位 = 偏移 + EffectMotion 路径积分位置，贴游戏观感），叠加混合；
+   * 根矩阵不参与（引擎挂接走 SetWorldMat 整体替换，Combat 根平移为
+   * 编辑器残留）。EffectSound 不渲染（音频由检查器试听），EffectMesh
+   * 的 .fak 暂不渲染。
    */
   addFx(
     id: number,
@@ -4340,6 +4481,7 @@ export class Viewer {
     const group = new THREE.Group();
     group.matrixAutoUpdate = false;
     const boards: FxItemObj["boards"] = [];
+    const motions = makeMotionMap(model.paths);
     model.nodes.forEach((n, i) => {
       const slots = nodeTex[i] ?? [];
       if (!n.textures.length || !slots.length) return;
@@ -4359,13 +4501,16 @@ export class Viewer {
       sprite.raycast = () => {}; // 不参与网格拾取（点击选中部件不被特效遮挡）
       group.add(sprite);
       const on = !opts.nodeMute?.[i];
-      boards.push({ node: i, sprite, mat, frames, cur: null, on });
+      const basePos = new THREE.Vector3(n.offset[0] || 0, n.offset[1] || 0, n.offset[2] || 0);
+      sprite.position.copy(basePos);
+      boards.push({ node: i, sprite, mat, frames, cur: null, on, basePos, pathName: effPathName(n.pathName, motions) });
     });
     this.modelRoot.add(group);
     const item = {
       id,
       group,
       boards,
+      motions,
       mode: opts.mode,
       boneIdx: -1,
       boneName: opts.mode === "bone" ? opts.bone : "",
@@ -4380,6 +4525,37 @@ export class Viewer {
     group.visible = opts.visible;
     this.updateFxMatrix(item);
     this.applyFxFrame(id, 0);
+  }
+
+  /** 路径动画推进（composable 播放循环逐帧调，dt 已乘速度） */
+  updateFxMotion(id: number, dt: number) {
+    const item = this.fxItems.get(id);
+    if (!item) return;
+    for (const { p, sim } of item.motions.values()) tickMotionSim(p, sim, dt);
+    for (const b of item.boards) {
+      if (!b.pathName) continue;
+      const sim = item.motions.get(b.pathName)?.sim;
+      if (!sim) continue;
+      b.sprite.position.set(
+        b.basePos.x + sim.pos.x,
+        b.basePos.y + sim.pos.y,
+        b.basePos.z + sim.pos.z
+      );
+    }
+  }
+
+  /** 路径动画复位（重播：模拟态清零、板回偏移位） */
+  resetFxMotion(id: number) {
+    const item = this.fxItems.get(id);
+    if (!item) return;
+    for (const { sim } of item.motions.values()) {
+      sim.t = 0;
+      sim.idx = 0;
+      sim.elapsed = 0;
+      sim.done = false;
+      sim.pos.set(0, 0, 0);
+    }
+    for (const b of item.boards) b.sprite.position.copy(b.basePos);
   }
 
   /** 按名解析骨序（大小写不敏感；未加载/找不到 = -1，特效落角色原点） */

@@ -31,10 +31,23 @@
     <template v-else>
       <!-- 节点列表：限高滚动，不再把下方预览顶走 -->
       <div class="sfx-nodelist">
-        <div class="sfx-node" v-for="(n, i) in sfx.sfxModel.nodes" :key="i">
+        <div
+          class="sfx-node"
+          v-for="(n, i) in sfx.sfxModel.nodes"
+          :key="i"
+          :class="{ hidden: !sfx.nodeVisible[i] }"
+        >
           <div class="action-row">
+            <button
+              class="sfx-eye"
+              :class="{ off: !sfx.nodeVisible[i] }"
+              :title="sfx.nodeVisible[i] ? '隐藏该节点公告板' : '显示该节点公告板'"
+              @click="sfx.toggleNodeVisible(i)"
+            >
+              {{ sfx.nodeVisible[i] ? "👁" : "🚫" }}
+            </button>
             <span class="sfx-kind">#{{ i }} {{ kindLabel(n.kind) }}</span>
-            <span class="action-meta">{{ n.name || "-" }}</span>
+            <span class="action-meta">{{ nodeMeta(n) }}</span>
           </div>
           <div v-if="n.textures.length" class="sfx-refs">
             <img
@@ -148,6 +161,18 @@ const KIND_LABELS: Record<string, string> = {
 };
 function kindLabel(kind: string): string {
   return `${KIND_LABELS[kind] ?? kind}`;
+}
+
+/** 节点元信息：设计师命名 + 位置偏移（Quad/Cross 逆向字段）+ 挂接路径 */
+function nodeMeta(n: { name: string; offset: number[]; pathName: string }): string {
+  const parts: string[] = [];
+  if (n.name) parts.push(n.name);
+  const off = n.offset ?? [0, 0, 0];
+  if (off.some((v) => Math.abs(v) > 1e-4)) {
+    parts.push(`偏移(${off.map((v) => Math.round(v)).join(",")})`);
+  }
+  if (n.pathName && n.pathName !== "none") parts.push(`路径 ${n.pathName}`);
+  return parts.join(" · ") || "-";
 }
 
 // ---------------- 播放控制 ----------------
@@ -293,6 +318,22 @@ onUnmounted(stopSound);
 }
 .sfx-node {
   padding: 2px 0;
+}
+/* 隐藏节点整行降透明度（缩略图等一并弱化） */
+.sfx-node.hidden {
+  opacity: 0.45;
+}
+.sfx-eye {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.sfx-eye.off {
+  filter: grayscale(1);
+  opacity: 0.5;
 }
 .sfx-node .action-row {
   margin-bottom: 2px;

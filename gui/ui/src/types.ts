@@ -355,6 +355,10 @@ export interface SfxNode {
   kind: string;
   /** GBK 解码节点名（"lujing"/"光传递_3" 等设计师命名，可为空） */
   name: string;
+  /** 位置偏移（prop+112；Quad/Cross 逆向确证，其余类型恒 0） */
+  offset: number[];
+  /** 挂接路径名（prop+80；"none"/空 = 定点，否则引用 paths 中同名 EffectMotion） */
+  pathName: string;
   /** 类型名之后的原始参数字节（节点号+名字缓冲+类型参数），保存时原样写回 */
   raw: number[];
   /** 贴图引用（system\effect\tex\…\*.tga，含逐帧动画序列） */
@@ -365,9 +369,25 @@ export interface SfxNode {
   sounds: string[];
 }
 
+/** 尾部路径对象（EffectMotion = 速度积分路径；节点按 pathName 引用共享） */
+export interface SfxPath {
+  kind: string;
+  name: string;
+  /** 起始延迟秒 */
+  delay: number;
+  /** 循环（末态回绕首态） */
+  looped: boolean;
+  /** 关键帧 {时长s, 速度xyz, 角速度xyz}；位置 = 速度逐帧积分 */
+  states: number[][];
+  /** 记录原始字节（类型名之后），保存时原样写回 */
+  raw: number[];
+}
+
 export interface SfxFile {
   path: string;
   /** 行主序 4×4 根变换（末行为平移） */
   matrix: number[];
   nodes: SfxNode[];
+  /** 尾部路径数组（可为空） */
+  paths: SfxPath[];
 }

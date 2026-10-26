@@ -7,8 +7,9 @@ import { message } from "../message";
 import { shortName } from "../utils";
 
 /**
- * SFX 特效模式：3D 公告板播放器（参数区字段未逆向，按节点贴图序列逐帧翻页，
- * 见 viewer.setSfx）+ 检查器节点树与资源引用。贴图引用
+ * SFX 特效模式：3D 公告板播放器（公告板按节点 prop+112 偏移真实摆放，
+ * 挂路径名的节点做 EffectMotion 速度积分动画，见 viewer.setSfx）+
+ * 检查器节点树与资源引用。贴图引用
  * （system\effect\tex\…\*.tga）与 FAK/FSM/FSCN 同「路径优先」口径解析：
  * 按文件路径祖先（CPK 根）拼接命中，未命中换 .dds 重试。
  * 支持改写节点贴图引用路径（raw 内原槽位就地覆写，长度只减不增，
@@ -26,6 +27,8 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
   /** 播放头（浮点帧号，0..actionFrames-1） */
   const playTime = ref(0);
   const speed = ref(1);
+  /** 节点显隐表（与 nodes 对齐，检查器逐节点开关） */
+  const nodeVisible = ref<boolean[]>([]);
 
   /** 贴图引用 → 解析结果（file 为命中的实际路径；url 为缩略图 dataURL） */
   const texSlots = reactive(new Map<string, { file: string | null; url: string | null }>());
@@ -89,6 +92,7 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
       sfxModel.value = model;
       dirty.value = false;
       playTime.value = 0;
+      nodeVisible.value = model.nodes.map(() => true);
       const nodeSlots = await resolveNodeTextures(model);
       viewer.value?.setSfx(model, nodeSlots);
       viewer.value?.frameAll();
@@ -126,6 +130,8 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
     const dt = Math.min((ts - lastTs) / 1000, 0.1);
     lastTs = ts;
     if (!playing.value || !sfxModel.value) return;
+    // 路径动画（EffectMotion 速度积分）与贴图翻页同拍推进
+    viewer.value?.tickSfxMotion(dt * speed.value);
     const total = actionFrames.value;
     playTime.value += dt * fps.value * speed.value;
     if (playTime.value >= total) playTime.value = 0;
@@ -141,6 +147,13 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
   /** 叠加混合开关（发光贴图默认叠加） */
   function setBlending(additive: boolean) {
     viewer.value?.setSfxBlending(additive);
+  }
+
+  /** 节点显隐（公告板+标签一并隐藏） */
+  function toggleNodeVisible(i: number) {
+    if (i >= nodeVisible.value.length) return;
+    nodeVisible.value[i] = !nodeVisible.value[i];
+    viewer.value?.setSfxNodeVisible(i, nodeVisible.value[i]);
   }
 
   /**
@@ -243,6 +256,8 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
     speed,
     scrub,
     setBlending,
+    nodeVisible,
+    toggleNodeVisible,
     // 路径改写与保存
     dirty,
     setNodeTexture,

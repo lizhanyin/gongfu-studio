@@ -323,6 +323,7 @@ export function useEffectMode(viewer: ShallowRef<Viewer | null>) {
     if (!inst) return;
     inst.elapsed = 0;
     inst.playing = true;
+    viewer.value?.resetFxMotion(id);
     viewer.value?.applyFxFrame(id, 0);
   }
 
@@ -343,13 +344,16 @@ export function useEffectMode(viewer: ShallowRef<Viewer | null>) {
     }
     for (const inst of instances.values()) {
       if (inst.playing) {
-        inst.elapsed += dt * inst.speed;
+        const step = dt * inst.speed;
+        inst.elapsed += step;
         if (!inst.loop && inst.elapsed >= inst.lifetime) {
           inst.elapsed = inst.lifetime;
           inst.playing = false; // 生命周期到点自停（保留末帧，重播按钮恢复）
         } else if (inst.loop) {
           inst.elapsed %= inst.lifetime;
         }
+        // 路径动画（EffectMotion 速度积分）与贴图翻页同拍推进
+        v.updateFxMotion(inst.id, step);
         v.applyFxFrame(inst.id, Math.floor(inst.elapsed * inst.fps));
       }
     }

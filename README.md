@@ -457,38 +457,51 @@ BVH段（SCN 特有）: [u32 记录总数][记录×N]，第 3 个 u32 为 0 是�
 ### SFX 特效脚本（`gui/src/sfx.rs`）
 
 战斗 / 场景 / 角色特效的节点脚本（`Effect/Combat|Scn|role|…`，system.cpk 全量
-782 个）。文件为「根变换 + 顺序节点表」，11 种节点类型：EffectQuad（公告板）、
-EffectParticleEmitter（粒子）、EffectCross（交叉面）、EffectCylinder（柱面）、
-EffectBeam（光束）、EffectGrid（面片）、EffectMesh（FAK 网格）、EffectSphere
-（球面）、EffectMsg（数值飘字）、EffectExplosive（爆炸）、EffectSound（音效）。
-查看器：近似播放器——参数区字段未逆向（粒子/发射行为离线不可复现），每个带
-贴图的节点渲染为一张公告板（Sprite，始终面向相机），按其贴图序列逐帧翻页
-（帧率可调，默认 12fps；序列内取模循环），叠加混合（可切普通透明）；根矩阵
-线性部分作用于整组、世界平移丢弃（Scn 摆放位离原点数千米）。检查器：节点
-列表限高滚动，贴图缩略图点击放大（吸底固定高度常驻）并可**改写贴图引用
-路径**（raw 内原槽位就地覆写、长度只减不增，同目录下拉 + 自定义路径，
+786 个）。文件为「根变换 + 顺序节点表 + 尾部路径数组」，11 种节点类型：
+EffectQuad（公告板）、EffectParticleEmitter（粒子）、EffectCross（交叉面）、
+EffectCylinder（柱面）、EffectBeam（光束）、EffectGrid（面片）、EffectMesh
+（FAK 网格）、EffectSphere（球面）、EffectMsg（数值飘字）、EffectExplosive
+（爆炸）、EffectSound（音效）。查看器：公告板播放器——带贴图节点各一块
+Sprite，按节点 prop+112 的**位置偏移**真实摆放（Quad/Cross 逆向确证，
+90%+ 节点非零，贴近游戏观感；粒子/发射行为仍离线不可复现），挂路径名的
+节点做 **EffectMotion 路径动画**（速度关键帧插值 + 逐帧积分，与引擎
+EffectMotion::Update 同语义），贴图序列逐帧翻页（帧率可调，默认 12fps；
+序列内取模循环），叠加混合（可切普通透明）；根矩阵线性部分作用于整组、
+世界平移丢弃（Combat 平移为编辑器残留、Scn 摆放位离原点数千米）。检查器：
+节点列表限高滚动，每节点**显隐切换**（公告板+标签一并隐藏），元信息含
+偏移与挂接路径名；贴图缩略图点击放大（吸底固定高度常驻）并可**改写贴图
+引用路径**（raw 内原槽位就地覆写、长度只减不增，同目录下拉 + 自定义路径，
 未解析到 .tga 时可改指 .dds），改写经「保存」落盘（CPK 内不可写）；
 EffectSound 引用可在线试听。资源树附带轻量统计（节点数）。贴图在
 `system\effect\tex\`，与 FSCN 同「路径优先」口径解析（祖先拼接 + .dds 重试）。
 
-节点参数区为逐类型变长（贴图槽数组 EffectQuad 72B/个、Emitter 168B、
-Cylinder 120B、Cross 124B、Sphere 108B、Beam 76B、Grid 96B + 变长字符串），
-完整字段图未逆向；节点边界按「下一个 [u32 长度][已知类型名]」定位，以
-节点数 == 头部计数、类型名在已知集合内、末节点收于文件尾三条不变量校验，
-参数字节原样保留（保存 = 字节级还原）。参数区常见 0xCD 未初始化填充，系
-MSVC 调试版导出的原貌。
+节点参数区 = prop 定长块（Quad 184B / Cross 208B / Motion 124B，头 36B 即
+[u32 节点号][32B 名字缓冲]）+ [u32 N][N×状态关键帧]（Quad 72B/Cross 124B/
+Motion 60B）+ 340B EffectBase 公共尾块（贴图路径在 base+12）。Quad/Cross
+的 prop+112 = 位置偏移 vec3（公告板世界位 = 偏移 + 路径积分位置，F3D.dll
+SetOffset/Update 实测）、prop+80 = 32B 挂接路径名（"none" = 定点）；其余
+类型 prop 布局未逆向（偏移按 0）。尾部路径数组 = [u32 M][M×EffectMotion]
+（引擎 SGEffectNode::Deserialize 第二个对象数组，AddEffectPath 挂接；
+状态 = {时长, 速度 xyz, 角速度 xyz}，looped 回绕），786 文件实测恒
+EffectMotion、M=0..22。节点边界按「下一个 [u32 长度][已知类型名]」定位
+（末节点收于尾部路径数组起点，链式校验恰好收于文件尾），参数字节原样
+保留（保存 = 字节级还原）。参数区常见 0xCD 未初始化填充，系 MSVC 调试版
+导出的原貌。
 
-#### sfx 格式速查（逆向结论，2026-10，system.cpk 全量 782 文件解析+往返 0 失败）
+#### sfx 格式速查（逆向结论，2026-10，system.cpk 全量 786 文件解析+往返 0 失败）
 
 ```
 0x00  f32×16 根变换矩阵（行主序，末行为平移，[3][3] 恒 1.0；Scn 场景特效
-      为世界坐标摆放位，Combat 特效多为近单位阵）
+      为世界坐标摆放位，Combat 特效平移为编辑器残留——引擎挂接走
+      SetWorldMat 整体替换）
 0x40  u32 节点数 N
 0x44  节点记录 ×N 顺序排列:
         [u32 类型名长(含NUL)][类型名 NUL][u32 节点号][节点名 32B 缓冲 GBK
          NUL 填充][类型参数变长区…]
       节点号 = 节点表位置（EffectSound 恒写 0）；节点名为设计师命名
       （"lujing"/"光传递_3"/"dust_a"，全量最长 15 字节）
+尾部  [u32 路径数 M][M × EffectMotion 记录]（结构同节点记录，name 即
+      路径名，供节点 prop+80 引用；M 可为 0——仅 4 字节计数）
 类型参数区内的资源引用（NUL 结尾可打印串，全小写前缀）:
       system\effect\tex\…\*.tga  贴图（9802 条，多贴图 = 逐帧动画序列）
       system\…\*.fak             EffectMesh 网格引用（111 条）
