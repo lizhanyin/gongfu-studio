@@ -3,17 +3,9 @@
     <div class="sfx-head kv">
       <b>{{ fileName }}</b> · 根平移 {{ transText }}<br />
       节点 {{ sfx.sfxModel.nodes.length }} · 类型 {{ kindCount }} · 贴图
-      {{ sfx.uniqueTextures.length }} · 时长 {{ ((sfx.actionFrames - 1) / sfx.fps).toFixed(2) }}s
+      {{ sfx.uniqueTextures.length }} · 时长 {{ sfx.actionFrames.toFixed(2) }}s
     </div>
     <div class="sfx-ctl">
-      <span class="ctl-lbl">帧率</span>
-      <n-select
-        size="tiny"
-        style="width: 70px"
-        :value="sfx.fps"
-        :options="fpsOpts"
-        @update:value="(v: number) => (sfx.fps = v)"
-      />
       <span class="ctl-lbl">叠加</span>
       <n-switch size="small" :value="additive" @update:value="onBlending" />
       <div class="ctl-spacer"></div>
@@ -38,15 +30,17 @@
           :class="{ hidden: !sfx.nodeVisible[i] }"
         >
           <div class="action-row">
+            <span class="sfx-kind">#{{ i }} {{ kindLabel(n.kind) }}</span>
             <button
               class="sfx-eye"
               :class="{ off: !sfx.nodeVisible[i] }"
               :title="sfx.nodeVisible[i] ? '隐藏该节点公告板' : '显示该节点公告板'"
               @click="sfx.toggleNodeVisible(i)"
             >
-              {{ sfx.nodeVisible[i] ? "👁" : "🚫" }}
+              {{ sfx.nodeVisible[i] ? "◉" : "○" }}
             </button>
-            <span class="sfx-kind">#{{ i }} {{ kindLabel(n.kind) }}</span>
+          </div>
+          <div class="sfx-refs">
             <span class="action-meta">{{ nodeMeta(n) }}</span>
           </div>
           <div v-if="n.textures.length" class="sfx-refs">
@@ -163,13 +157,27 @@ function kindLabel(kind: string): string {
   return `${KIND_LABELS[kind] ?? kind}`;
 }
 
-/** 节点元信息：设计师命名 + 位置偏移（Quad/Cross 逆向字段）+ 挂接路径 */
-function nodeMeta(n: { name: string; offset: number[]; pathName: string }): string {
+/** 节点元信息：设计师命名 + 位置偏移 + 尺寸 + 帧网格 + 挂接路径（引擎逆向字段） */
+function nodeMeta(n: {
+  name: string;
+  offset: number[];
+  pathName: string;
+  size: number[];
+  grid: number[];
+  hold: boolean;
+  fps: number;
+}): string {
   const parts: string[] = [];
   if (n.name) parts.push(n.name);
   const off = n.offset ?? [0, 0, 0];
   if (off.some((v) => Math.abs(v) > 1e-4)) {
     parts.push(`偏移(${off.map((v) => Math.round(v)).join(",")})`);
+  }
+  const sz = n.size ?? [0, 0];
+  if (sz[0] > 1 || sz[1] > 1) parts.push(`${Math.round(sz[0])}×${Math.round(sz[1])}`);
+  const g = n.grid ?? [1, 1];
+  if (g[0] > 1 || g[1] > 1) {
+    parts.push(`分帧${g[0]}×${g[1]}@${Math.round(n.fps)}fps${n.hold ? "停帧" : ""}`);
   }
   if (n.pathName && n.pathName !== "none") parts.push(`路径 ${n.pathName}`);
   return parts.join(" · ") || "-";
@@ -177,7 +185,6 @@ function nodeMeta(n: { name: string; offset: number[]; pathName: string }): stri
 
 // ---------------- 播放控制 ----------------
 
-const fpsOpts = [6, 10, 12, 15, 24, 30].map((v) => ({ label: `${v}`, value: v }));
 /** 叠加混合（发光特效默认开）；换文件时随 viewer 重建回默认 */
 const additive = ref(true);
 function onBlending(v: boolean) {
@@ -327,13 +334,23 @@ onUnmounted(stopSound);
   border: 0;
   background: transparent;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1;
   padding: 0 2px;
+  margin-left: 6px;
+  color: #63e2b7;
+}
+.sfx-eye:hover {
+  color: #8cffd4;
 }
 .sfx-eye.off {
-  filter: grayscale(1);
-  opacity: 0.5;
+  color: #5a6274;
+}
+/* 元信息行：可随长路径折行（覆盖全局 .action-meta 的 flex-shrink:0） */
+.sfx-refs .action-meta {
+  flex-shrink: 1;
+  min-width: 0;
+  word-break: break-all;
 }
 .sfx-node .action-row {
   margin-bottom: 2px;

@@ -83,6 +83,80 @@ pub struct SfxNode {
     pub models: Vec<String>,
     /// 音效引用（EffectSound 节点的 sound\…\*.wav）
     pub sounds: Vec<String>,
+    /// 首状态关键帧尺寸 [全宽, 全高]（Quad/Cross 状态 f32[5]/[6] 为半宽/
+    /// 半高，引擎 sub_10095210/sub_10087E60 通道图；×2 成全尺寸）。
+    /// 无状态或字段为 0 时 [0,0]，查看器回退标称尺寸
+    pub size: [f32; 2],
+    /// 首状态颜色 RGBA（状态 f32[1..5]，0..1；引擎淡出直乘 [4] 确证 A 位）
+    pub color: [f32; 4],
+    /// Cross prop+140 非 0 → 两片垂直交叉外追加水平第三片（地贴模式，
+    /// 引擎 sub_10087E60 分支；Quad 该偏移是 U×V 帧总数，不通用故仅 Cross 取）
+    pub ground: bool,
+    /// Cylinder 首状态几何（21 通道图 sub_100898F0；None = 非 Cylinder）
+    pub cyl: Option<SfxCyl>,
+    /// EffectBase 尾块 +260/+264 的 U×V 帧网格（MMUVPage 单 tga 分帧；
+    /// [1,1] = 整图单帧）
+    pub grid: [u32; 2],
+    /// EffectBase 尾块 +268 翻页帧率（帧时长 = 1/fps）
+    pub fps: f32,
+    /// EffectBase 尾块 +272 播完停帧（true = 停末帧，false = 回绕循环）
+    pub hold: bool,
+    /// 状态关键帧总时长（各状态 f32[0] 求和；播放循环长度，0 = 未知用默认）
+    pub dur: f32,
+    /// Quad/Cross 全部状态关键帧（播放器逐帧插值 RGBA/尺寸并累计转速；
+    /// 空类型/未逆向类型为空）
+    pub states: Vec<SfxKeyState>,
+}
+
+/// Quad/Cross 状态关键帧（引擎 Update 通道图：{时长, RGBA, 半宽, 半高,
+/// 转速 xyz}；转速×dt 逐帧累计为旋转角，插值向下一关键帧（末态回绕首态））
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SfxKeyState {
+    /// 状态时长（秒）
+    pub dur: f32,
+    /// RGBA（0..1）
+    pub rgba: [f32; 4],
+    /// 全宽/全高（半宽×2）
+    pub size: [f32; 2],
+    /// 转速 xyz（rad/s，逐帧累计）
+    pub rot: [f32; 3],
+}
+
+/// EffectCylinder 首状态几何（引擎 sub_100898F0 逐段生成的可编程光带管）：
+/// 每段 i 的角度 θ=i/segs×wrap×2π，底/顶半径 = 基准 + θ×花边 − 偶段锯齿，
+/// 底 Y = base_y + θ×rise_bot，顶 Y = θ×top_y（恒值即平顶）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SfxCyl {
+    /// 状态[1] 环绕圈数（角度总跨度 = wrap×2π）
+    pub wrap: f32,
+    /// 状态[2] 底部基准高
+    pub base_y: f32,
+    /// 状态[10] 顶部高（恒值 = 平顶管）
+    pub top_y: f32,
+    /// 状态[3] 底部半径
+    pub r_bot: f32,
+    /// 状态[4] 顶部半径
+    pub r_top: f32,
+    /// 状态[5] 底部花边调制（半径随角度线性叠加）
+    pub wob_bot: f32,
+    /// 状态[6] 顶部花边调制
+    pub wob_top: f32,
+    /// 状态[7] 底部锯齿深度（偶数段半径减去）
+    pub zig_bot: f32,
+    /// 状态[8] 顶部锯齿深度
+    pub zig_top: f32,
+    /// 状态[9] 底部螺旋抬升（Y 随角度上升 → 螺旋带）
+    pub rise_bot: f32,
+    /// 状态[11..15] 底部 RGBA
+    pub rgba_bot: [f32; 4],
+    /// 状态[15..19] 顶部 RGBA
+    pub rgba_top: [f32; 4],
+    /// prop+116 环绕分段数
+    pub segs: u32,
+    /// prop+132 环绕方向 UV 平铺数
+    pub u_wrap: f32,
 }
 
 /// 尾部路径对象（EffectPathCtrl 派生，引擎 SGEffectNode 按名挂接；
@@ -180,17 +254,126 @@ fn node_name(raw: &[u8]) -> String {
     crate::fskin::decode_path(&buf[..end])
 }
 
-/// prop 头部派生字段（Quad/Cross 逆向确证）：+112 偏移 vec3 / +80 路径名。
-/// 其余类型 prop 布局未逆向，偏移恒 0、路径名恒空
+/// prop 头部派生字段：偏移 vec3 与挂接路径名。Quad/Cross 的块与 raw 同基
+/// （BeginBuild memcpy 到块+0）：偏移 +112、名字 +80；Cylinder 的块相对
+/// raw 错 4B（memcpy 到块+4）：偏移 raw+116、名字 raw+80（引擎 Update/
+/// sub_100898F0 实测，segs=u32@raw+112 与偏移不重叠）
 fn node_place(kind: &str, raw: &[u8]) -> ([f32; 3], String) {
-    if kind != "EffectQuad" && kind != "EffectCross" {
+    if !matches!(kind, "EffectQuad" | "EffectCross" | "EffectCylinder") {
         return ([0.0, 0.0, 0.0], String::new());
     }
     let f = |o: usize| f32::from_bits(u32_at(raw, o).unwrap_or(0));
-    let offset = [f(112), f(116), f(120)];
+    let off = if kind == "EffectCylinder" { 116 } else { 112 };
+    let offset = [f(off), f(off + 4), f(off + 8)];
     let buf = &raw[80..80 + NAME_BUF];
     let end = buf.iter().position(|&c| c == 0).unwrap_or(NAME_BUF);
     (offset, crate::fskin::decode_path(&buf[..end]))
+}
+
+/// 首状态与 EffectBase 尾块派生字段（F3D.dll Update/构建函数通道图）：
+/// Quad(72B)/Cross(124B)/Cylinder(120B) 状态 = {时长, …通道…}；
+/// size/color 取 Quad/Cross「长成后」（尺寸最大）关键帧，states 为 Quad/Cross
+/// 全部关键帧（播放器插值用），cyl 取 Cylinder 半径和最大关键帧 21 通道 +
+/// prop+116 分段数 + prop+132 UV 平铺，grid/fps/hold 取尾块 +260/+264/+268/+272，
+/// dur = 各状态时长求和
+#[derive(Default)]
+struct NodeDerived {
+    size: [f32; 2],
+    color: [f32; 4],
+    ground: bool,
+    cyl: Option<SfxCyl>,
+    grid: [u32; 2],
+    fps: f32,
+    hold: bool,
+    dur: f32,
+    states: Vec<SfxKeyState>,
+}
+
+fn node_states(kind: &str, raw: &[u8]) -> NodeDerived {
+    let mut d = NodeDerived {
+        color: [1.0, 1.0, 1.0, 1.0],
+        grid: [1, 1],
+        ..Default::default()
+    };
+    let (prop, stride) = match kind {
+        "EffectQuad" => (184usize, 72usize),
+        "EffectCross" => (208, 124),
+        "EffectCylinder" => (176, 120),
+        _ => (0, 0),
+    };
+    let f = |o: usize| f32::from_bits(u32_at(raw, o).unwrap_or(0));
+    if stride > 0 && raw.len() > prop + 4 {
+        let n = u32_at(raw, prop).unwrap_or(0) as usize;
+        if n > 0 && n < 999 && prop + 4 + n * stride <= raw.len() {
+            let st = prop + 4;
+            // 静态观感取「长成后」关键帧：Quad/Cross 按半宽+半高、Cylinder
+            // 按半径和打分——首状态常为 0（生长），末状态常已淡出
+            let quadlike = kind != "EffectCylinder";
+            let mut best = 0f32;
+            let mut best_j = 0usize;
+            for j in 0..n {
+                let s = st + j * stride;
+                let score = if quadlike {
+                    f(s + 20) + f(s + 24)
+                } else {
+                    f(s + 12) + f(s + 16)
+                };
+                if score > best {
+                    best = score;
+                    best_j = j;
+                }
+                let dur = f(s);
+                if dur.is_finite() && dur > 0.0 && dur < 3600.0 {
+                    d.dur += dur;
+                }
+                if quadlike {
+                    d.states.push(SfxKeyState {
+                        dur,
+                        rgba: [f(s + 4), f(s + 8), f(s + 12), f(s + 16)],
+                        size: [f(s + 20) * 2.0, f(s + 24) * 2.0],
+                        rot: [f(s + 28), f(s + 32), f(s + 36)],
+                    });
+                }
+            }
+            let s = st + best_j * stride;
+            if quadlike {
+                d.color = [f(s + 4), f(s + 8), f(s + 12), f(s + 16)];
+                d.size = [f(s + 20) * 2.0, f(s + 24) * 2.0];
+            } else {
+                d.cyl = Some(SfxCyl {
+                    wrap: f(s + 4),
+                    base_y: f(s + 8),
+                    r_bot: f(s + 12),
+                    r_top: f(s + 16),
+                    wob_bot: f(s + 20),
+                    wob_top: f(s + 24),
+                    zig_bot: f(s + 28),
+                    zig_top: f(s + 32),
+                    rise_bot: f(s + 36),
+                    top_y: f(s + 40),
+                    rgba_bot: [f(s + 44), f(s + 48), f(s + 52), f(s + 56)],
+                    rgba_top: [f(s + 60), f(s + 64), f(s + 68), f(s + 72)],
+                    segs: u32_at(raw, 112).unwrap_or(0),
+                    u_wrap: f(128),
+                });
+            }
+        }
+    }
+    // EffectBase 尾块（340B，全类型收尾；见模块注释字段图）
+    if raw.len() >= BASE_BLOB {
+        let b = &raw[raw.len() - BASE_BLOB..];
+        let g = [
+            u32_at(b, 260).unwrap_or(1).min(64),
+            u32_at(b, 264).unwrap_or(1).min(64),
+        ];
+        if g[0] >= 1 && g[1] >= 1 {
+            d.grid = g;
+        }
+        d.fps = f32::from_bits(u32_at(b, 268).unwrap_or(0));
+        d.hold = b.get(272).copied().unwrap_or(0) != 0;
+    }
+    d.ground = kind == "EffectCross" && u32_at(raw, 140).unwrap_or(0) != 0;
+    d
 }
 
 /// 校验并返回尾部路径数组 [u32 M][M×记录] 在 o 处的记录区间表
@@ -319,6 +502,7 @@ pub fn parse_sfx(path: &str, bytes: &[u8]) -> Result<SfxFile, String> {
         let raw = bytes[body..end].to_vec();
         let (textures, models, sounds) = extract_refs(&raw);
         let (offset, path_name) = node_place(&kind, &raw);
+        let d = node_states(&kind, &raw);
         nodes.push(SfxNode {
             kind,
             name: node_name(&raw),
@@ -328,6 +512,15 @@ pub fn parse_sfx(path: &str, bytes: &[u8]) -> Result<SfxFile, String> {
             textures,
             models,
             sounds,
+            size: d.size,
+            color: d.color,
+            ground: d.ground,
+            cyl: d.cyl,
+            grid: d.grid,
+            fps: d.fps,
+            hold: d.hold,
+            dur: d.dur,
+            states: d.states,
         });
         pos = end;
     }
@@ -446,6 +639,34 @@ mod tests {
         assert!((m.nodes[0].offset[0] - 0.0).abs() < 1e-4);
         assert!((m.nodes[0].offset[1] - 100.0).abs() < 1e-4);
         assert!((m.nodes[0].offset[2] - 0.0).abs() < 1e-4);
+        // 派生字段（2026-10-27 引擎通道图）：Quad 首状态尺寸/颜色 + 尾块分帧参数
+        assert!(
+            m.nodes[0].size[0] > 0.0 && m.nodes[0].size[1] > 0.0,
+            "光传 首状态尺寸 {:?}",
+            m.nodes[0].size
+        );
+        assert!(
+            m.nodes[0].color.iter().all(|c| (0.0..=1.0).contains(c)),
+            "RGBA 0..1 {:?}",
+            m.nodes[0].color
+        );
+        assert!(m.nodes[0].dur > 0.0, "状态总时长 {:?}", m.nodes[0].dur);
+        assert_eq!(m.nodes[0].grid, [1, 1], "光传 单帧");
+        // Cylinder 节点几何派生
+        let cyl = m.nodes.iter().find(|n| n.kind == "EffectCylinder").unwrap();
+        assert!(cyl.cyl.is_some(), "柱面几何");
+        let c = cyl.cyl.as_ref().unwrap();
+        assert!(c.segs >= 3 && c.segs <= 128, "分段数 {}", c.segs);
+        // #3 xuan_1（Quad 自旋节点）：3 个关键帧、转速恒 (0,-3,0)
+        let x3 = &m.nodes[3];
+        assert_eq!(x3.name, "xuan_1");
+        assert_eq!(x3.states.len(), 3, "xuan_1 关键帧数");
+        assert!(
+            x3.states.iter().all(|s| (s.rot[1] + 3.0).abs() < 1e-3),
+            "转速 {:?}",
+            x3.states[0].rot
+        );
+        assert!((x3.states[1].rgba[3] - 1.0).abs() < 1e-3, "alpha 呼吸 0.4→1→0");
         // 本样例无路径对象（尾部仅 4 字节 0 计数，序列化仍须还原）
         assert!(m.paths.is_empty());
     }

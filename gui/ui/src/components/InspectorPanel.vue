@@ -184,7 +184,7 @@ watch(firstSection, (n) => {
 const inspectorWidth = ref(
   (() => {
     const n = Number(localStorage.getItem("panel.inspectorW"));
-    return Number.isFinite(n) && n > 0 ? Math.min(620, Math.max(220, n)) : 320;
+    return Number.isFinite(n) && n > 0 ? Math.min(620, Math.max(220, n)) : 350;
   })()
 );
 const inspectorDragging = ref(false);

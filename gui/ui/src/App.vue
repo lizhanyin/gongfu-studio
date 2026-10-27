@@ -56,8 +56,8 @@
                   <div>SFX 特效 · {{ shortName(sfx.sfxModel.path) }}</div>
                   <div>
                     节点: {{ sfx.sfxModel.nodes.length }} · 贴图:
-                    {{ sfx.uniqueTextures.length }} · 当前帧
-                    {{ Math.floor(sfx.playTime) }}/{{ sfx.actionFrames - 1 }}（近似翻页预览）
+                    {{ sfx.uniqueTextures.length }} · 时刻
+                    {{ sfx.playTime.toFixed(1) }}s / {{ sfx.actionFrames.toFixed(1) }}s
                   </div>
                 </template>
                 <template v-else>

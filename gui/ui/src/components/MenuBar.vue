@@ -71,6 +71,7 @@ const options = computed<MenuOption[]>(() => {
         { label: "UV", key: "rm-uv", disabled: skinOff, icon: tick(props.skin.renderMode === "uv") },
         { type: "divider", key: "view-d1" },
         { label: "线框", key: "wireframe", disabled: skinOff, icon: tick(props.skin.wireframe) },
+        { label: "网格地板", key: "grid-floor", icon: tick(props.skin.showGrid) },
         { label: "选中高亮", key: "pick-highlight", disabled: skinOff, icon: tick(props.skin.pickHighlight) },
         { label: "定位模型", key: "frame-all", disabled: skinOff, icon: tick(false) },
       ],
@@ -139,6 +140,9 @@ function onCommand(key: string | number) {
       break;
     case "wireframe":
       props.skin.wireframe = !props.skin.wireframe;
+      break;
+    case "grid-floor":
+      props.skin.showGrid = !props.skin.showGrid;
       break;
     case "pick-highlight":
       props.skin.pickHighlight = !props.skin.pickHighlight;

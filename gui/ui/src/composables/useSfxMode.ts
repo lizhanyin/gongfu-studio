@@ -21,10 +21,11 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
   const texCache = reactive(new Map<string, TexData | null>());
   /** 有未保存的路径改写 */
   const dirty = ref(false);
-  /** 翻页帧率（文件未记录，默认 12，可调） */
-  const fps = ref(12);
+  /** 恒 1：播放时间轴为秒（PlayBar「帧」接口口径兼容；分帧速率由各节点
+   * 引擎参数 fps 决定，不再全局可调） */
+  const fps = ref(1);
   const playing = ref(false);
-  /** 播放头（浮点帧号，0..actionFrames-1） */
+  /** 播放头（秒，0..duration） */
   const playTime = ref(0);
   const speed = ref(1);
   /** 节点显隐表（与 nodes 对齐，检查器逐节点开关） */
@@ -48,11 +49,13 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
     return out;
   });
 
-  /** 播放时长（帧）= 最长节点贴图序列；单帧文件静态展示 */
+  /** 播放时长（秒）= 节点状态关键帧总时长的最大值（路径动画同拍循环）；
+   * 无状态数据时回退 4s */
   const actionFrames = computed(() => {
     const m = sfxModel.value;
     if (!m) return 1;
-    return Math.max(1, ...m.nodes.map((n) => n.textures.length));
+    const d = Math.max(0.2, ...m.nodes.map((n) => n.dur ?? 0));
+    return d > 0 ? d : 4;
   });
 
   function fillTexSlots(refs: string[], slots: { tex: TexData | null; file: string | null }[]) {
@@ -118,8 +121,8 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
 
   function applyPlayTime() {
     const total = actionFrames.value;
-    const t = Math.min(Math.max(playTime.value, 0), Math.max(total - 1, 0));
-    viewer.value?.applySfxFrame(Math.floor(t));
+    const t = Math.min(Math.max(playTime.value, 0), Math.max(total - 1e-3, 0));
+    viewer.value?.applySfxFrame(t);
   }
 
   let playRaf = 0;
@@ -130,10 +133,10 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
     const dt = Math.min((ts - lastTs) / 1000, 0.1);
     lastTs = ts;
     if (!playing.value || !sfxModel.value) return;
-    // 路径动画（EffectMotion 速度积分）与贴图翻页同拍推进
+    // 路径动画（EffectMotion 速度积分）与 U×V 分帧翻页同拍推进（秒制）
     viewer.value?.tickSfxMotion(dt * speed.value);
     const total = actionFrames.value;
-    playTime.value += dt * fps.value * speed.value;
+    playTime.value += dt * speed.value;
     if (playTime.value >= total) playTime.value = 0;
     applyPlayTime();
   }

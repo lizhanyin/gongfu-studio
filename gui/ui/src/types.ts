@@ -367,6 +367,64 @@ export interface SfxNode {
   models: string[];
   /** 音效引用（EffectSound 的 sound\…\*.wav） */
   sounds: string[];
+  /** 长成后尺寸 [全宽, 全高]（Quad/Cross 状态关键帧半宽×2；0 = 未知回退标称） */
+  size: number[];
+  /** 长成后颜色 RGBA（0..1，取尺寸最大关键帧） */
+  color: number[];
+  /** Cross 追加水平第三片（地贴模式，prop+140） */
+  ground: boolean;
+  /** Cylinder 首状态几何（null = 非 Cylinder） */
+  cyl: SfxCyl | null;
+  /** 尾块 +260/+264 的 U×V 帧网格（[1,1] = 整图单帧） */
+  grid: number[];
+  /** 尾块 +268 翻页帧率（0 = 未记录） */
+  fps: number;
+  /** 尾块 +272 播完停帧 */
+  hold: boolean;
+  /** 状态关键帧总时长（秒；0 = 未知） */
+  dur: number;
+  /** Quad/Cross 全部状态关键帧（播放器逐帧插值 RGBA/尺寸并累计转速） */
+  states: SfxKeyState[];
+}
+
+/** Quad/Cross 状态关键帧（引擎通道 {时长, RGBA, 半宽×2, 半高×2, 转速xyz}） */
+export interface SfxKeyState {
+  /** 状态时长（秒） */
+  dur: number;
+  /** RGBA（0..1） */
+  rgba: number[];
+  /** 全宽/全高 */
+  size: number[];
+  /** 转速 xyz（rad/s，逐帧累计） */
+  rot: number[];
+}
+
+/** EffectCylinder 几何参数（引擎 sub_100898F0 通道图） */
+export interface SfxCyl {
+  /** 环绕圈数（角度总跨度 = wrap×2π） */
+  wrap: number;
+  /** 底部基准高 */
+  baseY: number;
+  /** 顶部高（恒值 = 平顶管） */
+  topY: number;
+  /** 底部半径 */
+  rBot: number;
+  rTop: number;
+  /** 底/顶部花边调制（半径随角度线性叠加） */
+  wobBot: number;
+  wobTop: number;
+  /** 底/顶部锯齿深度（偶数段半径减去） */
+  zigBot: number;
+  zigTop: number;
+  /** 底部螺旋抬升（Y 随角度上升） */
+  riseBot: number;
+  /** 底/顶部 RGBA */
+  rgbaBot: number[];
+  rgbaTop: number[];
+  /** 环绕分段数 */
+  segs: number;
+  /** 环绕方向 UV 平铺数 */
+  uWrap: number;
 }
 
 /** 尾部路径对象（EffectMotion = 速度积分路径；节点按 pathName 引用共享） */

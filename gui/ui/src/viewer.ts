@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { FakModel, FsmModel, FskinModel, FskelMeta, Influence, SfxFile, SfxPath, Vertex } from "./types";
+import type { FakModel, FsmModel, FskinModel, FskelMeta, Influence, SfxCyl, SfxFile, SfxKeyState, SfxPath, Vertex } from "./types";
 import { gfm, gfmEnabled } from "./gfm";
 
 export interface TexData {
@@ -245,6 +245,8 @@ export class Viewer {
   private scene = new THREE.Scene();
   /** 模型根组（绕 Y 旋转 MODEL_YAW）：网格/骨架可视化挂此处；骨骼层级与蒙皮数学留在 scene（数据空间） */
   private modelRoot = new THREE.Group();
+  /** 场景网格地板（视图菜单可隐藏） */
+  private grid = new THREE.GridHelper(600, 60, 0x2a3550, 0x1a2033);
   private camera: THREE.PerspectiveCamera;
   private renderer: THREE.WebGLRenderer;
   private controls: OrbitControls;
@@ -476,24 +478,36 @@ export class Viewer {
   private fsmDummyGeoms: THREE.SphereGeometry[] = [];
   private fsmDummyMats: THREE.Material[] = [];
 
-  // ---- SFX 特效播放器（公告板按节点 prop+112 偏移真实摆放 + 路径动画）----
+  // ---- SFX 特效播放器（按节点 prop 偏移真实摆放 + 路径动画）----
   private sfxGroup: THREE.Group | null = null;
-  /** 各贴图节点一个公告板（Sprite 始终面向相机），node = 节点序 */
+  /** 各贴图节点一个展示体：Quad/未知 = 相机朝向 Sprite，Cross = 交叉面片组
+   * （ground 追加水平片），Cylinder = 程序管网格（引擎 sub_10087E60 /
+   * sub_100898F0 同构）；node = 节点序 */
   private sfxBoards: {
     node: number;
-    sprite: THREE.Sprite;
-    mat: THREE.SpriteMaterial;
-    /** 逐帧纹理（null = 该帧贴图未解析到） */
-    frames: (THREE.Texture | null)[];
-    /** 当前绑定 map 与其帧序（热替换同帧时直接重绑） */
-    cur: THREE.Texture | null;
-    frameIdx: number;
+    obj: THREE.Object3D;
+    mat: THREE.SpriteMaterial | THREE.MeshBasicMaterial;
+    /** 解析缓存贴图与其展示克隆（含 U×V 分帧 UV 变换）；null = 未解析到 */
+    baseTex: THREE.Texture | null;
+    tex: THREE.Texture | null;
+    /** U×V 帧网格（[1,1] = 整图单帧）与引擎翻页参数 */
+    grid: [number, number];
+    fps: number;
+    hold: boolean;
     /** 节点显隐（检查器逐节点开关） */
     on: boolean;
     /** 节点偏移（板位 = basePos + 路径积分位置） */
     basePos: THREE.Vector3;
     /** 引用的路径名（"" = 定点） */
     pathName: string;
+    /** 标称半高（标签摆放） */
+    h: number;
+    /** Quad/Cross 状态关键帧（插值动画；空 = 静态）与动画游标 */
+    states: SfxKeyState[];
+    lastT: number;
+    rotAcc: number;
+    /** 构建期基准尺寸（插值尺寸的回退/缩放基准） */
+    baseScale: [number, number];
     label: THREE.Sprite;
     labelTex: THREE.CanvasTexture;
   }[] = [];
@@ -563,8 +577,7 @@ export class Viewer {
     dir2.position.set(-160, 120, -140);
     this.scene.add(dir2);
 
-    const grid = new THREE.GridHelper(600, 60, 0x2a3550, 0x1a2033);
-    this.scene.add(grid);
+    this.scene.add(this.grid);
     const axis = new THREE.AxesHelper(60);
     axis.position.y = 0.2;
     this.scene.add(axis);
@@ -1176,6 +1189,10 @@ export class Viewer {
     for (const p of this.parts.values()) for (const m of p.mats) m.wireframe = on;
     for (const m of this.fakMats) m.wireframe = on;
     for (const m of this.fsmMats) m.wireframe = on;
+  }
+
+  setGridVisible(on: boolean) {
+    this.grid.visible = on;
   }
 
   /** 高亮选中部件：其余半透明（饰品叠层随之）。压暗 opacity 0.28 会把
@@ -4262,15 +4279,14 @@ export class Viewer {
   // ---------------- SFX 特效播放器 ----------------
 
   /**
-   * 构建特效预览场景：每个带贴图的节点一个公告板（Sprite），按节点
-   * prop+112 的真实偏移摆放（Quad/Cross 逆向确证，90%+ 节点非零——
-   * 贴近游戏观感；其余类型偏移未逆向恒 0）。挂路径名的节点位 =
-   * 偏移 + EffectMotion 速度积分位置（tickSfxMotion 逐帧推进）。
-   * 根矩阵的线性部分（旋转/缩放）作用于整组，平移丢弃——Combat 特效
-   * 平移为编辑器残留、Scn 特效为场景世界摆放位（离原点数千米，对独立
-   * 预览无意义且 frameAll 焦距失控）。逐帧动画 = 各节点贴图序列翻页
-   * （全量实测每节点至多 1 条引用，翻页为前向兼容预留，实际恒单帧；
-   * 帧率与相位文件未记录，统一按外部帧号驱动、序列内取模循环）。
+   * 构建特效预览场景（2026-10-27 起按引擎真实形态）：Quad/未知类型 = 相机
+   * 朝向公告板，尺寸/颜色取状态关键帧「长成后」值（引擎 sub_10095210 通道
+   * {RGBA,半宽,半高}）；Cross = 两片垂直交叉面片（ground 追加水平第三片，
+   * sub_10087E60）；Cylinder = 程序管网格（21 通道 sub_100898F0：半径/花边/
+   * 锯齿/螺旋/上下 RGBA 顶点色）。节点按 prop 偏移摆放，挂路径名的节点位 =
+   * 偏移 + EffectMotion 速度积分位置。根矩阵线性部分作用于整组、平移丢弃
+   * （Combat 平移为编辑器残留）。U×V 帧网格贴图按引擎参数（fps/停帧）取
+   * 子矩形翻页（MMUVPage 同语义）。
    */
   setSfx(model: SfxFile, nodeTex: { file: string | null; tex: TexData | null }[][]) {
     this.clearSfx();
@@ -4280,40 +4296,96 @@ export class Viewer {
     const boards = model.nodes
       .map((n, i) => ({ n, i, slots: nodeTex[i] ?? [] }))
       .filter((b) => b.n.textures.length > 0);
-    const H = 150; // 公告板统一高度（世界单位），宽按贴图纵横比
     boards.forEach((b) => {
-      const base = new THREE.Vector3(b.n.offset[0] || 0, b.n.offset[1] || 0, b.n.offset[2] || 0);
-      const mat = new THREE.SpriteMaterial({
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      });
-      // Sprite 的 UV 取向按图像习惯（flipY=true 缓存键独立，不与模型贴图互串）
-      const frames = b.slots.map((s) =>
-        s?.tex && s.file ? this.getTexture(s.file, s.tex, true) : null
-      );
+      const n = b.n;
+      const base = new THREE.Vector3(n.offset[0] || 0, n.offset[1] || 0, n.offset[2] || 0);
       const first = b.slots.find((s) => s?.tex);
-      const aspect = first?.tex ? first.tex.width / first.tex.height : 1;
-      const sprite = new THREE.Sprite(mat);
-      sprite.position.copy(base);
-      sprite.scale.set(H * Math.min(Math.max(aspect, 0.25), 4), H, 1);
-      group.add(sprite);
+      const baseTex = first?.tex && first.file ? this.getTexture(first.file, first.tex, true) : null;
+      const grid: [number, number] = [
+        Math.max(1, Math.round(n.grid?.[0] ?? 1)),
+        Math.max(1, Math.round(n.grid?.[1] ?? 1)),
+      ];
+      const tex = baseTex ? this.sfxBoardTex(baseTex, grid) : null;
+      const col = n.color ?? [1, 1, 1, 1];
+      const rgba = [col[0] ?? 1, col[1] ?? 1, col[2] ?? 1, col[3] ?? 1];
+      let obj: THREE.Object3D;
+      let mat: THREE.SpriteMaterial | THREE.MeshBasicMaterial;
+      let h: number;
+      let bs: [number, number] = [1, 1];
+      if (n.kind === "EffectCross" || (n.kind === "EffectCylinder" && n.cyl)) {
+        // 世界固定面片/管（MeshBasic 共享材质，双面 + 叠加）
+        mat = new THREE.MeshBasicMaterial({
+          map: tex ?? undefined,
+          transparent: true,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          side: THREE.DoubleSide,
+        });
+        if (n.kind === "EffectCross") {
+          const [w, hh] = this.sfxQuadSize(n, first?.tex ?? null);
+          const geo = new THREE.PlaneGeometry(w, hh);
+          const g = new THREE.Group();
+          g.add(new THREE.Mesh(geo, mat));
+          const c = new THREE.Mesh(geo, mat);
+          c.rotation.y = Math.PI / 2;
+          g.add(c);
+          if (n.ground) {
+            const d = new THREE.Mesh(geo, mat);
+            d.rotation.x = Math.PI / 2;
+            g.add(d);
+          }
+          obj = g;
+          h = hh / 2;
+          bs = [w, hh];
+          this.sfxTint(mat, rgba);
+        } else {
+          const c = n.cyl!;
+          obj = new THREE.Mesh(Viewer.buildCylGeo(c), mat);
+          mat.vertexColors = true;
+          h = Math.max(40, Math.abs(c.topY - c.baseY) / 2 + Math.abs(c.riseBot));
+          bs = [Math.max(c.rBot, c.rTop) * 2, Math.abs(c.topY - c.baseY)];
+        }
+      } else {
+        // 公告板（Quad/粒子等未知几何类型回退）：尺寸按状态关键帧
+        const [w, hh] = this.sfxQuadSize(n, first?.tex ?? null);
+        mat = new THREE.SpriteMaterial({
+          transparent: true,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          map: tex ?? undefined,
+        });
+        const sp = new THREE.Sprite(mat);
+        sp.scale.set(w, hh, 1);
+        obj = sp;
+        h = hh / 2;
+        bs = [w, hh];
+        this.sfxTint(mat, rgba);
+      }
+      obj.position.copy(base);
+      group.add(obj);
       // 名称标签：对应检查器节点序，普通混合不受叠加开关影响
       const { label, tex: labelTex } = this.sfxLabel(
-        `#${b.i} ${b.n.kind}${b.n.name ? ` · ${b.n.name}` : ""}`
+        `#${b.i} ${n.kind}${n.name ? ` · ${n.name}` : ""}`
       );
-      label.position.set(base.x, base.y - H * 0.62, base.z);
+      label.position.set(base.x, base.y - h - 26, base.z);
       group.add(label);
       this.sfxBoards.push({
         node: b.i,
-        sprite,
+        obj,
         mat,
-        frames,
-        cur: null,
-        frameIdx: 0,
+        baseTex,
+        tex,
+        grid,
+        fps: n.fps ?? 0,
+        hold: !!n.hold,
         on: true,
         basePos: base,
-        pathName: effPathName(b.n.pathName, this.sfxMotions),
+        pathName: effPathName(n.pathName, this.sfxMotions),
+        h,
+        states: n.states ?? [],
+        lastT: 0,
+        rotAcc: 0,
+        baseScale: bs,
         label,
         labelTex,
       });
@@ -4330,6 +4402,68 @@ export class Viewer {
     );
     this.modelRoot.add(group);
     this.applySfxFrame(0);
+  }
+
+  /** 节点尺寸 [全宽, 全高]：状态关键帧「长成后」值优先，未知/为 0 回退 150×纵横比 */
+  private sfxQuadSize(n: SfxFile["nodes"][number], tex: TexData | null): [number, number] {
+    const s = n.size ?? [0, 0];
+    const aspect = tex ? tex.width / tex.height : 1;
+    const H = 150;
+    return [s[0] > 1 ? s[0] : H * Math.min(Math.max(aspect, 0.25), 4), s[1] > 1 ? s[1] : H];
+  }
+
+  /** 材质整体着色（RGBA 关键帧；叠加混合下近黑视为无色防吞光） */
+  private sfxTint(mat: THREE.SpriteMaterial | THREE.MeshBasicMaterial, rgba: number[]) {
+    if (Math.max(rgba[0], rgba[1], rgba[2]) >= 0.02) mat.color.setRGB(rgba[0], rgba[1], rgba[2]);
+    mat.opacity = Math.min(Math.max(rgba[3] ?? 1, 0.05), 1);
+  }
+
+  /** 板用贴图 = 缓存贴图克隆（独立 UV 变换，勿污染共享缓存）：U×V 分帧取子矩形 */
+  private sfxBoardTex(base: THREE.Texture, grid: [number, number]): THREE.Texture {
+    if (grid[0] <= 1 && grid[1] <= 1) return base;
+    const t = base.clone();
+    t.needsUpdate = true;
+    t.repeat.set(1 / grid[0], 1 / grid[1]);
+    t.offset.set(0, 1 - 1 / grid[1]);
+    return t;
+  }
+
+  /**
+   * EffectCylinder 程序管（引擎 sub_100898F0 同构）：θ=i/segs×wrap×2π，
+   * 底/顶半径 = 基准 + θ×花边 − 偶段锯齿，底 Y = baseY+θ×rise，顶 Y = topY，
+   * 底/顶部 RGBA 走顶点色（flipY 贴图 V: 底 0 顶 1，U 沿环绕平铺 uWrap 圈）
+   */
+  private static buildCylGeo(c: SfxCyl): THREE.BufferGeometry {
+    const segs = Math.max(3, Math.min(96, Math.round(c.segs) || 20));
+    const wrap = c.wrap > 0.01 && c.wrap < 50 ? c.wrap : 1;
+    const uW = c.uWrap > 0.01 && c.uWrap < 50 ? c.uWrap : 1;
+    const zb = c.rgbaBot ?? [1, 1, 1, 1];
+    const zt = c.rgbaTop ?? [1, 1, 1, 1];
+    const pos: number[] = [];
+    const uv: number[] = [];
+    const col: number[] = [];
+    const idx: number[] = [];
+    for (let i = 0; i <= segs; i++) {
+      const th = (i / segs) * wrap * Math.PI * 2;
+      const alt = i % 2 === 0 ? 1 : 0;
+      const rb = Math.max(0, c.rBot + th * c.wobBot - alt * c.zigBot);
+      const rt = Math.max(0, c.rTop + th * c.wobTop - alt * c.zigTop);
+      pos.push(rb * Math.sin(th), c.baseY + th * c.riseBot, rb * Math.cos(th));
+      pos.push(rt * Math.sin(th), c.topY, rt * Math.cos(th));
+      const u = (i / segs) * uW;
+      uv.push(u, 0, u, 1);
+      col.push(zb[0], zb[1], zb[2], zb[3], zt[0], zt[1], zt[2], zt[3]);
+    }
+    for (let i = 0; i < segs; i++) {
+      const a = i * 2;
+      idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(col, 4));
+    geo.setIndex(idx);
+    return geo;
   }
 
   /** 节点标签（canvas 文本 Sprite） */
@@ -4353,22 +4487,56 @@ export class Viewer {
     return { label, tex };
   }
 
-  /** 应用播放帧：各节点按自身帧数取模翻页（短序列提前循环），尊重节点显隐 */
-  applySfxFrame(frame: number) {
+  /** 应用播放时刻（秒）：①Quad/Cross 状态关键帧插值（RGBA/尺寸，向下一
+   * 关键帧过渡、末态回绕首态——引擎 Update 同口径）并按转速×dt 累计旋转
+   * （公告板走平面内旋转、面片组/管绕世界 Y，与相机基矢的精确组合引擎
+   * 侧未逆向完，主导通道口径已贴合光旋类观感）②U×V 帧网格节点按自身
+   * 引擎帧率取子矩形翻页（播完停帧=钳末帧否则回绕） */
+  applySfxFrame(tSec: number) {
     for (const b of this.sfxBoards) {
-      if (!b.frames.length) continue;
-      const i = ((frame % b.frames.length) + b.frames.length) % b.frames.length;
-      const t = b.frames[i] ?? null;
-      b.frameIdx = i;
-      if (t === b.cur) continue;
-      b.cur = t;
-      b.mat.map = t ?? undefined;
-      b.mat.needsUpdate = true;
-      b.sprite.visible = b.on && !!t;
+      const dt = tSec >= b.lastT && tSec - b.lastT < 1 ? tSec - b.lastT : Math.min(tSec, 0.05);
+      b.lastT = tSec;
+      if (b.states.length && b.states[0].dur > 0) {
+        const total = b.states.reduce((s, k) => s + k.dur, 0);
+        let t = ((tSec % total) + total) % total;
+        let j = 0;
+        while (j < b.states.length - 1 && t >= b.states[j].dur) {
+          t -= b.states[j].dur;
+          j++;
+        }
+        const cur = b.states[j];
+        const nxt = b.states[j + 1] ?? b.states[0];
+        const k = Math.min(Math.max(t / Math.max(cur.dur, 1e-4), 0), 1);
+        const mix = (a: number, c: number) => (c - a) * k + a;
+        const rgba = [0, 1, 2, 3].map((q) => mix(cur.rgba[q] ?? 1, nxt.rgba[q] ?? 1));
+        this.sfxTint(b.mat, rgba);
+        const w = mix(cur.size[0] || b.baseScale[0], nxt.size[0] || b.baseScale[0]);
+        const hh = mix(cur.size[1] || b.baseScale[1], nxt.size[1] || b.baseScale[1]);
+        const rot = [0, 1, 2].map((q) => mix(cur.rot[q] ?? 0, nxt.rot[q] ?? 0));
+        const spin = rot[1] !== 0 ? rot[1] : rot[0] || rot[2];
+        b.rotAcc += spin * dt;
+        const sp = b.obj as THREE.Sprite;
+        if (sp.isSprite) {
+          sp.scale.set(Math.max(w, 1), Math.max(hh, 1), 1);
+          (b.mat as THREE.SpriteMaterial).rotation = b.rotAcc;
+        } else {
+          const sw = Math.max(w / Math.max(b.baseScale[0], 1), 0.001);
+          const sh = Math.max(hh / Math.max(b.baseScale[1], 1), 0.001);
+          b.obj.scale.set(sw, sh, sw);
+          b.obj.rotation.y = b.rotAcc;
+        }
+      }
+      if (!b.tex || (b.grid[0] <= 1 && b.grid[1] <= 1)) continue;
+      const total = b.grid[0] * b.grid[1];
+      const fps = b.fps > 0.5 && b.fps < 240 ? b.fps : 12;
+      let k2 = Math.floor(Math.max(0, tSec) * fps);
+      k2 = b.hold ? Math.min(k2, total - 1) : ((k2 % total) + total) % total;
+      const u = b.grid[0];
+      b.tex.offset.set((k2 % u) / u, 1 - (Math.floor(k2 / u) + 1) / b.grid[1]);
     }
   }
 
-  /** 路径动画推进（composable 播放循环逐帧调；贴图翻页独立按帧号驱动） */
+  /** 路径动画推进（composable 播放循环逐帧调；帧网格翻页由 applySfxFrame 同拍驱动） */
   tickSfxMotion(dt: number) {
     if (!this.sfxGroup) return;
     for (const { p, sim } of this.sfxMotions.values()) tickMotionSim(p, sim, dt);
@@ -4376,15 +4544,15 @@ export class Viewer {
       if (!b.pathName) continue;
       const sim = this.sfxMotions.get(b.pathName)?.sim;
       if (!sim) continue;
-      b.sprite.position.set(
+      b.obj.position.set(
         b.basePos.x + sim.pos.x,
         b.basePos.y + sim.pos.y,
         b.basePos.z + sim.pos.z
       );
       b.label.position.set(
-        b.sprite.position.x,
-        b.sprite.position.y - 93, // H(150)×0.62，与构建期标签位同口径
-        b.sprite.position.z
+        b.obj.position.x,
+        b.obj.position.y - b.h - 26,
+        b.obj.position.z
       );
     }
   }
@@ -4399,31 +4567,31 @@ export class Viewer {
       sim.pos.set(0, 0, 0);
     }
     for (const b of this.sfxBoards) {
-      b.sprite.position.copy(b.basePos);
-      b.label.position.set(b.basePos.x, b.basePos.y - 93, b.basePos.z);
+      b.obj.position.copy(b.basePos);
+      b.label.position.set(b.basePos.x, b.basePos.y - b.h - 26, b.basePos.z);
     }
   }
 
-  /** 节点显隐（检查器逐节点开关；公告板与标签一并隐藏） */
+  /** 节点显隐（检查器逐节点开关；展示体与标签一并隐藏） */
   setSfxNodeVisible(nodeIdx: number, on: boolean) {
     const b = this.sfxBoards.find((x) => x.node === nodeIdx);
     if (!b) return;
     b.on = on;
-    b.sprite.visible = on && !!b.cur;
+    b.obj.visible = on && !!b.tex;
     b.label.visible = on;
   }
 
-  /** SFX 节点贴图热替换（检查器改路径后刷新公告板）：nodeIdx 节点序 / frameIdx 节点内贴图槽序 */
-  setSfxTexture(nodeIdx: number, frameIdx: number, file: string, tex: TexData) {
+  /** SFX 节点贴图热替换（检查器改路径后刷新展示体；slot 参数保留兼容恒 0） */
+  setSfxTexture(nodeIdx: number, _slot: number, file: string, texData: TexData) {
     const b = this.sfxBoards.find((x) => x.node === nodeIdx);
-    if (!b || frameIdx >= b.frames.length) return;
-    b.frames[frameIdx] = this.getTexture(file, tex, true);
-    if (b.frameIdx === frameIdx) {
-      b.cur = b.frames[frameIdx] ?? null;
-      b.mat.map = b.cur ?? undefined;
-      b.mat.needsUpdate = true;
-      b.sprite.visible = !!b.cur;
-    }
+    if (!b) return;
+    const base = this.getTexture(file, texData, true);
+    if (b.tex && b.tex !== b.baseTex) b.tex.dispose();
+    b.baseTex = base;
+    b.tex = this.sfxBoardTex(base, b.grid);
+    b.mat.map = b.tex;
+    b.mat.needsUpdate = true;
+    b.obj.visible = b.on && !!b.tex;
   }
 
   /** 特效混合模式：叠加（发光贴图黑底加色，默认）↔ 普通透明 */
@@ -4441,6 +4609,11 @@ export class Viewer {
     }
     for (const b of this.sfxBoards) {
       b.mat.dispose();
+      if (b.tex && b.tex !== b.baseTex) b.tex.dispose();
+      b.obj.traverse((o) => {
+        const g = (o as THREE.Mesh).geometry;
+        if (g) g.dispose();
+      });
       b.labelTex.dispose();
       (b.label.material as THREE.SpriteMaterial).dispose();
     }

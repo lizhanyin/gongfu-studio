@@ -27,6 +27,8 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
   const scanning = ref(false);
   const renderMode = ref<"shaded" | "bones" | "uv">("shaded");
   const wireframe = ref(false);
+  /** 场景网格地板是否显示（默认开，不随部件加载禁用） */
+  const showGrid = ref(true);
   /** 选中部件时是否压暗其余部件（默认关） */
   const pickHighlight = ref(false);
   const selectedPart = ref<string | null>(null);
@@ -576,6 +578,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
 
   watch(renderMode, (m) => viewer.value?.setMode(m));
   watch(wireframe, (w) => viewer.value?.setWireframe(w));
+  watch(showGrid, (g) => viewer.value?.setGridVisible(g));
   // 开关切换时立即应用到当前选中状态
   watch(pickHighlight, (v) => viewer.value?.highlight(v ? selectedPart.value : null));
 
@@ -585,6 +588,7 @@ export function useSkinMode(viewer: ShallowRef<Viewer | null>) {
     scanning,
     renderMode,
     wireframe,
+    showGrid,
     pickHighlight,
     selectedPart,
     loaded,
