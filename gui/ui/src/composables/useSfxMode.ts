@@ -33,7 +33,7 @@ export function useSfxMode(viewer: ShallowRef<Viewer | null>) {
   /** 贴图引用 → 解析结果（file 为命中的实际路径；url 为缩略图 dataURL） */
   const texSlots = reactive(new Map<string, { file: string | null; url: string | null }>());
 
-  /** 全部节点贴图引用去重保序（动画帧序列集中查看） */
+  /** 全部节点贴图引用去重保序（每节点至多 1 条，集中查看用） */
   const uniqueTextures = computed(() => {
     const m = sfxModel.value;
     if (!m) return [];

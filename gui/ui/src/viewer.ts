@@ -4268,8 +4268,9 @@ export class Viewer {
    * 偏移 + EffectMotion 速度积分位置（tickSfxMotion 逐帧推进）。
    * 根矩阵的线性部分（旋转/缩放）作用于整组，平移丢弃——Combat 特效
    * 平移为编辑器残留、Scn 特效为场景世界摆放位（离原点数千米，对独立
-   * 预览无意义且 frameAll 焦距失控）。逐帧动画 = 各节点贴图序列翻页；
-   * 帧率与相位文件未记录，统一按外部帧号驱动、序列内取模循环。
+   * 预览无意义且 frameAll 焦距失控）。逐帧动画 = 各节点贴图序列翻页
+   * （全量实测每节点至多 1 条引用，翻页为前向兼容预留，实际恒单帧；
+   * 帧率与相位文件未记录，统一按外部帧号驱动、序列内取模循环）。
    */
   setSfx(model: SfxFile, nodeTex: { file: string | null; tex: TexData | null }[][]) {
     this.clearSfx();

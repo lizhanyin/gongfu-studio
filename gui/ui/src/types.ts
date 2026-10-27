@@ -361,7 +361,7 @@ export interface SfxNode {
   pathName: string;
   /** 类型名之后的原始参数字节（节点号+名字缓冲+类型参数），保存时原样写回 */
   raw: number[];
-  /** 贴图引用（system\effect\tex\…\*.tga，含逐帧动画序列） */
+  /** 贴图引用（system\effect\tex\…\*.tga；全量实测每节点至多 1 条，帧序列在 tex 目录相邻文件而非文件内列表） */
   textures: string[];
   /** 网格引用（EffectMesh 的 system\…\*.fak） */
   models: string[];

@@ -75,7 +75,9 @@ pub struct SfxNode {
     /// 类型名之后的整段原始字节（节点号 + 名字缓冲 + 类型参数），
     /// 序列化原样写回保证字节级还原
     pub raw: Vec<u8>,
-    /// 贴图引用（system\effect\tex\…\*.tga，含逐帧动画序列）
+    /// 贴图引用（system\effect\tex\…\*.tga；全量实测每节点至多 1 条——
+    /// 9802 条引用 == 9802 个有贴图节点，多贴图节点 0 个，帧序列在 tex
+    /// 目录的相邻文件里而非文件内帧列表）
     pub textures: Vec<String>,
     /// 网格引用（EffectMesh 节点的 system\…\*.fak）
     pub models: Vec<String>,

@@ -572,6 +572,12 @@ pub fn sfx_probe_for_test(path: &str) -> Result<String, String> {
     ))
 }
 
+/// 诊断探针（sfx_flags 示例用）：解析 .sfx 为结构化模型（cpk: 寻址含内）
+pub fn sfx_parse_for_test(path: &str) -> Result<sfx::SfxFile, String> {
+    let bytes = vfs::read_file(path)?;
+    sfx::parse_sfx(path, &bytes)
+}
+
 /// 诊断探针（sz38_probe 示例用）：时装部件头发链排查——从 system.cpk 提取
 /// shizhuang\SZ_38.fskin，列出 Bone* 链骨使用分布（镜像标志/顶点数/
 /// authored Y 范围/帧0 LBS↔authored 残差）与链根顶点簇（识别马尾/披发链）。
